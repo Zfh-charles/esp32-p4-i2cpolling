@@ -14,7 +14,7 @@ git commit -m "Initial commit: EP Chat P4 ML307 reminder firmware and tools"
 在 GitHub 创建 **Private** 仓库后：
 
 ```powershell
-git remote add origin https://github.com/YOUR_ORG/esp32-p4-i2cpolling.git
+git remote add origin https://github.com/Zfh-charles/esp32-p4-i2cpolling.git
 git branch -M main
 git push -u origin main
 ```
@@ -22,13 +22,13 @@ git push -u origin main
 或使用 GitHub CLI：
 
 ```powershell
-gh repo create YOUR_ORG/esp32-p4-i2cpolling --private --source=. --remote=origin --push
+gh repo create Zfh-charles/esp32-p4-i2cpolling --private --source=. --remote=origin --push
 ```
 
 ## 2. 新成员克隆
 
 ```powershell
-git clone https://github.com/YOUR_ORG/esp32-p4-i2cpolling.git
+git clone https://github.com/Zfh-charles/esp32-p4-i2cpolling.git
 cd esp32-p4-i2cpolling
 ```
 
