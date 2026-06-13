@@ -185,13 +185,23 @@ void ReminderPoller::Start() {
         [](void* arg) {
             static_cast<ReminderPoller*>(arg)->PollTask();
         },
-        "reminder_poll", 8192, this, 2, nullptr);
+        "reminder_poll", 8192, this, 2, &poll_task_handle_);
     ESP_LOGI(TAG, "Reminder poller started, interval %ds, mac=%s",
              CONFIG_REMINDER_POLL_INTERVAL_SEC, SystemInfo::GetMacAddress().c_str());
 }
 
 void ReminderPoller::Stop() {
     running_ = false;
+    if (poll_task_handle_ != nullptr) {
+        xTaskNotifyGive(poll_task_handle_);
+    }
+}
+
+void ReminderPoller::TriggerPoll() {
+    if (poll_task_handle_ != nullptr) {
+        ESP_LOGI(TAG, "MQTT wake -> trigger HTTP poll");
+        xTaskNotifyGive(poll_task_handle_);
+    }
 }
 
 void ReminderPoller::DoPollOnce() {
@@ -354,8 +364,11 @@ void ReminderPoller::DoPollOnce() {
 void ReminderPoller::PollTask() {
     while (running_) {
         DoPollOnce();
-        vTaskDelay(pdMS_TO_TICKS(CONFIG_REMINDER_POLL_INTERVAL_SEC * 1000));
+        const uint32_t interval_ms = CONFIG_REMINDER_POLL_INTERVAL_SEC * 1000U;
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(interval_ms));
     }
+    poll_task_handle_ = nullptr;
+    vTaskDelete(nullptr);
 }
 
 #endif  // CONFIG_USE_REMINDER_POLL

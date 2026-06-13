@@ -797,5 +797,37 @@ menu "XVSENFENG_ALARM"
         help
             每 10 秒检查 W001/W002/W005 等异常；待机且 session=None 时自动 RestoreIdleReady。
             串口搜 "ANOMALY" / "auto_heal" 可追踪。
+
+    config REMINDER_MQTT_WAKE
+        bool "启用 MQTT 唤醒后立即 HTTP 拉取提醒"
+        default y
+        depends on USE_REMINDER_POLL
+        help
+            推理服务在 push 后向设备订阅主题发布唤醒消息，固件立即 GET /pending。
+            与 HTTP 周期轮询并存（轮询作兜底）。ML307 4G 需 broker 公网可达。
+
+    config REMINDER_MQTT_WAKE_DEFAULT_BROKER
+        string "默认 MQTT broker（host:port）"
+        default "broker.emqx.io:1883"
+        depends on REMINDER_MQTT_WAKE
+        help
+            首次启动写入 NVS reminder_mqtt.broker。本地调试可用公网 broker 或 ngrok tcp 1883。
+
+    config REMINDER_MQTT_WAKE_DEFAULT_TOPIC
+        string "MQTT 订阅主题（支持 {device_id}）"
+        default "xiaozhi/reminder/wake/{device_id}"
+        depends on REMINDER_MQTT_WAKE
+        help
+            推理服务 push 后应向同一主题发布唤醒。device_id 为设备 MAC。
+
+    config REMINDER_MQTT_WAKE_DEFAULT_USERNAME
+        string "MQTT 用户名（可留空）"
+        default ""
+        depends on REMINDER_MQTT_WAKE
+
+    config REMINDER_MQTT_WAKE_DEFAULT_PASSWORD
+        string "MQTT 密码（可留空）"
+        default ""
+        depends on REMINDER_MQTT_WAKE
 endmenu
 endmenu

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <string>
 
 enum class ReminderDeliveryMode {
@@ -16,11 +18,15 @@ public:
     void Start();
     void Stop();
 
+    /** Wake the poll loop immediately (e.g. MQTT push notification). */
+    void TriggerPoll();
+
     static void EnsureNvsConfigured();
     static bool PostAck(const std::string& ack_url, const std::string& id);
 
 private:
     bool running_ = false;
+    TaskHandle_t poll_task_handle_ = nullptr;
     void PollTask();
     void DoPollOnce();
     static std::string ExpandDeviceIdInUrl(const std::string& url_template);

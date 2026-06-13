@@ -30,17 +30,22 @@ idf.py reconfigure
 
 `sdkconfig` 在 `.gitignore` 中，**勿提交**含真实 ngrok 域名的文件。请参考模板：
 
-- `sdkconfig.defaults.reminder.example` — 板型 + 60s HTTP 轮询提醒
+- `sdkconfig.defaults.reminder.example` — 板型 + HTTP 轮询 + **MQTT 唤醒**（推荐 300s 兜底）
 
 在 menuconfig 中确认：
 
 ```
 Xiaozhi Assistant → Board Type → EP Chat P4 ML307
 XVSENFENG_ALARM → 启用推理提醒 HTTP 轮询
-  → CONFIG_REMINDER_POLL_INTERVAL_SEC=60
+  → 启用 MQTT 唤醒后立即 HTTP 拉取提醒
+  → CONFIG_REMINDER_POLL_INTERVAL_SEC=300
   → CONFIG_REMINDER_POLL_DEFAULT_URL="https://<你的公网>/v1/devices/{device_id}/reminders/pending"
+  → CONFIG_REMINDER_MQTT_WAKE_DEFAULT_BROKER="broker.emqx.io:1883"
+  → CONFIG_REMINDER_MQTT_WAKE_DEFAULT_TOPIC="xiaozhi/reminder/wake/{device_id}"
   → CONFIG_REMINDER_WAKE_PHRASE="查提醒"
 ```
+
+MQTT 与服务器部署详见 [reminder-mqtt-wake.md](reminder-mqtt-wake.md)。
 
 设备 MAC 与 `tools/mcp-calculator/.env` 中 `INFERENCE_DEVICE_ID` 一致（串口日志 `mac=`）。
 
@@ -157,7 +162,9 @@ PC 端服务一键启动：`tools\start-reminder-stack.bat`（API + 定时推送
 
 | 日志 | 含义 |
 |------|------|
-| `I ReminderPoll: Reminder poller started, interval 60s, mac=...` | 轮询已启动 |
+| `I ReminderPoll: Reminder poller started, interval 300s, mac=...` | 轮询已启动（兜底） |
+| `I ReminderMqtt: MQTT wake subscribed: xiaozhi/reminder/wake/<MAC>` | MQTT 唤醒就绪 |
+| `I ReminderPoll: MQTT wake -> trigger HTTP poll` | 收到唤醒，立即拉队列 |
 | `I ReminderPoll: poll_no_reminder` | 队列为空，静默 |
 | `I EezuiDisplayAdapter: ✅ UI初始化完成` | LVGL UI 就绪 |
 | `E EezuiDisplayAdapter: ❌ SD卡未挂载，无法初始化表情系统` | 无 SD，仅文字 UI |

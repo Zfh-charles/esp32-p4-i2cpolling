@@ -21,6 +21,9 @@
 #if CONFIG_USE_REMINDER_POLL
 #include "reminder/reminder_poller.h"
 #include "reminder/reminder_diag.h"
+#if CONFIG_REMINDER_MQTT_WAKE
+#include "reminder/reminder_mqtt_wake.h"
+#endif
 #endif
 
 
@@ -134,6 +137,9 @@ private:
 #if CONFIG_USE_REMINDER_POLL
     SessionKind session_kind_ = SessionKind::None;
     ReminderPoller* reminder_poller_ = nullptr;
+#if CONFIG_REMINDER_MQTT_WAKE
+    ReminderMqttWake* reminder_mqtt_wake_ = nullptr;
+#endif
     std::string pending_reminder_ack_id_;
     std::string pending_reminder_ack_url_;
     bool proactive_reminder_tts_started_ = false;

@@ -11,6 +11,11 @@
   DEMO_DEVICE_ID       启动时自动插入演示提醒的 MAC（可留空跳过）
   SEED_DEMO_ON_START   默认 1，设为 0 则不自动 seed
 
+  MQTT_WAKE_ENABLED    默认 1，push 后向设备发布 MQTT 唤醒
+  MQTT_WAKE_BROKER     默认 broker.emqx.io
+  MQTT_WAKE_PORT       默认 1883
+  MQTT_WAKE_TOPIC_PREFIX  默认 xiaozhi/reminder/wake
+
 接口:
   GET  /v1/devices/{device_id}/reminders/pending
   POST /v1/devices/{device_id}/reminders/push   MCP/推理服务写入队列
@@ -28,9 +33,45 @@ HOST = os.environ.get("INFERENCE_API_HOST", "0.0.0.0")
 PORT = int(os.environ.get("INFERENCE_API_PORT", "8765"))
 SEED_DEMO = os.environ.get("SEED_DEMO_ON_START", "1") != "0"
 
+MQTT_WAKE_ENABLED = os.environ.get("MQTT_WAKE_ENABLED", "1") != "0"
+MQTT_WAKE_BROKER = os.environ.get("MQTT_WAKE_BROKER", "broker.emqx.io")
+MQTT_WAKE_PORT = int(os.environ.get("MQTT_WAKE_PORT", "1883"))
+MQTT_WAKE_TOPIC_PREFIX = os.environ.get(
+    "MQTT_WAKE_TOPIC_PREFIX", "xiaozhi/reminder/wake"
+)
+MQTT_WAKE_USERNAME = os.environ.get("MQTT_WAKE_USERNAME", "")
+MQTT_WAKE_PASSWORD = os.environ.get("MQTT_WAKE_PASSWORD", "")
+
 # device_id -> list of pending reminders
 _PENDING: dict[str, list[dict]] = {}
 _ACKED: set[str] = set()
+
+
+def publish_mqtt_wake(device_id: str) -> None:
+    if not MQTT_WAKE_ENABLED:
+        return
+    try:
+        import paho.mqtt.publish as mqtt_publish
+    except ImportError:
+        print("[mqtt] paho-mqtt not installed, skip wake publish")
+        return
+
+    topic = f"{MQTT_WAKE_TOPIC_PREFIX}/{device_id}"
+    payload = json.dumps({"type": "reminder_wake", "device_id": device_id})
+    auth = None
+    if MQTT_WAKE_USERNAME:
+        auth = {"username": MQTT_WAKE_USERNAME, "password": MQTT_WAKE_PASSWORD}
+    try:
+        mqtt_publish.single(
+            topic,
+            payload=payload,
+            hostname=MQTT_WAKE_BROKER,
+            port=MQTT_WAKE_PORT,
+            auth=auth,
+        )
+        print(f"[mqtt] wake published topic={topic}")
+    except Exception as exc:
+        print(f"[mqtt] wake publish failed: {exc}")
 
 
 def seed_demo_meeting(device_id: str) -> None:
@@ -72,6 +113,7 @@ def push_reminder(device_id: str, data: dict) -> dict:
     _PENDING[device_id] = queue
     _ACKED.discard(rid)
     print(f"[push] device={device_id} id={rid}")
+    publish_mqtt_wake(device_id)
     return {"success": True, "id": rid, "reminder": reminder}
 
 
@@ -171,6 +213,11 @@ def main():
     print(f"  GET  /v1/devices/{{device_id}}/reminders/pending")
     print(f"  POST /v1/devices/{{device_id}}/reminders/push")
     print(f"  POST /v1/devices/{{device_id}}/reminders/ack")
+    if MQTT_WAKE_ENABLED:
+        print(
+            f"  MQTT wake: {MQTT_WAKE_BROKER}:{MQTT_WAKE_PORT}/"
+            f"{MQTT_WAKE_TOPIC_PREFIX}/{{device_id}}"
+        )
     server.serve_forever()
 
 

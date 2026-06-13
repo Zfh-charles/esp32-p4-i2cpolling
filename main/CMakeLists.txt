@@ -48,6 +48,9 @@ if(CONFIG_USE_REMINDER_POLL)
     list(APPEND SOURCES "reminder/reminder_poller.cc" "reminder/reminder_diag.cc" "reminder/reminder_lifecycle_trace.cc" "reminder/reminder_hw_trace.cc")
     list(APPEND INCLUDE_DIRS "reminder")
 endif()
+if(CONFIG_REMINDER_MQTT_WAKE)
+    list(APPEND SOURCES "reminder/reminder_mqtt_wake.cc")
+endif()
 
 # Add board common files
 file(GLOB BOARD_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.cc)

@@ -803,6 +803,10 @@ void Application::Start() {
 #if CONFIG_USE_REMINDER_POLL
     reminder_poller_ = new ReminderPoller();
     reminder_poller_->Start();
+#if CONFIG_REMINDER_MQTT_WAKE
+    reminder_mqtt_wake_ = new ReminderMqttWake();
+    reminder_mqtt_wake_->Start(reminder_poller_);
+#endif
 #endif
     has_server_time_ = ota.HasServerTime();
     if (protocol_started) {
