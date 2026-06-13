@@ -9,25 +9,27 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
+#include "i2c_bus.h"
 #include "battery_monitor.h"
+
+#define BATTERY_MONITOR_I2C_SDA_PIN  GPIO_NUM_7
+#define BATTERY_MONITOR_I2C_SCL_PIN  GPIO_NUM_8
 
 #define BATTERY_SHUTDOWN_SOC (10)
 
-static const ParamCEDV g_cedv = {
-    .cedv_conf = {
-        .gauge_conf =
-        {
-            .CCT = 1,
-            .CSYNC = 0,
-            .EDV_CMP = 0,
-            .SC = 1,
-            .FIXED_EDV0 = 0,
-            .FCC_LIM = 1,
-            .FC_FOR_VDQ = 1,
-            .IGNORE_SD = 1,
-            .SME0 = 0,
-        },
-    },
+static const gauging_config_t g_gauge_config = {
+    .CCT = 1,
+    .CSYNC = 0,
+    .EDV_CMP = 0,
+    .SC = 1,
+    .FIXED_EDV0 = 0,
+    .FCC_LIM = 1,
+    .FC_FOR_VDQ = 1,
+    .IGNORE_SD = 1,
+    .SME0 = 0,
+};
+
+static const parameter_cedv_t g_cedv = {
     .full_charge_cap = 650,
     .design_cap = 650,
     .reserve_cap = 0,
@@ -61,7 +63,7 @@ static const char *TAG = "battery_monitor";
 void BatteryMonitor::check_shutdown()
 {
     if (battery_status.DSG == 0) {
-        return; // Battery is charging, no need to check shutdown.
+        return;
     }
     if (this->getBatterySOC() <= BATTERY_SHUTDOWN_SOC) {
         ESP_LOGW(TAG, "Battery SOC is low, going to sleep");
@@ -75,7 +77,7 @@ void BatteryMonitor::check_shutdown()
 
 void BatteryMonitor::printInfo() const
 {
-    BatteryStatus status = {};
+    battery_status_t status = {};
     bq27220_get_battery_status(bq27220Handle, &status);
     ESP_LOGI(TAG, "Battery Status - DSG: %d, SYSDWN: %d, TDA: %d, BATTPRES: %d, AUTH_GD: %d, OCVGD: %d, TCA: %d, RSVD: %d, CHGINH: %d, FC: %d, OTD: %d, OTC: %d, SLEEP: %d, OCVFAIL: %d, OCVCOMP: %d, FD: %d",
              status.DSG, status.SYSDWN, status.TDA, status.BATTPRES,
@@ -87,11 +89,11 @@ void BatteryMonitor::printInfo() const
     int16_t current = bq27220_get_current(bq27220Handle);
     uint16_t rc = bq27220_get_remaining_capacity(bq27220Handle);
     uint16_t full_cap = bq27220_get_full_charge_capacity(bq27220Handle);
-    uint16_t temp = bq27220_get_temperature(bq27220Handle) / 10 - 273; // Convert from 0.1K to Celsius
+    uint16_t temp = bq27220_get_temperature(bq27220Handle) / 10 - 273;
     uint16_t cycle_cnt = bq27220_get_cycle_count(bq27220Handle);
     uint16_t soc = bq27220_get_state_of_charge(bq27220Handle);
-    int16_t avg_power = bq27220_get_average_power(bq27220Handle); // in mW
-    int16_t max_load = bq27220_get_maxload_current(bq27220Handle); // in mA
+    int16_t avg_power = bq27220_get_average_power(bq27220Handle);
+    int16_t max_load = bq27220_get_maxload_current(bq27220Handle);
     uint16_t time_to_empty = bq27220_get_time_to_empty(bq27220Handle);
     uint16_t time_to_full = bq27220_get_time_to_full(bq27220Handle);
 
@@ -113,7 +115,8 @@ BatteryMonitor::~BatteryMonitor()
         xTimerDelete(timer, 0);
     }
     if (bq27220Handle) {
-        bq27220_deinit(bq27220Handle);
+        bq27220_delete(bq27220Handle);
+        bq27220Handle = nullptr;
     }
 }
 
@@ -126,12 +129,35 @@ bool BatteryMonitor::init(i2c_master_bus_handle_t i2c_bus)
         return false;
     }
 
-    bq27220_config_t bq27220_cfg = {
-        .i2c_bus = i2c_bus,
-        .cedv = (ParamCEDV *)(&g_cedv),
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = BATTERY_MONITOR_I2C_SDA_PIN,
+        .scl_io_num = BATTERY_MONITOR_I2C_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master = {
+            .clk_speed = 400 * 1000,
+        },
     };
 
-    bq27220Handle = bq27220_init(&bq27220_cfg);
+    i2c_bus_handle_t i2c_bus_handle = i2c_bus_create(I2C_NUM_0, &conf);
+    if (i2c_bus_handle == nullptr) {
+        ESP_LOGE(TAG, "Failed to create i2c_bus wrapper");
+        return false;
+    }
+
+    if (i2c_bus_get_internal_bus_handle(i2c_bus_handle) != i2c_bus) {
+        ESP_LOGE(TAG, "i2c_bus wrapper does not match shared I2C bus");
+        return false;
+    }
+
+    bq27220_config_t bq27220_cfg = {
+        .i2c_bus = i2c_bus_handle,
+        .cfg = &g_gauge_config,
+        .cedv = &g_cedv,
+    };
+
+    bq27220Handle = bq27220_create(&bq27220_cfg);
     if (!bq27220Handle) {
         ESP_LOGE(TAG, "Failed to initialize BQ27220");
         return false;
@@ -140,10 +166,11 @@ bool BatteryMonitor::init(i2c_master_bus_handle_t i2c_bus)
     getBatteryStatus(this->battery_status);
     check_shutdown();
 
-    // create timer to monitor battery status
     timer = xTimerCreate("battery_monitor", pdMS_TO_TICKS(1000), pdTRUE, this, monitor_period);
     if (timer == nullptr) {
         ESP_LOGE(TAG, "Failed to create battery monitor timer");
+        bq27220_delete(bq27220Handle);
+        bq27220Handle = nullptr;
         return false;
     }
     xTimerStart(timer, 0);
@@ -179,12 +206,12 @@ int16_t BatteryMonitor::getCurrent() const
 uint16_t BatteryMonitor::getTemperature() const
 {
     uint16_t temp = bq27220_get_temperature(bq27220Handle);
-    return static_cast<int16_t>(temp / 10 - 273); // Convert from 0.1K to Celsius.
+    return static_cast<int16_t>(temp / 10 - 273);
 }
 
-bool BatteryMonitor::getBatteryStatus(BatteryStatus &status)
+bool BatteryMonitor::getBatteryStatus(battery_status_t &status)
 {
-    return bq27220_get_battery_status(bq27220Handle, &status);
+    return bq27220_get_battery_status(bq27220Handle, &status) == ESP_OK;
 }
 
 void BatteryMonitor::monitor_period(TimerHandle_t xTimer)
@@ -196,10 +223,8 @@ void BatteryMonitor::monitor_period(TimerHandle_t xTimer)
     }
 
     static uint32_t count = 0;
-    if (count++ % 5 == 0) { // check every 5 seconds
-        // check battery low power
+    if (count++ % 5 == 0) {
         bm.check_shutdown();
-        // bm.printInfo();
         if (bm.period_cb) {
             bm.period_cb();
         }

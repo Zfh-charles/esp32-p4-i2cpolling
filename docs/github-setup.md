@@ -32,7 +32,7 @@ git clone https://github.com/Zfh-charles/esp32-p4-i2cpolling.git
 cd esp32-p4-i2cpolling
 ```
 
-然后按 [team-onboarding.md](team-onboarding.md) 配置本地 `sdkconfig` 与 `.env`。
+然后按 [team-onboarding.md](team-onboarding.md) 配置本地 `sdkconfig` 与 `.env`。首次编译若报错或白屏，见 [ep-chat-p4-build-onboarding.md](ep-chat-p4-build-onboarding.md)。
 
 ## 3. 不提交的文件（已在 .gitignore）
 
@@ -51,6 +51,7 @@ cd esp32-p4-i2cpolling
 |------|------|
 | `sdkconfig.defaults` | 通用编译默认项 |
 | `sdkconfig.defaults.reminder.example` | 轮询功能 menuconfig 参考 |
+| [docs/ep-chat-p4-build-onboarding.md](ep-chat-p4-build-onboarding.md) | P4 编译排障、显示与 SD 卡说明 |
 | `tools/mcp-calculator/.env.example` | MCP 环境变量模板 |
 | `tools/inference-api-demo/.env.example` | API 环境变量模板 |
 

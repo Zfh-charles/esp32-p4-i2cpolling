@@ -90,7 +90,7 @@ public:
      * @brief Check if the battery is charging.
      * @return bool True if charging, false otherwise.
      */
-    bool getBatteryStatus(BatteryStatus &status);
+    bool getBatteryStatus(battery_status_t &status);
 
     /**
      * @brief Print battery information.
@@ -103,7 +103,7 @@ public:
      *
      * @param callback
      */
-    void setBatteryStatusCallback(std::function<void(const BatteryStatus &)> callback)
+    void setBatteryStatusCallback(std::function<void(const battery_status_t &)> callback)
     {
         status_cb = callback;
     }
@@ -119,16 +119,14 @@ public:
     }
 
 private:
-    // Add private members for battery monitoring implementation.
-    bq27220_handle_t bq27220Handle; // Handle for the BQ27220 driver.
+    bq27220_handle_t bq27220Handle;
     TimerHandle_t timer;
-    BatteryStatus battery_status; // Current battery status.
+    battery_status_t battery_status;
     static void monitor_period(TimerHandle_t xTimer);
     void check_shutdown(void);
-    std::function<void(const BatteryStatus &)> status_cb; // Callback for battery status updates.
-    std::function<void(void)> shutdown_cb; // Callback for shutdown event.
-    std::function<void(void)> period_cb; // Callback for monitor period updates.
-
+    std::function<void(const battery_status_t &)> status_cb;
+    std::function<void(void)> shutdown_cb;
+    std::function<void(void)> period_cb;
 };
 
 #endif // __cplusplus

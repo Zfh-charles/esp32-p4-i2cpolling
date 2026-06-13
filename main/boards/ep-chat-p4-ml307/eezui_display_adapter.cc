@@ -17,6 +17,17 @@
 #include "application.h"
 #include "board.h"
 #include "font_awesome.h"
+
+LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
+
+static void ApplyDialogueTextStyle(lv_obj_t *label)
+{
+    if (label == nullptr) {
+        return;
+    }
+    lv_obj_set_style_text_font(label, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(0xE8EEF5), 0);
+}
 #if CONFIG_USE_REMINDER_POLL
 #include "reminder/reminder_hw_trace.h"
 
@@ -113,8 +124,7 @@ void EezuiDisplayAdapter::SetupUI() {
     
     // 获取 EEZ UI 对象引用
     dialogue_box_ = objects.dialogue_box;
-    // main_image 在新版UI中可能被移除或改名，设为nullptr
-    main_image_ = nullptr;
+    main_image_ = objects.main_image;
     
     
     // 立即隐藏电池相关标签，防止开机时显示
@@ -133,11 +143,9 @@ void EezuiDisplayAdapter::SetupUI() {
     
     // 初始状态设置
     if (dialogue_box_ != nullptr) {
-        // 设置对话框文本居中对齐
+        ApplyDialogueTextStyle(dialogue_box_);
         lv_obj_set_style_text_align(dialogue_box_, LV_TEXT_ALIGN_CENTER, 0);
-        // 设置初始文本
-     //   lv_label_set_text(dialogue_box_, "你好，小智！");
-          lv_label_set_text(dialogue_box_, "你好，小易！");
+        lv_label_set_text(dialogue_box_, "你好，小易！");
         lv_obj_clear_flag(dialogue_box_, LV_OBJ_FLAG_HIDDEN);
         
         // 添加点击事件处理
@@ -319,6 +327,14 @@ void EezuiDisplayAdapter::SetEmotion(const char* emotion) {
     if (!IsEmotionSystemReady()) {
         if (!InitEmotionSystem()) {
             ESP_LOGE(TAG, "表情系统初始化失败，跳过表情显示");
+            if (dialogue_box_ && SafeLVGLLock(200)) {
+                lv_label_set_text(dialogue_box_, "请插入SD卡\n并放入 /mjpeg/ 表情文件");
+                ApplyDialogueTextStyle(dialogue_box_);
+                lv_obj_set_style_text_align(dialogue_box_, LV_TEXT_ALIGN_CENTER, 0);
+                lv_obj_clear_flag(dialogue_box_, LV_OBJ_FLAG_HIDDEN);
+                UpdateDialogueBoxHeight();
+                SafeLVGLUnlock();
+            }
             return;
         }
     }
@@ -500,6 +516,16 @@ static void OnIdleHideTimer(lv_timer_t* timer) {
         delete data;
         return;
     }
+
+    // 无 SD 表情时保持文字可见，避免整屏空白
+    if (!data->adapter->IsEmotionSystemReady()) {
+        if (data->hide_timer == timer) {
+            data->adapter->SetHideTimer(nullptr);
+        }
+        lv_timer_del(timer);
+        delete data;
+        return;
+    }
     
     // 检查是否为重要信息，如果是则不隐藏
     const char* current_text = lv_label_get_text(data->dialogue_box);
@@ -615,16 +641,17 @@ void EezuiDisplayAdapter::SetStatus(Status status) {
                 hide_timer_ = nullptr;
             }
 
-            // 创建3秒后隐藏的定时器
-            TimerData* timer_data = new TimerData{this, dialogue_box_, nullptr};
-            hide_timer_ = lv_timer_create(OnIdleHideTimer, 3000, timer_data);
-            if (hide_timer_) {
-                timer_data->hide_timer = hide_timer_;
-            } else {
-                // 定时器创建失败，清理内存
-                ESP_LOGE(TAG, "创建隐藏定时器失败，清理TimerData");
-                delete timer_data;
-                timer_data = nullptr;
+            // 有表情视频时才自动隐藏文字；无 SD 卡时保持提示可见
+            if (IsEmotionSystemReady()) {
+                TimerData* timer_data = new TimerData{this, dialogue_box_, nullptr};
+                hide_timer_ = lv_timer_create(OnIdleHideTimer, 3000, timer_data);
+                if (hide_timer_) {
+                    timer_data->hide_timer = hide_timer_;
+                } else {
+                    ESP_LOGE(TAG, "创建隐藏定时器失败，清理TimerData");
+                    delete timer_data;
+                    timer_data = nullptr;
+                }
             }
             }
         } else if (status == Status::kListening) {
@@ -953,6 +980,8 @@ void EezuiDisplayAdapter::CreateVideoCanvas() {
     lv_obj_t* parent_screen = nullptr;
     if (main_image_ && lv_obj_get_parent(main_image_)) {
         parent_screen = lv_obj_get_parent(main_image_);
+    } else if (objects.main) {
+        parent_screen = objects.main;
     } else {
         parent_screen = lv_screen_active();
     }

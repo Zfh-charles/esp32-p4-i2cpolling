@@ -263,6 +263,8 @@ https://reminder.your-domain.com/v1/devices/{device_id}/reminders/pending
 
 ## 6. 新成员上手步骤（另一台 PC）
 
+> **编译/白屏排障**：见 [ep-chat-p4-build-onboarding.md](ep-chat-p4-build-onboarding.md)（target、依赖、UI 桩、SD 表情、battery_monitor 等）。
+
 ### 6.1 环境
 
 1. 安装 [ESP-IDF v5.4.1](https://docs.espressif.com/projects/esp-idf/en/v5.4.1/esp32p4/get-started/index.html)

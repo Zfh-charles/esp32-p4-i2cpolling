@@ -31,6 +31,10 @@ dependencies:
     version: '==1.3.1' # for compatibility. update version may need to modify this project code.
     rules:
     - if: target not in [esp32]
+  espressif/esp_video_codec:
+    version: ^0.5.5
+    rules:
+    - if: target in [esp32p4]
   espressif/esp_lcd_touch_ft5x06: ~1.0.7
   espressif/esp_lcd_touch_gt911: ^1
   espressif/esp_lcd_touch_gt1151: ^1
@@ -93,6 +97,10 @@ dependencies:
 
   llgok/cpp_bus_driver:
     version: 1.1.0
+    rules:
+    - if: target in [esp32p4]
+  espressif/bq27220:
+    version: ^0.1.1
     rules:
     - if: target in [esp32p4]
 
