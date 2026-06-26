@@ -8,15 +8,10 @@ void loadScreen(void)
     objects.main = lv_obj_create(NULL);
     lv_obj_remove_style_all(objects.main);
     lv_obj_set_size(objects.main, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(objects.main, lv_color_hex(0x101820), 0);
+    lv_obj_set_style_bg_color(objects.main, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(objects.main, LV_OPA_COVER, 0);
 
-    objects.main_image = lv_obj_create(objects.main);
-    lv_obj_remove_style_all(objects.main_image);
-    lv_obj_set_size(objects.main_image, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(objects.main_image, lv_color_hex(0x101820), 0);
-    lv_obj_set_style_bg_opa(objects.main_image, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(objects.main_image, LV_OBJ_FLAG_SCROLLABLE);
+    objects.main_image = NULL;
 
     objects.dialogue_box = lv_label_create(objects.main);
     lv_obj_set_width(objects.dialogue_box, LV_PCT(90));

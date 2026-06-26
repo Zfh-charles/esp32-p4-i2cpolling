@@ -35,6 +35,7 @@ struct ReminderDiagSnapshot {
     bool alarm_ringing = false;
     bool can_deliver = false;
     bool audio_idle = true;
+    bool boot_wake_deferred = false;
     uint32_t input_age_ms = 0;
     uint32_t output_age_ms = 0;
     size_t decode_q = 0;

@@ -14,6 +14,11 @@
 #include "reminder/reminder_diag.h"
 #include "reminder/reminder_lifecycle_trace.h"
 #include "reminder/reminder_hw_trace.h"
+#include "reminder/boot_trace.h"
+#if !CONFIG_REMINDER_MQTT_TLS_INSECURE
+#include "reminder/reminder_mqtt_tls.h"
+#include <at_modem.h>
+#endif
 #endif
 
 #include <cstring>
@@ -635,8 +640,10 @@ void Application::Start() {
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
                     aborted_ = false;
-                    audio_service_.PrepareSpeakerPlayback();
 #if CONFIG_USE_REMINDER_POLL
+                    if (session_kind_ == SessionKind::ProactiveReminder) {
+                        audio_service_.PrepareSpeakerPlayback();
+                    }
                     if (!pending_reminder_ack_id_.empty()) {
                         proactive_reminder_tts_started_ = true;
                         StopProactiveReminderTimeout();
@@ -662,9 +669,9 @@ void Application::Start() {
                 Schedule([this]() {
 #if CONFIG_USE_REMINDER_POLL
                     const bool proactive = session_kind_ == SessionKind::ProactiveReminder;
-#endif
-                    audio_service_.EndSpeakerPlayback();
-#if CONFIG_USE_REMINDER_POLL
+                    if (proactive) {
+                        audio_service_.EndSpeakerPlayback();
+                    }
                     if (proactive) {
                         ReminderTraceLog("proactive_tts_stop", pending_reminder_ack_id_.c_str());
                         ESP_LOGI(TAG, "Proactive TTS stop id=%s audio_packets=%d",
@@ -802,11 +809,13 @@ void Application::Start() {
 #endif
 #if CONFIG_USE_REMINDER_POLL
     reminder_poller_ = new ReminderPoller();
-    reminder_poller_->Start();
 #if CONFIG_REMINDER_MQTT_WAKE
     reminder_mqtt_wake_ = new ReminderMqttWake();
-    reminder_mqtt_wake_->Start(reminder_poller_);
 #endif
+    deferred_reminder_services_pending_ = true;
+    wake_running_since_us_ = 0;
+    ESP_LOGI(TAG, "Reminder net deferred until idle + wake stable (%ds after wake)",
+             CONFIG_REMINDER_BOOT_DEFER_SEC);
 #endif
     has_server_time_ = ota.HasServerTime();
     if (protocol_started) {
@@ -880,6 +889,9 @@ void Application::MainEventLoop() {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
+#if CONFIG_USE_REMINDER_POLL
+            TryStartDeferredReminderNet();
+#endif
         
             // Print the debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
@@ -1117,11 +1129,6 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
                 audio.EnableWakeWordDetection(true);
             }
 #else
-            {
-                const bool session_ended = previous_state == kDeviceStateSpeaking ||
-                    previous_state == kDeviceStateListening;
-                audio.SetAudioRoute(AudioRoute::Capture, session_ended);
-            }
             audio.EnableWakeWordDetection(true);
 #endif
             break;
@@ -1138,7 +1145,7 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
                 break;
             }
 #endif
-            audio.SetAudioRoute(AudioRoute::Capture);
+            /* User conversation: ori-ref soft path — no I2S hard switch */
             if (protocol_ && !audio.IsAudioProcessorRunning()) {
                 protocol_->SendStartListening(listening_mode_);
                 audio.EnableVoiceProcessing(true);
@@ -1152,21 +1159,15 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
                 audio.EnableVoiceProcessing(false);
                 audio.EnableWakeWordDetection(false);
                 audio.SetAudioRoute(AudioRoute::Playback);
-            } else {
+                break;
+            }
 #endif
+            /* User conversation: ori-ref soft path — mic/speaker via Enable* only */
             if (listening_mode_ != kListeningModeRealtime) {
                 audio.EnableVoiceProcessing(false);
                 audio.EnableWakeWordDetection(audio.IsAfeWakeWord());
             }
-            if (listening_mode_ == kListeningModeRealtime) {
-                audio.SetAudioRoute(AudioRoute::Duplex);
-            } else {
-                audio.SetAudioRoute(AudioRoute::Playback);
-            }
             audio.ResetDecoder();
-#if CONFIG_USE_REMINDER_POLL
-            }
-#endif
             break;
 
 #if CONFIG_USE_ALARM
@@ -1260,6 +1261,7 @@ ReminderDiagSnapshot Application::BuildReminderDiagSnapshot() {
     snap.input_frames = audio_diag.input_frames;
     snap.playback_frames = audio_diag.playback_frames;
     snap.pending_id = pending_reminder_ack_id_.empty() ? "-" : pending_reminder_ack_id_.c_str();
+    snap.boot_wake_deferred = deferred_reminder_services_pending_;
     return snap;
 }
 
@@ -1272,6 +1274,16 @@ void Application::RunReminderDiagnostics(const char* trigger, bool allow_auto_he
 #if CONFIG_REMINDER_DIAG_AUTO_HEAL
     if (!allow_auto_heal) {
         return;
+    }
+    if (deferred_reminder_services_pending_ && !audio_service_.IsWakeWordRunning()) {
+        return;
+    }
+    if (deferred_reminder_services_pending_ && wake_running_since_us_ > 0) {
+        const int64_t wake_elapsed_s =
+            (esp_timer_get_time() - wake_running_since_us_) / 1000000LL;
+        if (wake_elapsed_s < CONFIG_REMINDER_BOOT_DEFER_SEC) {
+            return;
+        }
     }
     static int64_t last_heal_us = 0;
     const int64_t now_us = esp_timer_get_time();
@@ -1293,6 +1305,50 @@ void Application::RunReminderDiagnostics(const char* trigger, bool allow_auto_he
 #else
     (void)allow_auto_heal;
 #endif
+}
+#endif
+
+#if CONFIG_USE_REMINDER_POLL
+void Application::TryStartDeferredReminderNet() {
+    if (!deferred_reminder_services_pending_ || reminder_poller_ == nullptr) {
+        return;
+    }
+    if (session_kind_ != SessionKind::None || device_state_ != kDeviceStateIdle) {
+        return;
+    }
+    if (!audio_service_.IsWakeWordRunning()) {
+        wake_running_since_us_ = 0;
+        return;
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    if (wake_running_since_us_ == 0) {
+        wake_running_since_us_ = now_us;
+        ESP_LOGI(TAG, "Wake armed — reminder net in %ds", CONFIG_REMINDER_BOOT_DEFER_SEC);
+        return;
+    }
+    const int64_t wake_elapsed_s = (now_us - wake_running_since_us_) / 1000000LL;
+    if (wake_elapsed_s < CONFIG_REMINDER_BOOT_DEFER_SEC) {
+        return;
+    }
+
+    deferred_reminder_services_pending_ = false;
+    BootTraceMarkHeap("REMINDER_NET_START");
+#if CONFIG_USE_REMINDER_POLL && !CONFIG_REMINDER_MQTT_TLS_INSECURE
+    if (auto* at_modem = dynamic_cast<AtModem*>(Board::GetInstance().GetNetwork())) {
+        if (!ReminderMqttInstallCaCert(at_modem->GetAtUart())) {
+            ESP_LOGW(TAG, "Reminder TLS CA install failed; MQTT/HTTPS may fail");
+        }
+    }
+#endif
+    reminder_poller_->Start();
+#if CONFIG_REMINDER_MQTT_WAKE
+    if (reminder_mqtt_wake_ != nullptr) {
+        reminder_mqtt_wake_->Start(reminder_poller_);
+    }
+#endif
+    ESP_LOGI(TAG, "Reminder network started %ds after wake ready", (int)wake_elapsed_s);
+    ReminderTraceLog("reminder_net_deferred_start", nullptr);
 }
 #endif
 
@@ -1470,6 +1526,9 @@ void Application::SetDeviceState(DeviceState state) {
     device_state_ = state;
     ESP_LOGI(TAG, "STATE: %s", STATE_STRINGS[device_state_]);
 #if CONFIG_USE_REMINDER_POLL
+    if (state == kDeviceStateIdle) {
+        BootTraceMarkHeap("STATE_IDLE");
+    }
     ReminderTraceLog("state_change", STATE_STRINGS[previous_state]);
 #endif
 
@@ -1493,9 +1552,7 @@ void Application::SetDeviceState(DeviceState state) {
             break;
         case kDeviceStateListening:
             display->SetStatus(Lang::Strings::LISTENING);
-            if (display->IsEmotionSystemReady()) {
-                display->SetEmotion("standby");
-            }
+            display->SetEmotion("standby");
             break;
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
@@ -1513,7 +1570,8 @@ void Application::SetDeviceState(DeviceState state) {
     UpdateCapturePowerHold();
 #if CONFIG_USE_REMINDER_POLL
     if (state == kDeviceStateIdle) {
-        RunReminderDiagnostics("enter_idle", true);
+        TryStartDeferredReminderNet();
+        RunReminderDiagnostics("enter_idle", false);
     }
 #endif
 }

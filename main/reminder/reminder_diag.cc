@@ -74,7 +74,7 @@ uint32_t ReminderDiagEvaluate(const ReminderDiagSnapshot& s, const char* context
     const bool proactive = s.session_kind == 2;
     const bool capture_session = s.voice_running || s.wake_running;
 
-    if (idle_ready && !s.wake_running) {
+    if (idle_ready && !s.wake_running && !s.boot_wake_deferred) {
         mask |= kDiagIdleWakeOff;
         LogAnomaly("W001", "idle_wake_off", s);
     }

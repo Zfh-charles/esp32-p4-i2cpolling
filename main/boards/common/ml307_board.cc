@@ -3,6 +3,9 @@
 #include "application.h"
 #include "display.h"
 #include "assets/lang_config.h"
+#if CONFIG_USE_REMINDER_POLL && !CONFIG_REMINDER_MQTT_TLS_INSECURE
+#include "reminder/reminder_mqtt_tls.h"
+#endif
 
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -66,6 +69,9 @@ void Ml307Board::StartNetwork() {
     ESP_LOGI(TAG, "ML307 Revision: %s", module_revision.c_str());
     ESP_LOGI(TAG, "ML307 IMEI: %s", imei.c_str());
     ESP_LOGI(TAG, "ML307 ICCID: %s", iccid.c_str());
+#if CONFIG_USE_REMINDER_POLL && !CONFIG_REMINDER_MQTT_TLS_INSECURE
+    ReminderTlsResetDefaultSslContext(modem_->GetAtUart());
+#endif
 }
 
 NetworkInterface* Ml307Board::GetNetwork() {

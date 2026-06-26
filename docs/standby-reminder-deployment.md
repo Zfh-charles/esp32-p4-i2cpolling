@@ -1,8 +1,10 @@
 # 待机轮询提醒 — 完整部署指南（小智云 + mcp-calculator + 固件）
 
-> **团队上手请先读：[team-onboarding.md](team-onboarding.md)**（配置清单、ngrok/VPS、新 PC/新板子步骤）
+> **团队上手请先读：[team-onboarding.md](team-onboarding.md)**（配置清单、ngrok/VPS、新 PC/新板子步骤）  
+> **生产联调 / 服务器待办：[server-integration-checklist.md](server-integration-checklist.md)**  
+> **当前架构（mcp_wake + MQTT 门铃）：[architecture-reminder-poll-mcp.md](architecture-reminder-poll-mcp.md)**
 
-> 基于 [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) 官方协议，语音/TTS 走小智云；待机唤醒由固件 HTTP 轮询触发。
+> 基于 [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) 官方协议，语音/TTS 走小智云；待机唤醒由 **MQTT 门铃 + HTTP 轮询** 触发，默认 **`mcp_wake`**（短 detect + wake opus → MCP 读队列 → 云 TTS）。
 
 ---
 
@@ -32,7 +34,7 @@
 
 | 组件 | 何时工作 | 作用 |
 |------|----------|------|
-| **ReminderPoller**（固件） | 待机 idle，每 N 秒 | 拉取提醒 → 开通道 → TTS 播报 |
+| **ReminderPoller**（固件） | 待机 idle | MQTT/HTTP 拉取 → **`mcp_wake`** → 云 TTS |
 | **backend_alert**（MCP） | 用户已唤醒对话 | LLM 查/推提醒，与固件同源 |
 | **server.py**（推理 API） | 7×24 在线 | 维护待提醒队列 |
 | **小智云** | 常在线 | 语音通道 + TTS，不提供待机推送 |
@@ -75,12 +77,21 @@ idf.py build flash monitor
 
 ### 3.3 串口验证
 
-正常日志：
+正常日志（**mcp_wake**，队列为空时无 TTS）：
 
 ```
-I ReminderPoll: Reminder poller started, interval 30s, mac=aa:bb:cc:dd:ee:ff
-I ReminderPoll: New reminder meet-xxx: 请用简洁口语提醒用户...
-I Application: Deliver reminder speech: ...
+I ReminderPoll: Reminder poller started, interval 300s, mac=aa:bb:cc:dd:ee:ff
+I ReminderMqtt: MQTT wake subscribed: v1/notify/aabbccddeeff
+I ReminderPoll: poll_no_reminder
+```
+
+有提醒且 MCP 在线时：
+
+```
+I ReminderMqtt: MQTT wake -> trigger HTTP poll
+I ReminderPoll: poll_new | mode=mcp_wake
+I Application: Proactive reminder ... dispatched
+I Application: proactive_tts_start
 I ReminderPoll: Ack posted for meet-xxx
 ```
 
@@ -174,19 +185,20 @@ python mcp_pipe.py backend_alert.py
 ## 6. 端到端验证流程
 
 1. 启动 `server.py`（`DEMO_DEVICE_ID` = 设备 MAC）
-2. 启动 `mcp_pipe.py`（`MCP_ENDPOINT` 已配置）
-3. 固件烧录完成，待机 30 秒内应自动 TTS 播报演示会议提醒
-4. 唤醒设备问「有什么提醒」→ LLM 调 `backend_get_latest_alert` 应答
-5. 对话中让 LLM 调 `backend_push_alert` 推新提醒 → 设备回 idle 后再次播报
+2. 启动 `mcp_pipe.py backend_alert.py`（`MCP_ENDPOINT` 已配置）
+3. `POST /push`（`delivery_mode: mcp_wake`，**自然语言 prompt**）→ MQTT publish → 固件 `dispatched` → **`proactive_tts_start`**
+4. 空队列仅 MQTT → `poll_no_reminder`，**无 TTS**
+5. 唤醒设备问「有什么提醒」→ LLM 调 `backend_get_latest_alert` 应答
 
 ---
 
 ## 7. 数据流时序
 
 ```
-T-10min  推理/MCP backend_push_alert → POST /push → 队列入库
-T-9min   固件 idle 轮询 GET /pending → has_reminder:true
-         → DeliverReminderSpeech → 小智云 TTS
+T-10min  推理/MCP backend_push_alert → POST /push → 队列入库 + MQTT publish
+T-9min   固件 idle：MQTT 触发 GET /pending → has_reminder:true, mcp_wake
+         → 开通道 + wake opus + detect「查提醒」
+         → 小智云 MCP 读队列 → 云 TTS 推流
          → POST /ack → 队列清除
 T-8min   用户唤醒问「还有提醒吗」→ MCP backend_get_latest_alert → 无
 ```
@@ -211,8 +223,10 @@ T-8min   用户唤醒问「还有提醒吗」→ MCP backend_get_latest_alert �
 | 路径 | 说明 |
 |------|------|
 | `main/reminder/reminder_poller.cc` | 固件轮询 |
-| `main/application.cc` | `DeliverReminderSpeech` |
+| `main/reminder/reminder_mqtt_wake.cc` | MQTT 唤醒 |
+| `main/application.cc` | `DeliverReminder` / `RunReminderDelivery` |
 | `tools/inference-api-demo/server.py` | 推理 API |
 | `tools/mcp-calculator/backend_alert.py` | MCP 工具 |
 | `tools/mcp-calculator/mcp_pipe.py` | 小智云 MCP 管道 |
 | `docs/architecture-reminder-poll-mcp.md` | 架构与 API 契约 |
+| `docs/server-integration-checklist.md` | **服务器联调清单（发给后端）** |

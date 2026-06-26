@@ -160,7 +160,7 @@ public:
     // 获取初始化状态
     bool IsUIInitialized() const { return (static_cast<int>(init_state_) & static_cast<int>(InitState::UI_READY)) != 0; }
     bool IsUIReady() const { return IsUIInitialized(); }
-    bool IsEmotionSystemReady() const override { return (static_cast<int>(init_state_) & static_cast<int>(InitState::EMOTION_READY)) != 0; }
+    bool IsEmotionSystemReady() const { return (static_cast<int>(init_state_) & static_cast<int>(InitState::EMOTION_READY)) != 0; }
   //  bool IsBatteryManagerReady() const { return (static_cast<int>(init_state_) & static_cast<int>(InitState::BATTERY_READY)) != 0; }
     bool IsFullyInitialized() const { return init_state_ == InitState::ALL_READY; }
 

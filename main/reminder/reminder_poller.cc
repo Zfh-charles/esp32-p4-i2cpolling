@@ -33,15 +33,26 @@ static void ReplaceAll(std::string& str, const std::string& from, const std::str
 
 std::string ReminderPoller::ExpandDeviceIdInUrl(const std::string& url_template) {
     std::string url = url_template;
-    ReplaceAll(url, "{device_id}", SystemInfo::GetMacAddress());
-    ReplaceAll(url, "{mac}", SystemInfo::GetMacAddress());
+    const std::string mac = SystemInfo::GetMacAddress();
+    std::string mac_clean = mac;
+    ReplaceAll(mac_clean, ":", "");
+    ReplaceAll(url, "{device_id}", mac);
+    ReplaceAll(url, "{mac}", mac);
+    ReplaceAll(url, "{mac_clean}", mac_clean);
     return url;
 }
 
 void ReminderPoller::EnsureNvsConfigured() {
     Settings settings("reminder_poll", true);
     std::string poll_url = settings.GetString("poll_url");
-    if (!poll_url.empty()) {
+    if (!poll_url.empty() && poll_url.find(":8444") != std::string::npos) {
+#ifdef CONFIG_REMINDER_POLL_DEFAULT_URL
+        settings.SetString("poll_url", CONFIG_REMINDER_POLL_DEFAULT_URL);
+        ESP_LOGW(TAG, "Migrated stale poll_url from :8444 to menuconfig default");
+#else
+        return;
+#endif
+    } else if (!poll_url.empty()) {
         return;
     }
 

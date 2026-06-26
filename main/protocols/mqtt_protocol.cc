@@ -5,6 +5,8 @@
 
 #include <esp_log.h>
 #include <cstring>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <arpa/inet.h>
 #include "assets/lang_config.h"
 
@@ -142,14 +144,26 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
 
 bool MqttProtocol::SendText(const std::string& text) {
     if (publish_topic_.empty()) {
+        ESP_LOGE(TAG, "Publish topic is empty");
         return false;
     }
-    if (!mqtt_->Publish(publish_topic_, text)) {
-        ESP_LOGE(TAG, "Failed to publish message: %s", text.c_str());
-        SetError(Lang::Strings::SERVER_ERROR);
-        return false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (mqtt_ == nullptr || !mqtt_->IsConnected()) {
+            ESP_LOGW(TAG, "MQTT not connected, reconnecting (attempt %d)", attempt + 1);
+            if (!StartMqttClient(false)) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
+        }
+        if (mqtt_->Publish(publish_topic_, text)) {
+            return true;
+        }
+        ESP_LOGW(TAG, "Publish failed (attempt %d)", attempt + 1);
+        vTaskDelay(pdMS_TO_TICKS(300));
     }
-    return true;
+    ESP_LOGE(TAG, "Failed to publish message: %s", text.c_str());
+    SetError(Lang::Strings::SERVER_ERROR);
+    return false;
 }
 
 bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {

@@ -93,9 +93,12 @@ flowchart TB
 
 ---
 
-## 4. 方案 B：本地定时器 + `SendMessage`（推荐，可语音）
+## 4. 方案 B：本地定时器 + `SendMessage`（本地闹钟，非 HTTP 轮询提醒）
 
-工程在 `CONFIG_USE_ALARM` 下已有路径：`GeneralTimer` → `Application::SendMessage()` → 开通道 → `SendWakeWordDetected(提醒文案)` → 官方云按**用户说话**处理 → 返回 TTS。
+> **注意**：本节描述 `GeneralTimer` / 闹钟路径，与 **HTTP/MQTT 主动提醒的 `mcp_wake` 流程不同**。  
+> 轮询提醒请用 [architecture-reminder-poll-mcp.md](architecture-reminder-poll-mcp.md) 与 [server-integration-checklist.md](server-integration-checklist.md)。
+
+工程在 `CONFIG_USE_ALARM` 下已有路径：`GeneralTimer` → `Application::SendMessage()` → 开通道 → `SendWakeWordDetected(提醒文案)` → 官方云 TTS。
 
 ### 流程
 

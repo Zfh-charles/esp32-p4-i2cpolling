@@ -36,11 +36,10 @@ public:
     virtual void SetEmotion(const char* emotion);
     virtual void SetChatMessage(const char* role, const char* content);
     virtual void SetTheme(Theme* theme);
- 
+
     virtual Theme* GetTheme() { return current_theme_; }
     virtual void UpdateStatusBar(bool update_all = false);
     virtual void SetPowerSaveMode(bool on);
-    virtual bool IsEmotionSystemReady() const { return false; }
 
     inline int width() const { return width_; }
     inline int height() const { return height_; }

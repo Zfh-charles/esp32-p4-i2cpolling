@@ -18,6 +18,7 @@
 #if CONFIG_USE_REMINDER_POLL
 #include "reminder/reminder_trace.h"
 #include "reminder/reminder_hw_trace.h"
+#include "reminder/boot_trace.h"
 #endif
 
 #define TAG "AudioService"
@@ -261,7 +262,8 @@ void AudioService::AudioInputTask() {
         }
 
         ESP_LOGE(TAG, "Should not be here, bits: %lx", bits);
-        break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
     }
 
     ESP_LOGW(TAG, "Audio input task stopped");
@@ -283,10 +285,17 @@ void AudioService::AudioOutputTask() {
         if (!codec_->output_enabled()) {
             esp_timer_stop(audio_power_timer_);
             esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
-            if (audio_route_ == AudioRoute::Duplex) {
-                SetAudioRoute(AudioRoute::Duplex, true);
+            if (speaker_playback_hold_) {
+                if (audio_route_ == AudioRoute::Duplex) {
+                    SetAudioRoute(AudioRoute::Duplex, true);
+                } else {
+                    SetAudioRoute(AudioRoute::Playback, true);
+                }
+            } else if (IsAudioProcessorRunning()) {
+                /* User realtime AEC: both mic and speaker without RX-off hard switch */
+                SetAudioRoute(AudioRoute::Duplex, false);
             } else {
-                SetAudioRoute(AudioRoute::Playback, true);
+                codec_->EnableOutput(true);
             }
         }
         codec_->OutputData(task->pcm);
@@ -508,11 +517,14 @@ void AudioService::EnableWakeWordDetection(bool enable) {
 #endif
     if (enable) {
         if (!wake_word_initialized_) {
+            BootTraceMarkHeap("WAKE_INIT_BEGIN");
             if (!wake_word_->Initialize(codec_, models_list_)) {
                 ESP_LOGE(TAG, "Failed to initialize wake word");
+                BootTraceMark("WAKE_INIT", "fail");
                 return;
             }
             wake_word_initialized_ = true;
+            BootTraceMarkHeap("WAKE_INIT_OK");
         }
         if (IsWakeWordRunning()) {
             wake_word_->Stop();
@@ -545,7 +557,13 @@ void AudioService::EnableVoiceProcessing(bool enable) {
         /* We should make sure no audio is playing */
         ResetDecoder();
         audio_input_need_warmup_ = true;
-        if (codec_ != nullptr && audio_route_ == AudioRoute::Capture && !codec_->input_enabled()) {
+        if (codec_ != nullptr && !codec_->input_enabled()) {
+            if (!speaker_playback_hold_ && codec_->output_enabled()) {
+                /* User soft path: TTS may have left TX on — release before reopening RX */
+                codec_->EnableOutput(false);
+            }
+            esp_timer_stop(audio_power_timer_);
+            esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
             codec_->EnableInput(true);
         }
         last_input_time_ = std::chrono::steady_clock::now();

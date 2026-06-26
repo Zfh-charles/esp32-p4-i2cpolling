@@ -11,30 +11,45 @@
        │
        ▼ POST /v1/devices/{MAC}/reminders/push
 ┌──────────────────────────────────────┐
-│  推理提醒 API（server.py，VPS/本机）   │
-│  · 内存队列 _PENDING[device_id]       │
-│  · push 成功后 publish_mqtt_wake()    │
+│  VPS 提醒 API                         │
+│  · 队列 _PENDING[device_id]           │
+│  · push 成功后 publish MQTT（门铃）    │
 └──────────────┬───────────────────────┘
-               │ MQTT publish
+               │ MQTT publish（无正文）
                ▼
-     xiaozhi/reminder/wake/{MAC}
+     v1/notify/{mac_clean}     ← 生产；demo 见 team-onboarding
                │
-               ▼ subscribe（ML307 4G 公网）
+               ▼ subscribe（ML307 4G）
 ┌──────────────────────────────────────┐
 │  ESP32-P4 固件                        │
 │  ReminderMqttWake → TriggerPoll()    │
 │  ReminderPoller  → GET /pending      │
-│  Application     → 小智云 TTS 播报    │
+│  mcp_wake → 开小智云通道 + detect     │
+│  等小智云 MCP 读队列 → TTS 推流播报    │
 └──────────────────────────────────────┘
 ```
 
+**服务器联调清单与待办**：[server-integration-checklist.md](server-integration-checklist.md)
+
 | 通道 | 协议 | 谁发起 | 用途 |
 |------|------|--------|------|
-| **唤醒** | MQTT 1883 | 服务器 → 固件 | push 后秒级唤醒，触发立即 GET |
+| **唤醒** | MQTT TLS 8883（生产） | 服务器 → 固件 | push 后秒级门铃，触发 GET；**payload 无提醒正文** |
 | **拉取/确认** | HTTPS | 固件 → 服务器 | GET `/pending`、POST `/ack` |
 | **兜底** | HTTPS 周期轮询 | 固件定时 | MQTT 丢包或离线恢复后补拉 |
 
 **设备标识**：统一使用 **MAC**（小写 `aa:bb:cc:dd:ee:ff`），与 HTTP `device_id`、MQTT 主题后缀一致。
+
+### 1.1 固件启动时序（idle + wake 稳定后再连 Reminder 网络）
+
+与 ori 基线兼容：**不推迟唤醒词**，仅延后 HTTP/MQTT 负载。
+
+| 阶段 | 行为 | Kconfig / 代码 |
+|------|------|----------------|
+| 进 idle | 立刻 `EnableWakeWordDetection`；有 SD 时 MJPEG standby | `ApplyAudioPolicyForState` |
+| AFE 就绪前 | （ori，无 GIF 互斥） | — |
+| wake=1 连续 5s | 启动 `ReminderPoller` + `ReminderMqttWake` | `REMINDER_BOOT_DEFER_SEC` |
+
+完整说明见 [reminder-boot-defer-design.md](reminder-boot-defer-design.md)。
 
 ---
 
@@ -73,6 +88,7 @@
 | 文件 | 说明 |
 |------|------|
 | `docs/reminder-mqtt-wake.md` | 本文档 |
+| `docs/reminder-boot-defer-design.md` | idle+wake 延后 MQTT、WDT 止血、无 SD 显示兼容 |
 | `docs/team-onboarding.md` | 团队总览与配置清单 |
 | `sdkconfig.defaults.reminder.example` | 固件 Kconfig 参考 |
 | `tools/ngrok-poll-url.md` | 无 VPS 时用 ngrok 暴露 HTTP |
@@ -90,6 +106,7 @@
 | `CONFIG_REMINDER_POLL_DEFAULT_URL` | `https://reminder.你的域名/v1/devices/{device_id}/reminders/pending` | 公网 HTTPS，ML307 4G 可达 |
 | `CONFIG_REMINDER_POLL_DEFAULT_ACK_URL` | 留空 | 自动从 poll_url 推导 `/ack` |
 | `CONFIG_REMINDER_POLL_INTERVAL_SEC` | `300` | 兜底轮询间隔（秒） |
+| `CONFIG_REMINDER_BOOT_DEFER_SEC` | `5` | idle + wake=1 稳定此秒数后再启 HTTP/MQTT |
 | `CONFIG_REMINDER_MQTT_WAKE_DEFAULT_BROKER` | `broker.emqx.io:1883` 或自建 `mqtt.你的域名:1883` | `host:port` |
 | `CONFIG_REMINDER_MQTT_WAKE_DEFAULT_TOPIC` | `xiaozhi/reminder/wake/{device_id}` | 与服务器 `MQTT_WAKE_TOPIC_PREFIX` 一致 |
 | `CONFIG_REMINDER_MQTT_WAKE_DEFAULT_USERNAME` | 留空或 broker 账号 | 自建 Mosquitto 时填写 |
@@ -280,12 +297,13 @@ I ReminderPoll: New reminder ...
 
 | 步骤 | 期望 |
 |------|------|
-| 固件启动 | `ReminderMqtt: MQTT wake subscribed: xiaozhi/reminder/wake/<MAC>` |
-| POST push | 服务器 `[mqtt] wake published topic=...` |
-| 发 MQTT / push 自动唤醒 | 串口 `MQTT wake -> trigger HTTP poll` |
-| GET pending | `poll_begin` → `New reminder` → TTS |
-| 队列为空时仅 MQTT | `poll_no_reminder`，无 TTS |
-| 兜底轮询 | 关闭 MQTT 或断网恢复后，300s 内仍能拉到 |
+| 固件启动 | `MQTT wake subscribed: v1/notify/<mac_clean>` |
+| POST push | 服务器 publish MQTT；固件 `MQTT wake -> trigger HTTP poll` |
+| 空队列仅 MQTT | `poll_no_reminder`，**无 TTS** |
+| 有队列 mcp_wake | `dispatched` → **`proactive_tts_start`** → TTS 播自然 prompt |
+| MCP 离线 | 有 `dispatched` 无 TTS（90s 超时） |
+
+完整服务器待办：[server-integration-checklist.md](server-integration-checklist.md)
 
 ---
 

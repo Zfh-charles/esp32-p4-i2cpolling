@@ -8,6 +8,9 @@
 #include <esp_log.h>
 #include <spi_flash_mmap.h>
 #include <esp_timer.h>
+#if CONFIG_USE_REMINDER_POLL
+#include "reminder/boot_trace.h"
+#endif
 #include <cbin_font.h>
 
 
@@ -102,6 +105,7 @@ bool Assets::InitializePartition() {
 }
 
 bool Assets::Apply() {
+    BootTraceMark("ASSETS_APPLY", "begin");
     void* ptr = nullptr;
     size_t size = 0;
     if (!GetAssetData("index.json", ptr, size)) {
@@ -248,6 +252,7 @@ bool Assets::Apply() {
     if (current_theme != nullptr) {
         display->SetTheme(current_theme);
     }
+    BootTraceMarkHeap("ASSETS_APPLY_OK");
 #elif defined(CONFIG_USE_EMOTE_MESSAGE_STYLE)
     auto &board = Board::GetInstance();
     auto display = board.GetDisplay();

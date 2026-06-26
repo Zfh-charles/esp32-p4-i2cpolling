@@ -44,9 +44,14 @@ if(CONFIG_USE_ALARM)
     list(APPEND INCLUDE_DIRS "alarm")
 endif()
 
+set(REMINDER_EMBED_FILES "")
 if(CONFIG_USE_REMINDER_POLL)
-    list(APPEND SOURCES "reminder/reminder_poller.cc" "reminder/reminder_diag.cc" "reminder/reminder_lifecycle_trace.cc" "reminder/reminder_hw_trace.cc")
+    list(APPEND SOURCES "reminder/reminder_poller.cc" "reminder/reminder_diag.cc" "reminder/reminder_lifecycle_trace.cc" "reminder/reminder_hw_trace.cc" "reminder/boot_trace.cc")
     list(APPEND INCLUDE_DIRS "reminder")
+    if(NOT CONFIG_REMINDER_MQTT_TLS_INSECURE)
+        list(APPEND SOURCES "reminder/reminder_mqtt_tls.cc")
+        list(APPEND REMINDER_EMBED_FILES "reminder/certs/mqtt_ca.pem")
+    endif()
 endif()
 if(CONFIG_REMINDER_MQTT_WAKE)
     list(APPEND SOURCES "reminder/reminder_mqtt_wake.cc")
@@ -688,7 +693,7 @@ if(CONFIG_IDF_TARGET_ESP32)
 endif()
 
 idf_component_register(SRCS ${SOURCES}
-                    EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
+                    EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS} ${REMINDER_EMBED_FILES}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
                     WHOLE_ARCHIVE
                     )
@@ -795,17 +800,24 @@ function(build_default_assets_bin)
     if(DEFAULT_ASSETS_EXTRA_FILES)
         list(APPEND BUILD_ARGS "--extra_files" "${DEFAULT_ASSETS_EXTRA_FILES}")
     endif()
+
+    if(DEFAULT_ASSETS_EMOJI_EXTRA)
+        list(APPEND BUILD_ARGS "--emoji_extra_dir" "${DEFAULT_ASSETS_EMOJI_EXTRA}")
+    endif()
     
     list(APPEND BUILD_ARGS "--esp_sr_model_path" "${ESP_SR_MODEL_PATH}")
     list(APPEND BUILD_ARGS "--xiaozhi_fonts_path" "${XIAOZHI_FONTS_PATH}")
     
+    set(ASSETS_BIN_DEPENDS
+        ${SDKCONFIG}
+        ${PROJECT_DIR}/scripts/build_default_assets.py
+    )
+
     # Create custom command to build assets
     add_custom_command(
         OUTPUT ${GENERATED_ASSETS_BIN}
         COMMAND python ${PROJECT_DIR}/scripts/build_default_assets.py ${BUILD_ARGS}
-        DEPENDS
-            ${SDKCONFIG}
-            ${PROJECT_DIR}/scripts/build_default_assets.py
+        DEPENDS ${ASSETS_BIN_DEPENDS}
         COMMENT "Building default assets.bin based on configuration"
         VERBATIM
     )

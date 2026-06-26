@@ -165,7 +165,10 @@ private:
     /** Scheme D: single-path idle recovery (one I2S switch + wake rearm). */
     void EnterIdleStandby(bool show_wake_hint = true);
     void UpdateCapturePowerHold();
+    void TryStartDeferredReminderNet();
     esp_timer_handle_t proactive_feedback_timer_handle_ = nullptr;
+    bool deferred_reminder_services_pending_ = false;
+    int64_t wake_running_since_us_ = 0;
     bool idle_rearm_in_progress_ = false;
     std::string last_reminder_display_text_;
     std::string last_reminder_emotion_;

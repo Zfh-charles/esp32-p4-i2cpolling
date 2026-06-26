@@ -1,5 +1,8 @@
 #include "afe_wake_word.h"
 #include "audio_service.h"
+#if CONFIG_USE_REMINDER_POLL
+#include "reminder/boot_trace.h"
+#endif
 
 #include <esp_log.h>
 #include <sstream>
@@ -79,7 +82,9 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
     
     afe_iface_ = esp_afe_handle_from_config(afe_config);
+    BootTraceMarkHeap("AFE_CREATE_BEGIN");
     afe_data_ = afe_iface_->create_from_config(afe_config);
+    BootTraceMarkHeap("AFE_CREATE_OK");
 
     xTaskCreate([](void* arg) {
         auto this_ = (AfeWakeWord*)arg;
@@ -124,11 +129,17 @@ void AfeWakeWord::AudioDetectionTask() {
     auto feed_size = afe_iface_->get_feed_chunksize(afe_data_);
     ESP_LOGI(TAG, "Audio detection task started, feed size: %d fetch size: %d",
         feed_size, fetch_size);
+    BootTraceMark("AFE_TASK", "started");
 
+    bool first_fetch = true;
     while (true) {
         xEventGroupWaitBits(event_group_, DETECTION_RUNNING_EVENT, pdFALSE, pdTRUE, portMAX_DELAY);
 
         auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
+        if (first_fetch) {
+            BootTraceMarkHeap("AFE_FIRST_FETCH");
+            first_fetch = false;
+        }
         if (res == nullptr || res->ret_value == ESP_FAIL) {
             continue;;
         }

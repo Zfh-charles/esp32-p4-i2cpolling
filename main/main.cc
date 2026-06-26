@@ -9,6 +9,9 @@
 
 #include "application.h"
 #include "system_info.h"
+#if CONFIG_USE_REMINDER_POLL
+#include "reminder/boot_trace.h"
+#endif
 
 #define TAG "main"
 
@@ -25,6 +28,10 @@ extern "C" void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+#if CONFIG_USE_REMINDER_POLL
+    BootTraceInit();
+#endif
 
     // Launch the application
     auto& app = Application::GetInstance();

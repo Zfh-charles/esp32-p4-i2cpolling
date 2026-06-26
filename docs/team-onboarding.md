@@ -66,11 +66,11 @@
 - **MQTT 唤醒**：`启用 MQTT 唤醒后立即 HTTP 拉取提醒`（`CONFIG_REMINDER_MQTT_WAKE`，推荐开启）
 - **间隔**：`CONFIG_REMINDER_POLL_INTERVAL_SEC`（**生产建议 300s 兜底**；纯轮询调试可用 60s）
 - **流程**：
-  1. 服务器 `POST /push` → 入队 → **MQTT publish** `xiaozhi/reminder/wake/{MAC}`
+  1. 服务器 `POST /push` → 入队 → **MQTT publish** `v1/notify/{mac_clean}`（生产）或 `xiaozhi/reminder/wake/{device_id}`（demo）
   2. 固件 `ReminderMqttWake` 收到 → `TriggerPoll()` → **立即** `GET {poll_url}`
   3. 无 MQTT 时由周期轮询兜底
   4. `has_reminder: false` → **完全静默**，不上屏、不 TTS
-  5. `has_reminder: true` → 按 `delivery_mode` 投递
+  5. `has_reminder: true` → 按 `delivery_mode` 投递（**默认 `mcp_wake`**）
   6. 播报成功 → `POST {ack_url}` → NVS 记录 `last_id` 防重复
 - **NVS 命名空间** `reminder_poll`：
 
@@ -85,8 +85,8 @@
 
 | 键 | 说明 |
 |----|------|
-| `broker` | 如 `broker.emqx.io:1883` 或自建 `mqtt.域名:1883` |
-| `topic` | 如 `xiaozhi/reminder/wake/{device_id}` |
+| `broker` | 如 `114.245.179.11:8883`（TLS）或 demo `broker.emqx.io:1883` |
+| `topic` | 生产 `v1/notify/{mac_clean}`；demo `xiaozhi/reminder/wake/{device_id}` |
 | `username` / `password` | 可选 |
 | `client_id` | 可选，默认 `xiaozhi-{MAC无冒号}` |
 
@@ -99,14 +99,33 @@
 
 ### 2.4 主动提醒投递模式
 
+> 完整约束与服务器待办：[server-integration-checklist.md](server-integration-checklist.md)
+
 | 模式 | JSON 字段 | 固件行为 |
 |------|-----------|----------|
-| **mcp_wake**（默认） | `delivery_mode: "mcp_wake"`, `wake_text: "查提醒"` | 开云通道 → 发短唤醒词 → 云端 MCP 读队列 → TTS 完整 `prompt`。**UI 推迟到 TTS 开始**，无消息不打扰 |
-| **direct_wake** | `delivery_mode: "direct_wake"` | 将完整 `prompt` 作为唤醒词发送（≤32 字） |
-| **alert_only** | `speak: false` | 仅屏幕 + 振动，不连云 TTS |
+| **mcp_wake**（**默认，生产必用**） | `delivery_mode: "mcp_wake"`, `wake_text: "查提醒"` | 开云通道 → 发 **wake opus** + 短 detect「查提醒」→ **idle 等小智云 TTS 推流**；正文由 **MCP 读 HTTP 队列** 后生成。**无消息不播报**；UI 推迟到 TTS 开始 |
+| `direct_wake` | `delivery_mode: "direct_wake"` | 将 prompt（≤32 字）作为 detect 发出。**勿默认**：长文本易被小智云拒播/无声 |
+| `alert_only` | `speak: false` | 仅屏幕 + 振动，不连云 TTS |
 
-- **反馈窗口**：`CONFIG_REMINDER_FEEDBACK_SEC`（默认 5s）— 播报后短暂聆听用户反馈
-- **唤醒短语**：`CONFIG_REMINDER_WAKE_PHRASE`（默认「查提醒」）
+**铁律（勿反复犯错）：**
+
+1. **禁止**把队列长 `prompt` 当 detect 上传小智云（除非充分实测的短句 `direct_wake`）。
+2. **必须** `mcp_wake` + MCP pipe 在线 + 云主动 TTS；固件 `CONFIG_SEND_WAKE_WORD_DATA=y` 时会先发 wake opus。
+3. **`prompt` 只写最终播报句**，自然口语；**不要**写「请播报…」「请用口语提醒用户…」等流程描述。
+4. 队列为空 → 完全静默，不上屏、不 TTS。
+
+**prompt 示例：**
+
+```json
+// ❌ 差
+"prompt": "请用简洁口语提醒用户：10分钟后有产品评审会。"
+
+// ✅ 好
+"prompt": "十分钟后有产品评审会，记得进会议室。"
+```
+
+- **反馈窗口**：`CONFIG_REMINDER_FEEDBACK_SEC`（默认 5s）— TTS 结束后短暂聆听用户反馈
+- **唤醒短语**：`CONFIG_REMINDER_WAKE_PHRASE`（默认「查提醒」）— 仅 mcp_wake detect 用，不是播报正文
 
 ### 2.5 用户主动对话
 
@@ -120,14 +139,17 @@
 
 ## 3. PC / 云端服务机制
 
-### 3.1 小智云 TTS
+### 3.1 小智云 TTS（主动提醒）
 
-- 固件 **不本地合成** 主动提醒长文案，而是：
+- 固件 **不本地合成** 长文案，也 **不在 mcp_wake 下上传 queue prompt**。
+- **mcp_wake 流程**：
   1. `OpenAudioChannel()` 连接官方 MQTT/UDP
-  2. `SendWakeWordDetected(text)` 触发云端会话
-  3. 云端返回 `tts` JSON + 音频包 → 扬声器播放
-- **前提**：设备已在小智控制台激活，能正常语音对话
-- **限制**：官方云 **不提供**「待机推送 API」；待机播报必须靠本仓库的 **HTTP 轮询 + 自建队列**
+  2. 发送 **wake opus 包**（若 `CONFIG_SEND_WAKE_WORD_DATA=y`）+ `SendWakeWordDetected("查提醒")`
+  3. 小智云 LLM 调 MCP `backend_get_latest_alert` → 读 VPS 队列 `prompt`
+  4. 小智云 **主动** 返回 `tts` JSON + opus 音频 → 固件播放
+  5. 无 TTS  within 90s → `proactive_tts_no_audio`，不 ack
+- **前提**：设备已激活；**MCP pipe 常驻**；队列 `prompt` 为自然播报句
+- **限制**：官方云无待机 notify API；勿用长文本 direct_wake 代替上述流程
 
 ### 3.2 HTTP 队列服务（server.py）
 
@@ -279,9 +301,9 @@ MCP 侧 `INFERENCE_API_BASE`：与 server 同机用 `http://127.0.0.1:8765`；�
 | 5 | **poll_url** | menuconfig 或 NVS `reminder_poll` | `https://<公网>/v1/devices/{device_id}/reminders/pending` |
 | 6 | **ack_url** | 可选 menuconfig | 留空则自动 `/pending` → `/ack` |
 | 7 | **轮询间隔（兜底）** | menuconfig | **300**（MQTT 为主）；纯轮询调试 60 |
-| 8 | **MQTT broker** | menuconfig 或 NVS `reminder_mqtt` | `broker.emqx.io:1883` 或 `mqtt.域名:1883` |
-| 9 | **MQTT 主题** | menuconfig 或 NVS `reminder_mqtt` | `xiaozhi/reminder/wake/{device_id}` |
-| 10 | **服务器 MQTT_WAKE_*** | `inference-api-demo/.env` | 与固件 broker、topic 前缀一致 |
+| 8 | **MQTT broker** | menuconfig 或 NVS `reminder_mqtt` | 生产 `114.245.179.11:8883` |
+| 9 | **MQTT 主题** | menuconfig 或 NVS `reminder_mqtt` | 生产 `v1/notify/{mac_clean}` |
+| 10 | **服务器 MQTT / push / MCP** | VPS | 见 [server-integration-checklist.md](server-integration-checklist.md) |
 | 11 | **COM 口** | `tools/build-flash.bat` 参数 | 本机 `COM6` / `COM3` 等 |
 | 12 | **ESP-IDF 路径** | `tools/build-flash.bat` 第 13 行 | 团队统一 `C:\esp_alm\v5.4.1\esp-idf` |
 | 13 | **SD 卡表情** | 物理 SD | `/sdcard/mjpeg/standby.mjpeg` 等 |
@@ -316,7 +338,7 @@ tools\build-flash.bat COMx         # x = 本机端口
 
 ```
 I ReminderPoll: Reminder poller started, interval 300s, mac=...
-I ReminderMqtt: MQTT wake subscribed: xiaozhi/reminder/wake/<MAC>
+I ReminderMqtt: MQTT wake subscribed: v1/notify/<mac_clean>
 I ReminderPoll: poll_no_reminder          # 队列为空时
 ```
 
@@ -344,11 +366,13 @@ python mcp_pipe.py backend_alert.py
 
 | 步骤 | 期望 |
 |------|------|
-| 空队列 idle 1 分钟 | 仅 `poll_no_reminder`，无 TTS、无弹窗 |
-| `POST /push` | 服务器 `[mqtt] wake published`；**数秒内**串口 `MQTT wake -> trigger HTTP poll` |
-| 仅发 MQTT（队列已有提醒） | `test_mqtt_wake.py` → 立即 poll，非等 300s |
-| 唤醒问「有什么提醒」 | MCP 返回队列内容 |
-| `python tools/reminder-diag-watch.py COMx` | 生命周期 trace PASS |
+| 空队列 idle | 仅 `poll_no_reminder`，**无 TTS、无弹窗** |
+| `POST /push`（mcp_wake + 自然 prompt） | MQTT publish → `MQTT wake -> trigger HTTP poll` → `dispatched` → **`proactive_tts_start`** |
+| 仅 MQTT（队列已有提醒） | 立即 poll，非等兜底间隔 |
+| MCP pipe 离线 | 有 `dispatched` 但 **无 TTS**（90s 超时）— 说明 MCP 必开 |
+| 唤醒问「有什么提醒」 | MCP 返回队列内容（User 对话路径） |
+
+服务器侧完整清单：[server-integration-checklist.md](server-integration-checklist.md)
 
 ### 6.5 更换 poll_url / 擦 NVS
 
@@ -375,10 +399,11 @@ NVS 中 `poll_url` **首次写入后持久保存**。更换 ngrok 域名时需�
 
 相关设计文档：
 
-- [reminder-mqtt-wake.md](reminder-mqtt-wake.md) — **MQTT 唤醒本地/服务器部署**
-- [architecture-reminder-poll-mcp.md](architecture-reminder-poll-mcp.md)
+- [server-integration-checklist.md](server-integration-checklist.md) — **服务器联调清单与待办（发给后端）**
+- [reminder-mqtt-wake.md](reminder-mqtt-wake.md) — MQTT 唤醒本地/服务器部署
+- [architecture-reminder-poll-mcp.md](architecture-reminder-poll-mcp.md) — 架构与 mcp_wake 流程
 - [standby-reminder-deployment.md](standby-reminder-deployment.md)
-- [proactive-reminder-official-cloud.md](proactive-reminder-official-cloud.md)
+- [proactive-reminder-official-cloud.md](proactive-reminder-official-cloud.md) — 官方云能力边界
 
 ---
 
@@ -389,8 +414,9 @@ NVS 中 `poll_url` **首次写入后持久保存**。更换 ngrok 域名时需�
 | 一直 `poll_no_reminder` | 队列空 / MAC 不匹配 | 检查 `DEMO_DEVICE_ID` 与串口 MAC |
 | 轮询无 HTTP 响应 | poll_url 错 / ngrok 过期 | 更新 URL，擦 NVS |
 | push 后要等很久才播报 | MQTT 未通，仅靠兜底轮询 | 查 `ReminderMqtt subscribed`；对齐 broker/topic |
-| 有 wake 无 TTS | poll_url 不可达 / 非 idle | 查 ngrok/VPS；等设备 `state=idle` |
-| 有提醒但不 TTS | 云未连 / MCP 未返回内容 | 查串口 `proactive_tts_no_audio` |
+| 有 wake 无 TTS | MCP 未在线 / 云未推 TTS / 非 idle | 查 `proactive_tts_no_audio`；开 mcp_pipe；见 server-integration-checklist |
+| 有提醒但不 TTS | 用了 direct_wake 或 prompt 像流程描述 | 改 `mcp_wake`；prompt 写自然播报句 |
+| push 403 | VPS 鉴权未开 | 后端修复，见 server-integration-checklist |
 | push 无 `[mqtt]` 日志 | 未装 paho-mqtt / 多实例 server | `pip install paho-mqtt`；只保留一个 `server.py` |
 | 无消息仍打扰 | 演示脚本自动 push | `SEED_DEMO_ON_START=0`, `PUSH_ON_START=0` |
 | 烧录失败 | COM 占用 / 未进下载模式 | `free-com-port.ps1`，BOOT+RESET |

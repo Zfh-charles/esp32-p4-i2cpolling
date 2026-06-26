@@ -1,13 +1,18 @@
 #include "reminder_mqtt_wake.h"
 
 #include "reminder_poller.h"
+#include "reminder_mqtt_tls.h"
 #include "board.h"
 #include "settings.h"
 #include "system_info.h"
 #include "mqtt.h"
+#include <at_modem.h>
 
 #include <esp_log.h>
 #include <cstring>
+#include <cstdio>
+#include <cctype>
+#include <mbedtls/md.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <memory>
@@ -30,10 +35,61 @@ static void ReplaceAll(std::string& str, const std::string& from, const std::str
 std::string ReminderMqttWake::ExpandDeviceIdInTopic(const std::string& topic_template) {
     std::string topic = topic_template;
     const std::string mac = SystemInfo::GetMacAddress();
+    std::string mac_clean = mac;
+    ReplaceAll(mac_clean, ":", "");
     ReplaceAll(topic, "{device_id}", mac);
     ReplaceAll(topic, "{mac}", mac);
+    ReplaceAll(topic, "{mac_clean}", mac_clean);
     return topic;
 }
+
+#if CONFIG_REMINDER_MQTT_WAKE_DERIVE_PASSWORD
+static bool HexDecode(const char* hex, unsigned char* out, size_t out_len) {
+    if (hex == nullptr || (strlen(hex) % 2) != 0) {
+        return false;
+    }
+    const size_t hex_len = strlen(hex);
+    if (hex_len / 2 != out_len) {
+        return false;
+    }
+    for (size_t i = 0; i < out_len; ++i) {
+        char byte_str[3] = {hex[i * 2], hex[i * 2 + 1], '\0'};
+        for (int j = 0; j < 2; ++j) {
+            if (!std::isxdigit(static_cast<unsigned char>(byte_str[j]))) {
+                return false;
+            }
+        }
+        out[i] = static_cast<unsigned char>(strtoul(byte_str, nullptr, 16));
+    }
+    return true;
+}
+
+static std::string DeriveMqttPassword() {
+    std::string mac_clean = SystemInfo::GetMacAddress();
+    ReplaceAll(mac_clean, ":", "");
+    const char* salt_hex = CONFIG_REMINDER_MQTT_WAKE_SECRET_SALT;
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (info == nullptr || salt_hex == nullptr || salt_hex[0] == '\0') {
+        return std::string();
+    }
+    unsigned char salt_key[32];
+    if (!HexDecode(salt_hex, salt_key, sizeof(salt_key))) {
+        ESP_LOGE(TAG, "Invalid MQTT password salt (expect 64 hex chars)");
+        return std::string();
+    }
+    unsigned char out[32];
+    if (mbedtls_md_hmac(info, salt_key, sizeof(salt_key),
+                        reinterpret_cast<const unsigned char*>(mac_clean.data()), mac_clean.size(),
+                        out) != 0) {
+        return std::string();
+    }
+    char hex[33];
+    for (int i = 0; i < 16; ++i) {
+        snprintf(hex + i * 2, 3, "%02x", out[i]);
+    }
+    return std::string(hex, 32);
+}
+#endif
 
 void ReminderMqttWake::EnsureNvsConfigured() {
     Settings settings("reminder_mqtt", true);
@@ -64,10 +120,16 @@ void ReminderMqttWake::EnsureNvsConfigured() {
         settings.SetString("username", username);
     }
 #endif
-#ifdef CONFIG_REMINDER_MQTT_WAKE_DEFAULT_PASSWORD
+#if defined(CONFIG_REMINDER_MQTT_WAKE_DEFAULT_PASSWORD) && !CONFIG_REMINDER_MQTT_WAKE_DERIVE_PASSWORD
     std::string password = CONFIG_REMINDER_MQTT_WAKE_DEFAULT_PASSWORD;
     if (!password.empty()) {
         settings.SetString("password", password);
+    }
+#endif
+#ifdef CONFIG_REMINDER_MQTT_WAKE_DEFAULT_CLIENT_ID
+    std::string client_id = CONFIG_REMINDER_MQTT_WAKE_DEFAULT_CLIENT_ID;
+    if (!client_id.empty()) {
+        settings.SetString("client_id", client_id);
     }
 #endif
     ESP_LOGI(TAG, "Wrote default MQTT wake broker to NVS (device=%s)", SystemInfo::GetMacAddress().c_str());
@@ -117,8 +179,14 @@ bool ReminderMqttWake::ConnectOnce() {
     Settings settings("reminder_mqtt", false);
     const std::string broker_endpoint = settings.GetString("broker");
     const std::string topic_template = settings.GetString("topic", "xiaozhi/reminder/wake/{device_id}");
-    const std::string username = settings.GetString("username");
-    const std::string password = settings.GetString("password");
+    const std::string username = ExpandDeviceIdInTopic(settings.GetString("username"));
+    std::string password = settings.GetString("password");
+#if CONFIG_REMINDER_MQTT_WAKE_DERIVE_PASSWORD
+    password = DeriveMqttPassword();
+    if (password.empty()) {
+        ESP_LOGE(TAG, "Derived MQTT password empty (check salt config)");
+    }
+#endif
 
     if (broker_endpoint.empty()) {
         return false;
@@ -135,13 +203,22 @@ bool ReminderMqttWake::ConnectOnce() {
     }
 
     const std::string subscribe_topic = ExpandDeviceIdInTopic(topic_template);
-    std::string client_id = settings.GetString("client_id");
+    std::string client_id = ExpandDeviceIdInTopic(settings.GetString("client_id"));
     if (client_id.empty()) {
         client_id = "xiaozhi-" + SystemInfo::GetMacAddress();
         ReplaceAll(client_id, ":", "");
     }
 
     auto network = Board::GetInstance().GetNetwork();
+#if !CONFIG_REMINDER_MQTT_TLS_INSECURE
+    if (broker_port == 8883) {
+        auto* at_modem = dynamic_cast<AtModem*>(network);
+        if (at_modem == nullptr || !ReminderMqttInstallCaCert(at_modem->GetAtUart())) {
+            ESP_LOGE(TAG, "MQTT CA cert install failed");
+            return false;
+        }
+    }
+#endif
     mqtt_ = network->CreateMqtt(1);
     if (!mqtt_) {
         ESP_LOGE(TAG, "Failed to create MQTT client (index 1)");

@@ -17,6 +17,9 @@
 #include <esp_log.h>
 #include <driver/i2c_master.h>
 #include <esp_lvgl_port.h>
+#if CONFIG_USE_REMINDER_POLL
+#include "reminder/boot_trace.h"
+#endif
 #include "driver/uart.h"
 #include "driver/gpio.h"
 
@@ -170,11 +173,20 @@ private:
 
     void InitializeSDCard() {
         ESP_LOGI(TAG, "初始化SD卡扫描器");
+#if CONFIG_USE_REMINDER_POLL
+        BootTraceMark("SD_MOUNT", "begin");
+#endif
         esp_err_t ret = sd_scanner_init_and_scan();
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "⚠️ SD卡初始化失败: %s", esp_err_to_name(ret));
+#if CONFIG_USE_REMINDER_POLL
+            BootTraceMark("SD_MOUNT", "fail");
+#endif
         } else {
             ESP_LOGI(TAG, "✅ SD卡初始化成功");
+#if CONFIG_USE_REMINDER_POLL
+            BootTraceMarkHeap("SD_MOUNT_OK");
+#endif
         }
     }
 

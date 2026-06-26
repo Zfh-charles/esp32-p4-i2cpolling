@@ -790,6 +790,26 @@ menu "XVSENFENG_ALARM"
         help
             idle 主动推流时只发送此短句唤醒云端对话；完整文案由 MCP 从队列读取后 TTS。
 
+    config REMINDER_DIRECT_WAKE_MAX_CHARS
+        int "direct_wake 最大 detect 字符数（官方云限制）"
+        default 32
+        range 8 32
+        depends on USE_REMINDER_POLL
+        help
+            官方小智云 listen/detect 仅接受短唤醒词，长文本会报错
+            "detect is only for wake words"。超过此长度自动降级 mcp_wake。
+            mcp_wake 只发 REMINDER_WAKE_PHRASE；完整 prompt 由屏幕显示。
+
+    config REMINDER_ANNOUNCE_REPEAT
+        int "单次投递内重诵次数"
+        default 1
+        range 1 5
+        depends on USE_REMINDER_POLL
+        help
+            同一条提醒在一次投递里连续重诵的遍数（1=不重复）。
+            注意: 对 direct_wake / alert_only 由固件控制文案，重诵生效；
+            mcp_wake 的语音由云端 MCP 读服务器队列生成，重诵需在服务器侧实现。
+
     config REMINDER_DIAG_AUTO_HEAL
         bool "诊断异常时自动恢复 idle 音频（唤醒词+麦克风）"
         default y
@@ -806,6 +826,23 @@ menu "XVSENFENG_ALARM"
             推理服务在 push 后向设备订阅主题发布唤醒消息，固件立即 GET /pending。
             与 HTTP 周期轮询并存（轮询作兜底）。ML307 4G 需 broker 公网可达。
 
+    config REMINDER_BOOT_TRACE
+        bool "开机阶段 BootTrace 诊断（串口过滤 BootTrace）"
+        default n
+        depends on USE_REMINDER_POLL
+        help
+            记录各启动阶段时间戳、堆内存、复位原因；WDT/ panic 后打印 REBOOT_AFTER 与 SUMMARY。
+
+    config REMINDER_BOOT_DEFER_SEC
+        int "唤醒词就绪后再启动 Reminder 网络（秒）"
+        range 3 120
+        default 5
+        depends on USE_REMINDER_POLL
+        help
+            ori 路径：进 idle 即 EnableWakeWordDetection。
+            本项仅延迟 HTTP 轮询与 MQTT 唤醒，在 wake=1 稳定运行此秒数后再连网。
+            避开 AFE 初始化与 4G/MQTT 并发导致 WDT。
+
     config REMINDER_MQTT_WAKE_DEFAULT_BROKER
         string "默认 MQTT broker（host:port）"
         default "broker.emqx.io:1883"
@@ -814,11 +851,13 @@ menu "XVSENFENG_ALARM"
             首次启动写入 NVS reminder_mqtt.broker。本地调试可用公网 broker 或 ngrok tcp 1883。
 
     config REMINDER_MQTT_WAKE_DEFAULT_TOPIC
-        string "MQTT 订阅主题（支持 {device_id}）"
+        string "MQTT 订阅主题（支持 {device_id}/{mac}/{mac_clean}）"
         default "xiaozhi/reminder/wake/{device_id}"
         depends on REMINDER_MQTT_WAKE
         help
-            推理服务 push 后应向同一主题发布唤醒。device_id 为设备 MAC。
+            推理服务 push 后应向同一主题发布唤醒。
+            占位符: {device_id}/{mac}=带冒号 MAC，{mac_clean}=无冒号小写 MAC。
+            生产建议 v1/notify/{mac_clean}，并与服务器发布主题、Mosquitto ACL 三处一致。
 
     config REMINDER_MQTT_WAKE_DEFAULT_USERNAME
         string "MQTT 用户名（可留空）"
@@ -829,5 +868,36 @@ menu "XVSENFENG_ALARM"
         string "MQTT 密码（可留空）"
         default ""
         depends on REMINDER_MQTT_WAKE
+
+    config REMINDER_MQTT_WAKE_DEFAULT_CLIENT_ID
+        string "MQTT client_id（留空则用 xiaozhi-<MAC无冒号>；支持 {mac_clean}）"
+        default ""
+        depends on REMINDER_MQTT_WAKE
+        help
+            首次启动写入 NVS reminder_mqtt.client_id。broker 按 client_id 做 ACL 限制时填写。
+            生产模板示例: esp32-{mac_clean}。
+
+    config REMINDER_MQTT_WAKE_DERIVE_PASSWORD
+        bool "派生 MQTT 密码（HMAC-SHA256(salt, mac_clean)）"
+        default n
+        depends on REMINDER_MQTT_WAKE
+        help
+            启用后忽略 NVS/默认密码，开机用 HMAC-SHA256(hex_decode(salt), mac_clean) 前 32 位 hex 作为密码。
+            salt 为 64 字符 hex（32 字节）；输出 32 字符小写 hex。务必与 broker 侧算法一致。
+
+    config REMINDER_MQTT_WAKE_SECRET_SALT
+        string "派生密码用的 salt"
+        default ""
+        depends on REMINDER_MQTT_WAKE_DERIVE_PASSWORD
+        help
+            HMAC 的密钥种子（64 字符 hex，固件侧 hex 解码为 32 字节）。务必与 broker 侧 salt 完全一致。
+
+    config REMINDER_MQTT_TLS_INSECURE
+        bool "MQTT TLS 不校验服务器证书（开发/自签用）"
+        default y
+        depends on REMINDER_MQTT_WAKE
+        help
+            y: 8883 连接关闭证书校验（仅加密，开发用）。
+            n: 启用服务器证书校验；固件嵌入 main/reminder/certs/mqtt_ca.pem 并上传至 ML307。
 endmenu
 endmenu
