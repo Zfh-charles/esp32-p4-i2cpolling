@@ -85,7 +85,7 @@
 
 | 键 | 说明 |
 |----|------|
-| `broker` | 如 `114.245.179.11:8883`（TLS）或 demo `broker.emqx.io:1883` |
+| `broker` | 如 `114.245.178.62:8883`（TLS）或 demo `broker.emqx.io:1883` |
 | `topic` | 生产 `v1/notify/{mac_clean}`；demo `xiaozhi/reminder/wake/{device_id}` |
 | `username` / `password` | 可选 |
 | `client_id` | 可选，默认 `xiaozhi-{MAC无冒号}` |
@@ -301,7 +301,7 @@ MCP 侧 `INFERENCE_API_BASE`：与 server 同机用 `http://127.0.0.1:8765`；�
 | 5 | **poll_url** | menuconfig 或 NVS `reminder_poll` | `https://<公网>/v1/devices/{device_id}/reminders/pending` |
 | 6 | **ack_url** | 可选 menuconfig | 留空则自动 `/pending` → `/ack` |
 | 7 | **轮询间隔（兜底）** | menuconfig | **300**（MQTT 为主）；纯轮询调试 60 |
-| 8 | **MQTT broker** | menuconfig 或 NVS `reminder_mqtt` | 生产 `114.245.179.11:8883` |
+| 8 | **MQTT broker** | menuconfig 或 NVS `reminder_mqtt` | 生产 `114.245.178.62:8883` |
 | 9 | **MQTT 主题** | menuconfig 或 NVS `reminder_mqtt` | 生产 `v1/notify/{mac_clean}` |
 | 10 | **服务器 MQTT / push / MCP** | VPS | 见 [server-integration-checklist.md](server-integration-checklist.md) |
 | 11 | **COM 口** | `tools/build-flash.bat` 参数 | 本机 `COM6` / `COM3` 等 |

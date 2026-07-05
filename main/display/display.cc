@@ -11,9 +11,6 @@
 #include "audio_codec.h"
 #include "settings.h"
 #include "assets/lang_config.h"
-#if CONFIG_USE_REMINDER_POLL
-#include "reminder/reminder_hw_trace.h"
-#endif
 
 #define TAG "Display"
 
@@ -25,9 +22,6 @@ Display::~Display() {
 
 void Display::SetStatus(const char* status) {
     ESP_LOGW(TAG, "SetStatus: %s", status);
-#if CONFIG_USE_REMINDER_POLL
-    ReminderUiTraceStatus(status);
-#endif
 }
 
 void Display::ShowNotification(const std::string &notification, int duration_ms) {
@@ -49,9 +43,6 @@ void Display::SetEmotion(const char* emotion) {
 void Display::SetChatMessage(const char* role, const char* content) {
     ESP_LOGW(TAG, "Role:%s", role);
     ESP_LOGW(TAG, "     %s", content);
-#if CONFIG_USE_REMINDER_POLL
-    ReminderUiTraceText(role, content, content != nullptr && content[0] != '\0' ? 1 : 0);
-#endif
 }
 
 void Display::SetTheme(Theme* theme) {

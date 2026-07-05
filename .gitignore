@@ -1,5 +1,6 @@
 tmp/
-components/
+components/*
+!components/eezui/
 managed_components/
 build/
 .vscode/

@@ -68,9 +68,9 @@ MQTT 主题、账号、TLS 必须与固件一致（见 §3）。
 |----|-----------|----------------|
 | 设备 MAC（HTTP） | `30:ed:a0:e1:b5:28` | `device_id` / push / pending 路径 |
 | MAC 无冒号 | `30eda0e1b528` | MQTT 主题、MQTT 用户名 |
-| HTTP poll | `http://114.245.179.11:8443/v1/devices/{device_id}/reminders/pending` | 4G 可达，返回 200 |
+| HTTP poll | `http://114.245.178.62:8443/v1/devices/{device_id}/reminders/pending` | 4G 可达，返回 200 |
 | HTTP ack | `.../reminders/ack` | 固件播报成功后 POST |
-| MQTT broker | `114.245.179.11:8883`（TLS） | push 后 publish 同一 broker |
+| MQTT broker | `114.245.178.62:8883`（TLS） | push 后 publish 同一 broker |
 | MQTT 主题 | `v1/notify/30eda0e1b528` | **`v1/notify/{mac_clean}`**，不是带冒号 MAC |
 | MQTT 用户名 | `esp32_30eda0e1b528` | 模板 `esp32_{mac_clean}` |
 | MQTT 密码 | HMAC 派生，**32 hex**（见 §3.1） | Mosquitto ACL 同一算法 |
@@ -162,7 +162,7 @@ push 成功后：**同一时刻**向 `v1/notify/30eda0e1b528` publish MQTT（TLS
 | 环境变量 | 联调值 |
 |----------|--------|
 | `MCP_ENDPOINT` | 小智云控制台 MCP 接入点 + token |
-| `INFERENCE_API_BASE` | `http://114.245.179.11:8443`（或 VPS 内网地址） |
+| `INFERENCE_API_BASE` | `http://114.245.178.62:8443`（或 VPS 内网地址） |
 | `INFERENCE_DEVICE_ID` | `30:ed:a0:e1:b5:28` |
 | `INFERENCE_WAKE_TEXT` | `查提醒` |
 
@@ -183,7 +183,7 @@ push 成功后：**同一时刻**向 `v1/notify/30eda0e1b528` publish MQTT（TLS
 
 ### B. MQTT 唤醒
 
-- [ ] Broker `114.245.179.11:8883` TLS 可用
+- [ ] Broker `114.245.178.62:8883` TLS 可用
 - [ ] 设备 ACL：`esp32_30eda0e1b528` 可 **subscribe** `v1/notify/30eda0e1b528`
 - [ ] 服务端 publish 账号有 **publish** 同主题权限
 - [ ] push 成功后自动 publish（或联调阶段可手动 publish 验证）

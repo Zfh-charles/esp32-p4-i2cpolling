@@ -390,13 +390,13 @@ esp_err_t emotion_video_player_init(const emotion_video_config_t *config, emotio
 
     *handle = player;
 
-    // 初始化时立即加载并播放standby表情，避免黑屏
+    // 🔥 修复1：初始化时立即加载并播放standby表情，避免黑屏
     ESP_LOGI(TAG, "🎬 初始化：加载并播放standby表情...");
-
+    
     const emotion_def_t *standby_def = find_emotion_def(DEFAULT_STANDBY_EMOTION);
     if (standby_def) {
         int standby_index = standby_def->cache_index;
-
+        
         esp_err_t ret = load_video_to_cache(player, standby_index);
         if (ret == ESP_OK) {
             ret = build_frame_index(player, standby_index);
@@ -1161,7 +1161,8 @@ static esp_err_t deinit_hw_decoder(emotion_video_player_t *player)
 static void preload_emotions_task(void *arg)
 {
     emotion_video_player_t *player = (emotion_video_player_t *)arg;
-
+    
+    // 等待2秒，让系统稳定运行
     vTaskDelay(pdMS_TO_TICKS(2000));
     
     ESP_LOGI(TAG, "🚀 开始后台预加载基础表情...");
