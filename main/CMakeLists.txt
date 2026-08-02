@@ -29,6 +29,11 @@ set(SOURCES "audio/audio_codec.cc"
             "protocols/websocket_protocol.cc"
             "mcp_server.cc"
             "system_info.cc"
+            "debug/wdt_contention_diag.c"
+            "debug/idle_wdt_diag.c"
+            "debug/afe_fetch_gate.c"
+            "debug/stack_diag.c"
+            "debug/panic_capture.c"
             "application.cc"
             "ota.cc"
             "settings.cc"
@@ -37,7 +42,7 @@ set(SOURCES "audio/audio_codec.cc"
             "main.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "protocols")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "protocols" "debug")
 
 if(CONFIG_USE_ALARM)
     list(APPEND SOURCES "alarm/general_timer.cc")
@@ -707,6 +712,23 @@ target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT}
                     )
 
+# debug/panic_capture.c mirrors the exception frame into RTC memory at the very
+# first C instruction of the panic path. It must wrap panicHandler /
+# xt_unhandled_exception rather than esp_panic_handler: this board hangs earlier,
+# inside panic_enable_cache(), and is then reset as a bare rst:0x7 with no dump.
+#
+# The spi_flash wraps count in-flight flash operations. spi_flash_disable_cache()
+# suspends the whole external-memory cache (CACHE_LL_LEVEL_EXT_MEM/CACHE_TYPE_ALL),
+# so a flash write makes PSRAM loads fault too. Recording the depth lets
+# PANIC_LAST tell a suspended cache apart from genuinely bad PSRAM.
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=panicHandler"
+    "-Wl,--wrap=xt_unhandled_exception"
+    "-Wl,--wrap=spi_flash_disable_interrupts_caches_and_other_cpu"
+    "-Wl,--wrap=spi_flash_enable_interrupts_caches_and_other_cpu"
+    "-Wl,--wrap=spi_flash_disable_interrupts_caches_and_other_cpu_no_os"
+    "-Wl,--wrap=spi_flash_enable_interrupts_caches_no_os")
+
 # Add generation rules
 add_custom_command(
     OUTPUT ${LANG_HEADER}
@@ -815,7 +837,7 @@ function(build_default_assets_bin)
     # Create custom command to build assets
     add_custom_command(
         OUTPUT ${GENERATED_ASSETS_BIN}
-        COMMAND python ${PROJECT_DIR}/scripts/build_default_assets.py ${BUILD_ARGS}
+        COMMAND ${PYTHON} ${PROJECT_DIR}/scripts/build_default_assets.py ${BUILD_ARGS}
         DEPENDS ${ASSETS_BIN_DEPENDS}
         COMMENT "Building default assets.bin based on configuration"
         VERBATIM

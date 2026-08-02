@@ -166,9 +166,17 @@ private:
     void EnterIdleStandby(bool show_wake_hint = true);
     void UpdateCapturePowerHold();
     void TryStartDeferredReminderNet();
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+    void TryStartDeferredEmotionPreload();
+#endif
     esp_timer_handle_t proactive_feedback_timer_handle_ = nullptr;
     bool deferred_reminder_services_pending_ = false;
+    bool deferred_reminder_net_started_ = false;
     int64_t wake_running_since_us_ = 0;
+    int64_t reminder_net_started_since_us_ = 0;
+    int reminder_net_defer_sec_ = CONFIG_REMINDER_BOOT_DEFER_SEC;
+    bool boot_flash_protection_mode_ = false;
+    uint32_t boot_crash_streak_ = 0;
     bool idle_rearm_in_progress_ = false;
     std::string last_reminder_display_text_;
     std::string last_reminder_emotion_;
@@ -177,6 +185,28 @@ private:
     bool pending_reminder_after_channel_close_ = false;
     int64_t last_idle_standby_us_ = 0;
     ReminderDeliverPayload pending_reminder_payload_;
+#endif
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+    bool deferred_emotion_preload_started_ = false;
+    bool mjpeg_wake_coexist_paused_ = false;
+    /** Proven stable: do not auto-resume MJPEG while AFE wake is armed (HP_WDT). */
+    bool mjpeg_skip_resume_while_wake_ = true;
+    /**
+     * Proven stable (v8/v9-r0): pause MJPEG for entire conversation.
+     * Face stays on last idle frame; no decode/flush during listen/speak.
+     * P2: base emotions preloaded once before first wake arm (cache for later bypass).
+     */
+    bool mjpeg_skip_resume_while_listening_ = true;
+    bool mjpeg_skip_resume_while_speaking_ = true;
+    uint32_t mjpeg_speaking_fps_ = 5;  // unused while speaking skip=true
+    /** Avoid deferred preload while wake armed (audio_detection stack overflow). */
+    bool emotion_skip_preload_while_wake_ = true;
+    int64_t emotion_preload_arm_since_us_ = 0;
+    int64_t mjpeg_resume_since_us_ = 0;
+    int mjpeg_resume_defer_sec_ = CONFIG_REMINDER_BOOT_DEFER_SEC;
+    int preload_after_net_stagger_sec_ = 3;
+    /** When cloud omits type=llm, apply STT keyword face hint at speaking (still-only). */
+    std::string stt_face_hint_;
 #endif
 };
 

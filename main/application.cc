@@ -2,6 +2,9 @@
 #include "board.h"
 #include "display.h"
 #include "system_info.h"
+#include "wdt_contention_diag.h"
+#include "idle_wdt_diag.h"
+#include "stack_diag.h"
 #include "audio_codec.h"
 #include "mqtt_protocol.h"
 #include "websocket_protocol.h"
@@ -9,6 +12,7 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include <esp_system.h>
 #if CONFIG_USE_REMINDER_POLL
 #include "reminder/reminder_trace.h"
 #include "reminder/reminder_diag.h"
@@ -21,13 +25,60 @@
 #endif
 #endif
 
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+#include "boards/ep-chat-p4-ml307/eezui_display_adapter.h"
+#endif
+
+namespace {
+// Keep BootTrace prev_phase aligned with IDLE_WDT marks (diag only).
+inline void IdleWdtMarkTraced(const char* phase, const char* detail) {
+    IdleWdtMark(phase, detail);
+#if CONFIG_USE_REMINDER_POLL
+    BootTraceMark(phase, detail ? detail : "-");
+#endif
+}
+}  // namespace
+
 #include <cstring>
 #include <esp_log.h>
+#include <esp_rom_sys.h>
+#include <esp_timer.h>
+#include <esp_heap_caps.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
 #include <arpa/inet.h>
 #include <font_awesome.h>
 
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+namespace {
+// Cloud often answers TTS without type=llm; map user STT intent to a face still.
+const char* InferFaceEmotionFromStt(const char* text) {
+    if (!text || text[0] == '\0') {
+        return nullptr;
+    }
+    if (strstr(text, "愤怒") || strstr(text, "生气") || strstr(text, "发火") ||
+        strstr(text, "怒") || strstr(text, "angry")) {
+        return "angry";
+    }
+    if (strstr(text, "悲伤") || strstr(text, "难过") || strstr(text, "伤心") ||
+        strstr(text, "哭") || strstr(text, "sad")) {
+        return "sad";
+    }
+    if (strstr(text, "开心") || strstr(text, "高兴") || strstr(text, "快乐") ||
+        strstr(text, "笑") || strstr(text, "happy")) {
+        return "happy";
+    }
+    if (strstr(text, "喜欢") || strstr(text, "亲亲") || strstr(text, "loving") ||
+        strstr(text, "love")) {
+        return "loving";
+    }
+    if (strstr(text, "中性") || strstr(text, "平静") || strstr(text, "neutral")) {
+        return "neutral";
+    }
+    return nullptr;
+}
+}  // namespace
+#endif
 #define TAG "Application"
 
 
@@ -439,6 +490,9 @@ void Application::StopListening() {
 
 void Application::Start() {
     auto& board = Board::GetInstance();
+    // Always print reset reason + baseline heap (independent of BootTrace Kconfig).
+    SystemInfo::PrintResetReason("app_start");
+    SystemInfo::PrintHeapStats("app_start");
     SetDeviceState(kDeviceStateStarting);
 
     /* Setup the display */
@@ -472,10 +526,15 @@ void Application::Start() {
     audio_service_.SetCallbacks(callbacks);
 
     // Start the main event loop task with priority 3
+    // s1ca: 8192 -> 24576. Since s1bi this stack also carries the whole face present path
+    // (hw JPEG decode + 480-row diff + 400-row memcpy + lv_obj_invalidate_area + caption
+    // flush) plus heap_caps_check_integrity_all. Every PresentFaceFrameToLvgl /
+    // SyncCanvasFromRgb / tlsf_walk_pool crash frame carried sp in 0x4ff5b6xx..0x4ff5b7xx,
+    // i.e. this stack, with wild pointers as mtval (0x84df9cc4 vs valid 0x48df9cc4).
     xTaskCreate([](void* arg) {
         ((Application*)arg)->MainEventLoop();
         vTaskDelete(NULL);
-    }, "main_event_loop", 2048 * 4, this, 3, &main_event_loop_task_handle_);
+    }, "main_event_loop", 2048 * 12, this, 3, &main_event_loop_task_handle_);
 
     /* Start the clock timer to update the status bar */
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
@@ -635,6 +694,21 @@ void Application::Start() {
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
+        if (!cJSON_IsString(type)) {
+            ESP_LOGW(TAG, "CTRL json type=invalid");
+            return;
+        }
+        // P1 diag: log every llm message, and any message that carries emotion.
+        {
+            auto emotion_field = cJSON_GetObjectItem(root, "emotion");
+            const bool is_llm = strcmp(type->valuestring, "llm") == 0;
+            if (is_llm || cJSON_IsString(emotion_field)) {
+                ESP_LOGW(TAG, "CTRL json type=%s emotion=%s device_state=%d",
+                         type->valuestring,
+                         cJSON_IsString(emotion_field) ? emotion_field->valuestring : "-",
+                         (int)device_state_);
+            }
+        }
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
@@ -729,6 +803,14 @@ void Application::Start() {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+                // Sync hint before Schedule — TTS/speaking often races past STT UI task.
+                if (const char* hint = InferFaceEmotionFromStt(text->valuestring)) {
+                    stt_face_hint_ = hint;
+                    ESP_LOGW(TAG, "FACE_STT_HINT emo=%s text=%.48s", hint, text->valuestring);
+                    esp_rom_printf("!!FACE_STT_HINT emo=%s\n", hint);
+                }
+#endif
                 Schedule([this, display, message = std::string(text->valuestring)]() {
 #if CONFIG_USE_REMINDER_POLL
                     if (session_kind_ == SessionKind::ProactiveReminder) {
@@ -743,7 +825,22 @@ void Application::Start() {
         } else if (strcmp(type->valuestring, "llm") == 0) {
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(emotion)) {
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+                stt_face_hint_.clear();  // cloud llm wins over STT hint
+#endif
                 Schedule([this, display, emotion_str = std::string(emotion->valuestring)]() {
+                    auto& audio = GetAudioService();
+                    const int64_t t0 = esp_timer_get_time();
+                    ESP_LOGW(TAG,
+                             "SAD_DIAG llm_in emo=%s state=%d wake=%d voice=%d route=%d "
+                             "task=%s free_int=%u free_psram=%u",
+                             emotion_str.c_str(), (int)device_state_,
+                             audio.IsWakeWordRunning() ? 1 : 0,
+                             audio.IsAudioProcessorRunning() ? 1 : 0,
+                             (int)audio.GetAudioRoute(),
+                             pcTaskGetName(nullptr),
+                             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 #if CONFIG_USE_REMINDER_POLL
                     if (session_kind_ == SessionKind::ProactiveReminder && !proactive_reminder_tts_started_) {
                         ReminderLcEmotion(ReminderLcOwner::Proactive, emotion_str.c_str(), 0);
@@ -756,7 +853,28 @@ void Application::Start() {
                     ReminderLcEmotion(owner, emotion_str.c_str(), 1);
 #endif
                     display->SetEmotion(emotion_str.c_str());
+                    const int cost_ms = (int)((esp_timer_get_time() - t0) / 1000);
+                    ESP_LOGW(TAG,
+                             "SAD_DIAG llm_out emo=%s state=%d wake=%d voice=%d route=%d "
+                             "set_emotion_ms=%d free_int=%u",
+                             emotion_str.c_str(), (int)device_state_,
+                             audio.IsWakeWordRunning() ? 1 : 0,
+                             audio.IsAudioProcessorRunning() ? 1 : 0,
+                             (int)audio.GetAudioRoute(), cost_ms,
+                             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+                    // Delayed audio health probe — catch AFE death after panel work returns.
+                    Schedule([this, emotion_str, cost_ms]() {
+                        auto& audio2 = GetAudioService();
+                        ESP_LOGW(TAG,
+                                 "SAD_DIAG probe+0 emo=%s state=%d wake=%d voice=%d "
+                                 "prev_set_ms=%d",
+                                 emotion_str.c_str(), (int)device_state_,
+                                 audio2.IsWakeWordRunning() ? 1 : 0,
+                                 audio2.IsAudioProcessorRunning() ? 1 : 0, cost_ms);
+                    });
                 });
+            } else {
+                ESP_LOGW(TAG, "CTRL llm no_emotion_field device_state=%d", (int)device_state_);
             }
         } else if (strcmp(type->valuestring, "mcp") == 0) {
             auto payload = cJSON_GetObjectItem(root, "payload");
@@ -803,7 +921,7 @@ void Application::Start() {
     });
     bool protocol_started = protocol_->Start();
 
-    SystemInfo::PrintHeapStats();
+    SystemInfo::PrintHeapStats("after_protocol_start");
     #if CONFIG_USE_ALARM
     general_timer_ = new GeneralTimer();
 #endif
@@ -812,10 +930,37 @@ void Application::Start() {
 #if CONFIG_REMINDER_MQTT_WAKE
     reminder_mqtt_wake_ = new ReminderMqttWake();
 #endif
+    boot_crash_streak_ = BootTraceCrashStreak();
+    boot_flash_protection_mode_ = BootTraceInCrashStorm(2);
+    reminder_net_defer_sec_ = CONFIG_REMINDER_BOOT_DEFER_SEC + 3;
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+    mjpeg_resume_defer_sec_ = CONFIG_REMINDER_BOOT_DEFER_SEC;
+    preload_after_net_stagger_sec_ = 3;
+    if (boot_flash_protection_mode_) {
+        reminder_net_defer_sec_ = CONFIG_REMINDER_BOOT_DEFER_SEC + 15;
+        mjpeg_resume_defer_sec_ = CONFIG_REMINDER_BOOT_DEFER_SEC + 8;
+        preload_after_net_stagger_sec_ = 6;
+    }
+#endif
     deferred_reminder_services_pending_ = true;
+    deferred_reminder_net_started_ = false;
+    reminder_net_started_since_us_ = 0;
     wake_running_since_us_ = 0;
-    ESP_LOGI(TAG, "Reminder net deferred until idle + wake stable (%ds after wake)",
-             CONFIG_REMINDER_BOOT_DEFER_SEC);
+    ESP_LOGI(TAG,
+             "Reminder net deferred until idle + wake stable (%ds after wake), crash_streak=%lu protection=%d",
+             reminder_net_defer_sec_,
+             (unsigned long)boot_crash_streak_,
+             boot_flash_protection_mode_ ? 1 : 0);
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+    ESP_LOGI(TAG,
+             "Boot scheduler: MJPEG defer=%ds, net defer=%ds, preload after net=%ds",
+             mjpeg_resume_defer_sec_,
+             reminder_net_defer_sec_,
+             preload_after_net_stagger_sec_);
+    if (boot_flash_protection_mode_) {
+        ESP_LOGW(TAG, "Boot flash protection active: heavy workloads are intentionally delayed");
+    }
+#endif
 #endif
     has_server_time_ = ota.HasServerTime();
     if (protocol_started) {
@@ -826,6 +971,7 @@ void Application::Start() {
         audio_service_.DrainLocalPlayback(2000);
     }
     SetDeviceState(kDeviceStateIdle);
+    SystemInfo::PrintHeapStats("enter_idle");
 }
 
 // Add a async task to MainLoop
@@ -892,10 +1038,15 @@ void Application::MainEventLoop() {
 #if CONFIG_USE_REMINDER_POLL
             TryStartDeferredReminderNet();
 #endif
-        
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+            TryStartDeferredEmotionPreload();
+#endif
+            WdtContendMainTick();
+            IdleWdtMainHb();
+
             // Print the debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
-                SystemInfo::PrintHeapStats();
+                SystemInfo::PrintHeapStats("tick_10s");
             }
 #if CONFIG_USE_REMINDER_POLL
             if (clock_ticks_ % 10 == 0) {
@@ -1102,6 +1253,37 @@ void Application::SetListeningMode(ListeningMode mode) {
 void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previous_state) {
     auto& audio = audio_service_;
 
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+    auto* eezui_display = dynamic_cast<EezuiDisplayAdapter*>(Board::GetInstance().GetDisplay());
+    auto ApplyMjpegForConversation = [&](const char* why, bool is_speaking) {
+        if (eezui_display == nullptr) {
+            return;
+        }
+        if ((!is_speaking && mjpeg_skip_resume_while_listening_) ||
+            (is_speaking && mjpeg_skip_resume_while_speaking_)) {
+            eezui_display->PauseMjpegHeavyWork();
+            mjpeg_wake_coexist_paused_ = true;
+            ESP_LOGW(TAG, "CTRL pause MJPEG in conversation (%s) speaking=%d",
+                     why ? why : "?", (int)is_speaking);
+            BootTraceMark(is_speaking ? "MJPEG_SKIP_SPEAK" : "MJPEG_SKIP_LISTEN",
+                          why ? why : "-");
+            return;
+        }
+        if (is_speaking) {
+            const uint32_t fps = mjpeg_speaking_fps_ ? mjpeg_speaking_fps_ : 5;
+            eezui_display->ResumeMjpegHeavyWorkAtFps(fps);
+            mjpeg_wake_coexist_paused_ = false;
+            ESP_LOGW(TAG, "CTRL resume MJPEG speaking@%ufps (%s)", (unsigned)fps, why ? why : "?");
+            BootTraceMark("MJPEG_SPEAK_FPS", why ? why : "-");
+            return;
+        }
+        eezui_display->ResumeMjpegHeavyWork();
+        mjpeg_wake_coexist_paused_ = false;
+        ESP_LOGW(TAG, "POLICY resume MJPEG for conversation (%s)", why ? why : "?");
+        BootTraceMark("MJPEG_RESUME_CONV", why ? why : "-");
+    };
+#endif
+
     switch (state) {
         case kDeviceStateIdle:
             audio.EnableVoiceProcessing(false);
@@ -1126,6 +1308,30 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
                         audio.SetAudioRoute(AudioRoute::Capture, session_ended);
                     }
                 }
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+                // Pause decode BEFORE arming wake — AFE + full-screen LVGL flush => HP_WDT.
+                if (eezui_display != nullptr) {
+                    eezui_display->LeaveConversationPresent();
+                    eezui_display->PauseMjpegHeavyWork();
+                    mjpeg_wake_coexist_paused_ = true;
+                    mjpeg_resume_since_us_ = 0;
+                    emotion_preload_arm_since_us_ = 0;
+                    // P2: sync preload once while wake=0 (before arm). Do NOT reset
+                    // deferred_emotion_preload_started_ on later idle returns.
+                    if (!deferred_emotion_preload_started_) {
+                        ESP_LOGW(TAG, "CTRL P2 safe_preload sync begin (wake=0)");
+                        SystemInfo::PrintHeapStats("p2_preload_begin");
+                        BootTraceMarkHeap("P2_PRELOAD_BEGIN");
+                        const bool ok = eezui_display->PreloadBaseEmotionsSync();
+                        deferred_emotion_preload_started_ = true;
+                        ESP_LOGW(TAG, "CTRL P2 safe_preload sync end ok=%d", ok ? 1 : 0);
+                        SystemInfo::PrintHeapStats("p2_preload_end");
+                        BootTraceMarkHeap("P2_PRELOAD_END");
+                        // Boot smokes disabled; conversation uses ShowEmotionViaBypass (I5-lite).
+                    }
+                    ESP_LOGI(TAG, "POLICY pause MJPEG before wake arm");
+                }
+#endif
                 audio.EnableWakeWordDetection(true);
             }
 #else
@@ -1142,15 +1348,49 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
                     audio.EnableVoiceProcessing(true);
                     audio.EnableWakeWordDetection(false);
                 }
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+                ApplyMjpegForConversation("listening_reminder", false);
+                if (eezui_display != nullptr) {
+                    eezui_display->EnterConversationPresent();
+                }
+#endif
                 break;
             }
 #endif
             /* User conversation: ori-ref soft path — no I2S hard switch */
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+            // WDT nail (serial): STATE_LISTEN mark → rst:0x7 with no PRESENT logs.
+            // Root: EnableVoiceProcessing while AFE still running, then UI.
+            // Order: pause MJPEG → stop AFE → arm voice → listen JSON → light present.
+            ApplyMjpegForConversation("listening", false);
+            if (protocol_) {
+                audio.EnableWakeWordDetection(false);
+                if (!audio.IsAudioProcessorRunning()) {
+                    audio.EnableVoiceProcessing(true);
+                }
+                protocol_->SendStartListening(listening_mode_);
+            }
+            if (eezui_display != nullptr) {
+                ESP_LOGW(TAG, "CTRL PRESENT DIAG before_enter wake=%d voice=%d state=listening",
+                         audio.IsWakeWordRunning() ? 1 : 0,
+                         audio.IsAudioProcessorRunning() ? 1 : 0);
+                BootTraceMark("PRESENT_HOOK", "listen");
+                esp_rom_printf("!!PRESENT_HOOK listen wake=%d voice=%d\n",
+                               audio.IsWakeWordRunning() ? 1 : 0,
+                               audio.IsAudioProcessorRunning() ? 1 : 0);
+                eezui_display->EnterConversationPresent();
+                esp_rom_printf("!!PRESENT_HOOK listen done\n");
+                ESP_LOGW(TAG, "CTRL PRESENT DIAG after_enter wake=%d voice=%d",
+                         audio.IsWakeWordRunning() ? 1 : 0,
+                         audio.IsAudioProcessorRunning() ? 1 : 0);
+            }
+#else
             if (protocol_ && !audio.IsAudioProcessorRunning()) {
                 protocol_->SendStartListening(listening_mode_);
                 audio.EnableVoiceProcessing(true);
                 audio.EnableWakeWordDetection(false);
             }
+#endif
             break;
 
         case kDeviceStateSpeaking:
@@ -1159,15 +1399,45 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
                 audio.EnableVoiceProcessing(false);
                 audio.EnableWakeWordDetection(false);
                 audio.SetAudioRoute(AudioRoute::Playback);
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+                ApplyMjpegForConversation("speaking_reminder", true);
+                if (eezui_display != nullptr) {
+                    eezui_display->EnterConversationPresent();
+                }
+#endif
                 break;
             }
 #endif
             /* User conversation: ori-ref soft path — mic/speaker via Enable* only */
             if (listening_mode_ != kListeningModeRealtime) {
                 audio.EnableVoiceProcessing(false);
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+                // Do not re-enable AFE during TTS while MJPEG animates (same WDT class).
+                audio.EnableWakeWordDetection(false);
+#else
                 audio.EnableWakeWordDetection(audio.IsAfeWakeWord());
+#endif
             }
             audio.ResetDecoder();
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+            ApplyMjpegForConversation("speaking", true);
+            if (eezui_display != nullptr) {
+                eezui_display->EnterConversationPresent();
+                // Cloud often skips type=llm; apply STT face hint as still-only (no burst).
+                if (!stt_face_hint_.empty()) {
+                    const std::string emo = stt_face_hint_;
+                    stt_face_hint_.clear();
+                    ESP_LOGW(TAG, "FACE_STT_HINT apply emo=%s (still-only; no llm)", emo.c_str());
+                    esp_rom_printf("!!FACE_STT_HINT apply=%s\n", emo.c_str());
+                    auto* disp = Board::GetInstance().GetDisplay();
+                    if (disp != nullptr) {
+                        disp->SetEmotion(emo.c_str());
+                    }
+                } else {
+                    ESP_LOGW(TAG, "FACE_SELFTEST_CONV skip inject; wait llm/SetEmotion");
+                }
+            }
+#endif
             break;
 
 #if CONFIG_USE_ALARM
@@ -1309,6 +1579,98 @@ void Application::RunReminderDiagnostics(const char* trigger, bool allow_auto_he
 #endif
 
 #if CONFIG_USE_REMINDER_POLL
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+void Application::TryStartDeferredEmotionPreload() {
+    if (session_kind_ != SessionKind::None || device_state_ != kDeviceStateIdle) {
+        return;
+    }
+    if (!audio_service_.IsWakeWordRunning()) {
+        emotion_preload_arm_since_us_ = 0;
+        mjpeg_resume_since_us_ = 0;
+        return;
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    if (emotion_preload_arm_since_us_ == 0) {
+        emotion_preload_arm_since_us_ = now_us;
+        ESP_LOGW(TAG,
+                 "Wake armed — policy: MJPEG_resume=%s emotion_preload=%s; net in %ds",
+                 mjpeg_skip_resume_while_wake_ ? "SKIP" : "defer",
+                 emotion_skip_preload_while_wake_ ? "SKIP" : "after_net",
+                 reminder_net_defer_sec_);
+        SystemInfo::PrintHeapStats("wake_armed");
+        return;
+    }
+
+    const int64_t wake_elapsed_s = (now_us - emotion_preload_arm_since_us_) / 1000000LL;
+    if (wake_elapsed_s < mjpeg_resume_defer_sec_) {
+        return;
+    }
+
+    auto* eezui_display = dynamic_cast<EezuiDisplayAdapter*>(Board::GetInstance().GetDisplay());
+    if (eezui_display != nullptr) {
+        if (mjpeg_wake_coexist_paused_ && mjpeg_resume_since_us_ == 0) {
+            if (mjpeg_skip_resume_while_wake_) {
+                // Keep paused_; only unblock reminder-net stagger.
+                // IDLE_WDT H2: if rst between SKIP_BEG and SKIP_END → died in this block.
+                IdleWdtMarkTraced("IDLE_SKIP_BEG", "wake_stable");
+                mjpeg_resume_since_us_ = now_us;
+                ESP_LOGW(TAG,
+                         "POLICY skip MJPEG resume after %ds wake-stable "
+                         "(decode stays paused; avoid LVGL flush HP_WDT)",
+                         (int)mjpeg_resume_defer_sec_);
+                IdleWdtMarkTraced("IDLE_HEAP", "before_print");
+                SystemInfo::PrintHeapStats("mjpeg_resume_skipped");
+                IdleWdtMarkTraced("IDLE_CLR", "before_clear");
+                BootTraceMarkHeap("MJPEG_SKIP");
+                BootTraceClearCrashStreak();
+                IdleWdtMarkTraced("IDLE_SKIP_END", "ok");
+            } else {
+                eezui_display->ResumeMjpegHeavyWork();
+                mjpeg_wake_coexist_paused_ = false;
+                mjpeg_resume_since_us_ = now_us;
+                ESP_LOGI(TAG, "MJPEG resumed %ds after wake stable", (int)mjpeg_resume_defer_sec_);
+                SystemInfo::PrintHeapStats("mjpeg_resumed");
+                BootTraceMarkHeap("MJPEG_RESUME");
+                WdtContendArmMjpegResume();
+            }
+        }
+        if (!deferred_emotion_preload_started_) {
+            if (emotion_skip_preload_while_wake_) {
+                deferred_emotion_preload_started_ = true;
+                ESP_LOGW(TAG,
+                         "POLICY skip emotion preload while wake armed "
+                         "(v8 baseline; avoid AFE stack overflow)");
+                SystemInfo::PrintHeapStats("preload_skipped");
+                BootTraceMarkHeap("PRELOAD_SKIP");
+                return;
+            }
+            if (!deferred_reminder_net_started_ || reminder_net_started_since_us_ == 0) {
+                return;
+            }
+            const int64_t after_net_s = (now_us - reminder_net_started_since_us_) / 1000000LL;
+            if (after_net_s < preload_after_net_stagger_sec_) {
+                return;
+            }
+            const size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            ESP_LOGI(TAG,
+                     "DEFER_STAGE preload_start wake_elapsed=%ds after_net=%ds free_int=%u free_psram=%u",
+                     (int)wake_elapsed_s, (int)after_net_s, (unsigned)free_int, (unsigned)free_psram);
+            SystemInfo::PrintHeapStats("preload_start");
+            StackDiagLog("app_before_preload_start", "arming_emotion_preload");
+            eezui_display->StartDeferredEmotionPreload();
+            deferred_emotion_preload_started_ = true;
+            ESP_LOGI(TAG, "Deferred emotion preload started %ds after wake ready", (int)wake_elapsed_s);
+        }
+    } else if (!deferred_emotion_preload_started_) {
+        mjpeg_wake_coexist_paused_ = false;
+        deferred_emotion_preload_started_ = true;
+        ESP_LOGW(TAG, "Skip deferred emotion preload: display is not EezuiDisplayAdapter");
+    }
+}
+#endif
+
 void Application::TryStartDeferredReminderNet() {
     if (!deferred_reminder_services_pending_ || reminder_poller_ == nullptr) {
         return;
@@ -1324,21 +1686,32 @@ void Application::TryStartDeferredReminderNet() {
     const int64_t now_us = esp_timer_get_time();
     if (wake_running_since_us_ == 0) {
         wake_running_since_us_ = now_us;
-        ESP_LOGI(TAG, "Wake armed — reminder net in %ds", CONFIG_REMINDER_BOOT_DEFER_SEC);
+        ESP_LOGI(TAG, "Wake armed — reminder net in %ds", reminder_net_defer_sec_);
         return;
     }
     const int64_t wake_elapsed_s = (now_us - wake_running_since_us_) / 1000000LL;
-    if (wake_elapsed_s < CONFIG_REMINDER_BOOT_DEFER_SEC) {
+    if (wake_elapsed_s < reminder_net_defer_sec_) {
         return;
     }
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+    if (mjpeg_resume_since_us_ == 0) {
+        return;
+    }
+#endif
 
     deferred_reminder_services_pending_ = false;
+    const int64_t start_us = esp_timer_get_time();
+    size_t heap_int_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t heap_psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     BootTraceMarkHeap("REMINDER_NET_START");
 #if CONFIG_USE_REMINDER_POLL && !CONFIG_REMINDER_MQTT_TLS_INSECURE
     if (auto* at_modem = dynamic_cast<AtModem*>(Board::GetInstance().GetNetwork())) {
+        const int64_t tls_begin_us = esp_timer_get_time();
         if (!ReminderMqttInstallCaCert(at_modem->GetAtUart())) {
             ESP_LOGW(TAG, "Reminder TLS CA install failed; MQTT/HTTPS may fail");
         }
+        const int64_t tls_cost_ms = (esp_timer_get_time() - tls_begin_us) / 1000LL;
+        ESP_LOGI(TAG, "DEFER_STAGE reminder_tls_ca_cost=%dms", (int)tls_cost_ms);
     }
 #endif
     reminder_poller_->Start();
@@ -1347,8 +1720,21 @@ void Application::TryStartDeferredReminderNet() {
         reminder_mqtt_wake_->Start(reminder_poller_);
     }
 #endif
+    const int64_t total_cost_ms = (esp_timer_get_time() - start_us) / 1000LL;
+    size_t heap_int_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t heap_psram_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG,
+             "DEFER_STAGE reminder_net_started cost=%dms free_int=%u->%u free_psram=%u->%u",
+             (int)total_cost_ms,
+             (unsigned)heap_int_before, (unsigned)heap_int_after,
+             (unsigned)heap_psram_before, (unsigned)heap_psram_after);
+    SystemInfo::PrintHeapStats("reminder_net_started");
     ESP_LOGI(TAG, "Reminder network started %ds after wake ready", (int)wake_elapsed_s);
     ReminderTraceLog("reminder_net_deferred_start", nullptr);
+    deferred_reminder_net_started_ = true;
+    reminder_net_started_since_us_ = esp_timer_get_time();
+    // Don't leave RTC phase stuck on REMINDER_NET_START — masks later idle WDTs.
+    BootTraceMarkHeap("REMINDER_NET_OK");
 }
 #endif
 
@@ -1385,6 +1771,11 @@ void Application::EnterIdleStandby(bool show_wake_hint) {
         }
         return;
     }
+    IdleWdtArm(show_wake_hint ? "wake_hint" : "silent");
+#if CONFIG_USE_REMINDER_POLL
+    BootTraceMark("IDLE_ARM", show_wake_hint ? "hint" : "silent");
+#endif
+    IdleWdtMarkTraced("IDLE_ENT_BEG", show_wake_hint ? "hint" : "silent");
     last_idle_standby_us_ = now_us;
     idle_rearm_in_progress_ = true;
     UpdateCapturePowerHold();
@@ -1404,6 +1795,9 @@ void Application::EnterIdleStandby(bool show_wake_hint) {
             protocol_->CloseAudioChannel();
         }
     }
+#if CONFIG_USE_REMINDER_POLL
+    IdleWdtMarkTraced("IDLE_CH_DONE", "channel");
+#endif
     audio_service_.ResetDecoder();
     audio_service_.EnableVoiceProcessing(false);
     audio_service_.EndSpeakerPlayback();
@@ -1416,8 +1810,21 @@ void Application::EnterIdleStandby(bool show_wake_hint) {
     if (device_state_ != kDeviceStateIdle) {
         SetDeviceState(kDeviceStateIdle);
     }
-    RestoreIdleReady(true);
 #if CONFIG_USE_REMINDER_POLL
+    IdleWdtMarkTraced("IDLE_STATE", "idle");
+    IdleWdtMarkTraced("IDLE_REST_BEG", "restore");
+#endif
+    // s1aq: if wake already armed on Capture, do not force EnterCaptureMode / wake off→on
+    // (serial: IDLE_REST_BEG→WK_OFF ≈2.5s + afe_hard → prev_phase=IDLE_REST_END WDT).
+    {
+        auto* codec = Board::GetInstance().GetAudioCodec();
+        const bool wake_armed = audio_service_.IsWakeWordRunning() &&
+            audio_service_.GetAudioRoute() == AudioRoute::Capture &&
+            codec != nullptr && codec->input_enabled();
+        RestoreIdleReady(!wake_armed);
+    }
+#if CONFIG_USE_REMINDER_POLL
+    IdleWdtMarkTraced("IDLE_REST_END", "restore");
     {
         auto* codec = Board::GetInstance().GetAudioCodec();
         const bool wake_armed = audio_service_.IsWakeWordRunning() &&
@@ -1440,26 +1847,50 @@ void Application::EnterIdleStandby(bool show_wake_hint) {
     ReminderLcSummary(ReminderLcOwner::Standby);
     ReminderHwTraceSnapshot("enter_idle_standby");
     RunReminderDiagnostics("enter_idle_standby", false);
+    IdleWdtMarkTraced("IDLE_ENT_END", "ok");
 #endif
 }
 
 void Application::RestoreIdleReady(bool force_capture) {
+    const int64_t t0 = esp_timer_get_time();
+#if CONFIG_USE_REMINDER_POLL
+    IdleWdtMarkTraced("IDLE_VP_OFF", "before");
+#endif
     audio_service_.EnableVoiceProcessing(false);
+#if CONFIG_USE_REMINDER_POLL
+    IdleWdtMarkTraced("IDLE_SPK_END", "before");
+#endif
     audio_service_.EndSpeakerPlayback();
+#if CONFIG_USE_REMINDER_POLL
+    IdleWdtMarkTraced("IDLE_ROUTE", force_capture ? "force" : "soft");
+#endif
     audio_service_.SetAudioRoute(AudioRoute::Capture, force_capture);
+#if CONFIG_USE_REMINDER_POLL
+    IdleWdtMarkTraced("IDLE_ROUTE_DONE", force_capture ? "force" : "soft");
+#endif
     auto* codec = Board::GetInstance().GetAudioCodec();
     const bool wake_ok = audio_service_.IsWakeWordRunning() &&
         audio_service_.GetAudioRoute() == AudioRoute::Capture &&
         codec != nullptr && codec->input_enabled();
-    if (!wake_ok || force_capture) {
+    // s1aq: force_capture only forces route; never force wake off→on when already armed.
+    if (!wake_ok) {
+        IdleWdtMarkTraced("IDLE_WK_OFF", "before");
         audio_service_.EnableWakeWordDetection(false);
+        IdleWdtMarkTraced("IDLE_WK_ONB", "before");
         audio_service_.EnableWakeWordDetection(true);
+        IdleWdtMarkTraced("IDLE_WK_ONA", "after");
+    } else {
+#if CONFIG_USE_REMINDER_POLL
+        IdleWdtMarkTraced("IDLE_WK_SKIP", "already_armed");
+#endif
     }
 #if CONFIG_USE_REMINDER_POLL
     ReminderTraceLog("restore_idle_ready", force_capture ? "force" : "skip_wake_restart");
 #else
     ESP_LOGI(TAG, "RestoreIdleReady (force=%d)", force_capture);
 #endif
+    ESP_LOGW(TAG, "IDLE_WDT RestoreIdleReady cost_ms=%d force=%d wake_ok=%d s1aq",
+             (int)((esp_timer_get_time() - t0) / 1000), force_capture ? 1 : 0, wake_ok ? 1 : 0);
 }
 
 void Application::EndSessionAndRestoreIdle(bool force_capture) {
@@ -1528,6 +1959,10 @@ void Application::SetDeviceState(DeviceState state) {
 #if CONFIG_USE_REMINDER_POLL
     if (state == kDeviceStateIdle) {
         BootTraceMarkHeap("STATE_IDLE");
+    } else if (state == kDeviceStateListening) {
+        BootTraceMark("STATE_LISTEN", STATE_STRINGS[previous_state]);
+    } else if (state == kDeviceStateSpeaking) {
+        BootTraceMark("STATE_SPEAK", STATE_STRINGS[previous_state]);
     }
     ReminderTraceLog("state_change", STATE_STRINGS[previous_state]);
 #endif
@@ -1543,6 +1978,12 @@ void Application::SetDeviceState(DeviceState state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+            // Leave conversation before idle face so seed blit is outside present mode.
+            if (auto* eezui = dynamic_cast<EezuiDisplayAdapter*>(display)) {
+                eezui->LeaveConversationPresent();
+            }
+#endif
             display->SetEmotion("standby");
             break;
         case kDeviceStateConnecting:
@@ -1552,6 +1993,7 @@ void Application::SetDeviceState(DeviceState state) {
             break;
         case kDeviceStateListening:
             display->SetStatus(Lang::Strings::LISTENING);
+            // EP: standby ignored during listen — keeps last LLM/seed face.
             display->SetEmotion("standby");
             break;
         case kDeviceStateSpeaking:
@@ -1571,6 +2013,9 @@ void Application::SetDeviceState(DeviceState state) {
 #if CONFIG_USE_REMINDER_POLL
     if (state == kDeviceStateIdle) {
         TryStartDeferredReminderNet();
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+        TryStartDeferredEmotionPreload();
+#endif
         RunReminderDiagnostics("enter_idle", false);
     }
 #endif

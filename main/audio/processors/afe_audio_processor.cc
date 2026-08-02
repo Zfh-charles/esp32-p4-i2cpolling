@@ -67,11 +67,12 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
     
+    // s1bh: same AFE fetch-on-caller-stack overflow as audio_detection.
     xTaskCreate([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;
         this_->AudioProcessorTask();
         vTaskDelete(NULL);
-    }, "audio_communication", 4096, this, 3, NULL);
+    }, "audio_communication", 8192, this, 3, NULL);
 }
 
 AfeAudioProcessor::~AfeAudioProcessor() {
@@ -92,6 +93,11 @@ void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
     if (afe_data_ == nullptr) {
         return;
     }
+    // s1bu: lock across check+feed so reset_buffer cannot land mid-feed (s1bt TOCTOU).
+    std::lock_guard<std::mutex> lock(afe_ops_mutex_);
+    if ((xEventGroupGetBits(event_group_) & PROCESSOR_RUNNING) == 0) {
+        return;
+    }
     afe_iface_->feed(afe_data_, data.data());
 }
 
@@ -101,8 +107,9 @@ void AfeAudioProcessor::Start() {
 
 void AfeAudioProcessor::Stop() {
     xEventGroupClearBits(event_group_, PROCESSOR_RUNNING);
+    // s1br: same ownership rule as AfeWakeWord — reset only on the fetch task.
     if (afe_data_ != nullptr) {
-        afe_iface_->reset_buffer(afe_data_);
+        afe_reset_pending_.store(true, std::memory_order_release);
     }
 }
 
@@ -125,7 +132,18 @@ void AfeAudioProcessor::AudioProcessorTask() {
         feed_size, fetch_size);
 
     while (true) {
+        // s1br: drain deferred reset before sleep (Stop may have raced prior fetch).
+        if (afe_reset_pending_.exchange(false, std::memory_order_acq_rel)) {
+            std::lock_guard<std::mutex> lock(afe_ops_mutex_);
+            afe_iface_->reset_buffer(afe_data_);
+            ESP_LOGW(TAG, "AFE_RESET apply proc core=%d s1bu", xPortGetCoreID());
+        }
         xEventGroupWaitBits(event_group_, PROCESSOR_RUNNING, pdFALSE, pdTRUE, portMAX_DELAY);
+        if (afe_reset_pending_.exchange(false, std::memory_order_acq_rel)) {
+            std::lock_guard<std::mutex> lock(afe_ops_mutex_);
+            afe_iface_->reset_buffer(afe_data_);
+            ESP_LOGW(TAG, "AFE_RESET apply proc core=%d s1bu", xPortGetCoreID());
+        }
 
         auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
         if ((xEventGroupGetBits(event_group_) & PROCESSOR_RUNNING) == 0) {

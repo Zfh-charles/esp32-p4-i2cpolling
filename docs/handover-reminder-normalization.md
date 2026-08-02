@@ -54,11 +54,11 @@
 
 ```
 CONFIG_USE_REMINDER_POLL=y
-CONFIG_REMINDER_POLL_DEFAULT_URL="http://114.245.178.62:8443/v1/devices/{device_id}/reminders/pending"
+CONFIG_REMINDER_POLL_DEFAULT_URL="http://114.245.176.144:8443/v1/devices/{device_id}/reminders/pending"
 CONFIG_REMINDER_POLL_INTERVAL_SEC=60
 CONFIG_REMINDER_ANNOUNCE_REPEAT=1
 CONFIG_REMINDER_MQTT_WAKE=y
-CONFIG_REMINDER_MQTT_WAKE_DEFAULT_BROKER="114.245.178.62:8883"
+CONFIG_REMINDER_MQTT_WAKE_DEFAULT_BROKER="114.245.176.144:8883"
 CONFIG_REMINDER_MQTT_WAKE_DEFAULT_TOPIC="v1/notify/{mac_clean}"
 CONFIG_REMINDER_MQTT_WAKE_DEFAULT_USERNAME="esp32_{mac_clean}"
 CONFIG_REMINDER_MQTT_WAKE_DEFAULT_PASSWORD="D3WamDq5shfqqg3BK5AcFKLebdGcREop"
@@ -77,7 +77,7 @@ CONFIG_REMINDER_MQTT_TLS_INSECURE=y
 4. 验证连通:监视串口,确认
    - `Ml307Mqtt` 连接成功 + 订阅 `v1/notify/30eda0e1b528`
    - `Wake armed — reminder net in 5s` → `Reminder network started`
-   - `ReminderTrace: poll_begin | url=http://114.245.178.62:8443/...` 正常返回
+   - `ReminderTrace: poll_begin | url=http://114.245.176.144:8443/...` 正常返回
 
 ### 关键命令前缀(激活 IDF 环境)
 ```

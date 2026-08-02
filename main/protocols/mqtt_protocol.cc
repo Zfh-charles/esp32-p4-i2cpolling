@@ -4,6 +4,7 @@
 #include "settings.h"
 
 #include <esp_log.h>
+#include <esp_rom_sys.h>
 #include <cstring>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -103,6 +104,30 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
             ESP_LOGE(TAG, "Message type is invalid");
             cJSON_Delete(root);
             return;
+        }
+
+        // P1b: ingress census — every MQTT type (esp_rom so it cannot be filtered away).
+        {
+            const char* t = type->valuestring;
+            auto emotion = cJSON_GetObjectItem(root, "emotion");
+            const char* emo = cJSON_IsString(emotion) ? emotion->valuestring : "-";
+            esp_rom_printf("!!MQTT type=%s emo=%s len=%u\n", t, emo, (unsigned)payload.size());
+            if (strcmp(t, "tts") == 0) {
+                auto state = cJSON_GetObjectItem(root, "state");
+                ESP_LOGW(TAG, "CTRL mqtt type=tts state=%s emotion=%s",
+                         cJSON_IsString(state) ? state->valuestring : "-", emo);
+            } else {
+                char preview[161];
+                size_t n = payload.size() < sizeof(preview) - 1 ? payload.size() : sizeof(preview) - 1;
+                memcpy(preview, payload.c_str(), n);
+                preview[n] = '\0';
+                ESP_LOGW(TAG, "CTRL mqtt type=%s emotion=%s len=%u preview=%s",
+                         t, emo, (unsigned)payload.size(), preview);
+            }
+            if (strcmp(t, "llm") == 0) {
+                ESP_LOGW(TAG, "FACE_INGRESS llm emotion=%s len=%u", emo, (unsigned)payload.size());
+                esp_rom_printf("!!FACE_INGRESS llm emo=%s\n", emo);
+            }
         }
 
         if (strcmp(type->valuestring, "hello") == 0) {

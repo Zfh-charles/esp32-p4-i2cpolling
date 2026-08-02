@@ -9,6 +9,7 @@
 #include <esp_nsn_models.h>
 #include <model_path.h>
 
+#include <atomic>
 #include <deque>
 #include <string>
 #include <vector>
@@ -41,6 +42,10 @@ private:
     char* wakenet_model_ = NULL;
     std::vector<std::string> wake_words_;
     EventGroupHandle_t event_group_;
+    /** s1br: reset_buffer is only legal on the task that owns fetch(). */
+    std::atomic<bool> afe_reset_pending_{false};
+    /** s1bu: serialize Feed vs reset_buffer (s1bt flag check alone is TOCTOU). */
+    std::mutex afe_ops_mutex_;
     std::function<void(const std::string& wake_word)> wake_word_detected_callback_;
     AudioCodec* codec_ = nullptr;
     std::string last_detected_wake_word_;

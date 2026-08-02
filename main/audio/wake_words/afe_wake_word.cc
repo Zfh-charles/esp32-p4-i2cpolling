@@ -1,10 +1,15 @@
 #include "afe_wake_word.h"
 #include "audio_service.h"
+#include "wdt_contention_diag.h"
+#include "idle_wdt_diag.h"
+#include "afe_fetch_gate.h"
+#include "stack_diag.h"
 #if CONFIG_USE_REMINDER_POLL
 #include "reminder/boot_trace.h"
 #endif
 
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <sstream>
 
 #define DETECTION_RUNNING_EVENT 1
@@ -77,20 +82,35 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     afe_config_t* afe_config = afe_config_init(input_format.c_str(), models_, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
     afe_config->aec_init = codec_->input_reference();
     afe_config->aec_mode = AEC_MODE_SR_HIGH_PERF;
-    afe_config->afe_perferred_core = 1;
+    // Keep AFE work on core0 to avoid competing with MJPEG decode on core1.
+    afe_config->afe_perferred_core = 0;
     afe_config->afe_perferred_priority = 1;
-    afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
-    
+    // WakeNet inference runs in the ESP-DL quantized conv1d assembly kernels
+    // (libdl_lib.a dl_esp32p4_pointwise_conv1d_qacc_*). With MORE_PSRAM those
+    // kernels do their SIMD loads straight out of PSRAM, which faults once the
+    // emotion cache and MJPEG decode saturate the same bus — the crash lands
+    // inside the kernel with MTVAL pointing just below the feature pointer.
+    afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_INTERNAL_PSRAM_BALANCE;
+
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     BootTraceMarkHeap("AFE_CREATE_BEGIN");
     afe_data_ = afe_iface_->create_from_config(afe_config);
     BootTraceMarkHeap("AFE_CREATE_OK");
+    if (afe_data_ == nullptr) {
+        ESP_LOGE(TAG, "AFE_MEM alloc_mode=balance create FAILED — internal RAM exhausted");
+        return false;
+    }
+    ESP_LOGW(TAG, "AFE_MEM alloc_mode=balance create ok s1ba");
 
+    // s1bh: fetch() runs the FFT and the WakeNet conv1d kernels on the *caller's*
+    // stack, so 4096 overflowed here — an interrupt taken during inference faulted
+    // while pushing its frame (_interrupt_handler at vectors.S, MTVAL just past SP).
+    // The hwm sampled after fetch() returns looks healthy and hides the real peak.
     xTaskCreate([](void* arg) {
         auto this_ = (AfeWakeWord*)arg;
         this_->AudioDetectionTask();
         vTaskDelete(NULL);
-    }, "audio_detection", 4096, this, 3, nullptr);
+    }, "audio_detection", 12288, this, 3, nullptr);
 
     return true;
 }
@@ -105,13 +125,22 @@ void AfeWakeWord::Start() {
 
 void AfeWakeWord::Stop() {
     xEventGroupClearBits(event_group_, DETECTION_RUNNING_EVENT);
+    // s1br: callers live on other tasks (main event loop). Resetting AFE ring state
+    // while audio_detection is mid-fetch corrupts the WakeNet feature pointers — the
+    // fault then lands inside dl_*_conv1d reading PSRAM (cache_on=1, mtval != sp).
     if (afe_data_ != nullptr) {
-        afe_iface_->reset_buffer(afe_data_);
+        afe_reset_pending_.store(true, std::memory_order_release);
+        ESP_LOGW(TAG, "AFE_RESET defer core=%d s1br", xPortGetCoreID());
     }
 }
 
 void AfeWakeWord::Feed(const std::vector<int16_t>& data) {
     if (afe_data_ == nullptr) {
+        return;
+    }
+    // s1bu: lock across check+feed so reset_buffer cannot land mid-feed (s1bt TOCTOU).
+    std::lock_guard<std::mutex> lock(afe_ops_mutex_);
+    if ((xEventGroupGetBits(event_group_) & DETECTION_RUNNING_EVENT) == 0) {
         return;
     }
     afe_iface_->feed(afe_data_, data.data());
@@ -132,10 +161,91 @@ void AfeWakeWord::AudioDetectionTask() {
     BootTraceMark("AFE_TASK", "started");
 
     bool first_fetch = true;
+    uint64_t last_diag_us = esp_timer_get_time();
     while (true) {
+        // Drain deferred reset before sleep — Stop may have raced the previous fetch.
+        if (afe_reset_pending_.exchange(false, std::memory_order_acq_rel)) {
+            std::lock_guard<std::mutex> lock(afe_ops_mutex_);
+            afe_iface_->reset_buffer(afe_data_);
+            ESP_LOGW(TAG, "AFE_RESET apply core=%d s1bu", xPortGetCoreID());
+        }
         xEventGroupWaitBits(event_group_, DETECTION_RUNNING_EVENT, pdFALSE, pdTRUE, portMAX_DELAY);
+        if (afe_reset_pending_.exchange(false, std::memory_order_acq_rel)) {
+            std::lock_guard<std::mutex> lock(afe_ops_mutex_);
+            afe_iface_->reset_buffer(afe_data_);
+            ESP_LOGW(TAG, "AFE_RESET apply core=%d s1bu", xPortGetCoreID());
+        }
 
+        uint64_t fetch_begin = esp_timer_get_time();
+        // s1cl: advertise occupancy so idle breathe can defer canvas write/read
+        // (MSPI-751 write-then-read vs WakeNet PSRAM). Leave always, even on abort.
+        AfeFetchGateEnter();
         auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
+        AfeFetchGateLeave();
+        uint64_t fetch_cost_ms = (esp_timer_get_time() - fetch_begin) / 1000ULL;
+        WdtContendNoteAfeFetch((uint32_t)fetch_cost_ms);
+        IdleWdtNoteAfeFetch((uint32_t)fetch_cost_ms);
+        {
+            UBaseType_t hwm_now = uxTaskGetStackHighWaterMark(NULL);
+            StackDiagNoteAfeHwm((uint32_t)hwm_now);
+            // During emotion preload, densify HWM so we can see stack shrink before overflow.
+            if (StackDiagPreloadActive()) {
+                static uint64_t s_last_stack_hb_us = 0;
+                uint64_t hb_now = esp_timer_get_time();
+                if (hb_now - s_last_stack_hb_us >= 200000ULL) {
+                    s_last_stack_hb_us = hb_now;
+                    ESP_LOGW(TAG,
+                             "STACK_DIAG stage=afe_during_preload core=%d fetch_ms=%u hwm=%u",
+                             xPortGetCoreID(),
+                             (unsigned)fetch_cost_ms,
+                             (unsigned)hwm_now);
+                    if (hwm_now < 256) {
+                        ESP_LOGE(TAG,
+                                 "STACK_DIAG WARN afe hwm=%u words during preload — overflow risk",
+                                 (unsigned)hwm_now);
+                    }
+                }
+            }
+        }
+        if (WdtContendWindowActive()) {
+            static uint64_t s_last_afe_hb_us = 0;
+            uint64_t hb_now = esp_timer_get_time();
+            if (hb_now - s_last_afe_hb_us >= 250000ULL) {
+                s_last_afe_hb_us = hb_now;
+                ESP_LOGI(TAG,
+                         "CONTEND_AFE_HB core=%d fetch_ms=%u hwm=%u",
+                         xPortGetCoreID(),
+                         (unsigned)fetch_cost_ms,
+                         (unsigned)uxTaskGetStackHighWaterMark(NULL));
+            }
+        }
+        uint64_t now_us = esp_timer_get_time();
+        if (now_us - last_diag_us >= 5000000ULL) {
+            last_diag_us = now_us;
+            UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+            // Keep format to %u only — avoid %llu argument shift on RV32.
+            const unsigned free_int =
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            const unsigned min_int =
+                (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+            const unsigned largest_int =
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+            const unsigned free_psram =
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            const unsigned min_psram =
+                (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+            ESP_LOGI(TAG,
+                     "AFE_DIAG core=%d fetch_ms=%u hwm=%u wake_pcm_q=%u | free_int=%u min_int=%u largest_int=%u | free_psram=%u min_psram=%u",
+                     xPortGetCoreID(),
+                     (unsigned)fetch_cost_ms,
+                     (unsigned)hwm,
+                     (unsigned)wake_word_pcm_.size(),
+                     free_int,
+                     min_int,
+                     largest_int,
+                     free_psram,
+                     min_psram);
+        }
         if (first_fetch) {
             BootTraceMarkHeap("AFE_FIRST_FETCH");
             first_fetch = false;
@@ -143,12 +253,18 @@ void AfeWakeWord::AudioDetectionTask() {
         if (res == nullptr || res->ret_value == ESP_FAIL) {
             continue;;
         }
+        // s1br: detection may have been disabled while we were blocked in fetch().
+        if ((xEventGroupGetBits(event_group_) & DETECTION_RUNNING_EVENT) == 0) {
+            continue;
+        }
 
         // Store the wake word data for voice recognition, like who is speaking
         StoreWakeWordData(res->data, res->data_size / sizeof(int16_t));
 
         if (res->wakeup_state == WAKENET_DETECTED) {
-            Stop();
+            // s1bt: only pause fetch here — do NOT reset_buffer yet. AudioService will
+            // gate Feed (clear AS_EVENT) then call Stop() which defers reset to this task.
+            xEventGroupClearBits(event_group_, DETECTION_RUNNING_EVENT);
             last_detected_wake_word_ = wake_words_[res->wakenet_model_index - 1];
 
             if (wake_word_detected_callback_) {

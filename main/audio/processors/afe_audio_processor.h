@@ -6,6 +6,8 @@
 #include <freertos/task.h>
 #include <freertos/event_groups.h>
 
+#include <atomic>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <functional>
@@ -37,6 +39,10 @@ private:
     AudioCodec* codec_ = nullptr;
     int frame_samples_ = 0;
     bool is_speaking_ = false;
+    /** s1br: reset_buffer is only legal on the task that owns fetch(). */
+    std::atomic<bool> afe_reset_pending_{false};
+    /** s1bu: serialize Feed vs reset_buffer (s1bt flag check alone is TOCTOU). */
+    std::mutex afe_ops_mutex_;
     std::vector<int16_t> output_buffer_;
 
     void AudioProcessorTask();

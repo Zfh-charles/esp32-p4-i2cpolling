@@ -23,6 +23,8 @@
  */
 
 #include "emotion_video_player.h"
+#include "wdt_contention_diag.h"
+#include "stack_diag.h"
 
 // 优化：定义安全的信号量操作宏，使用更短的超时时间
 #define SAFE_SEMAPHORE_TAKE(sem, timeout_ms) \
@@ -32,6 +34,7 @@
     (xSemaphoreTake((sem), pdMS_TO_TICKS(2000)) == pdTRUE)
 
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_video_dec.h"
 #include "esp_video_dec_mjpeg.h"
 #include "esp_video_codec_utils.h"
@@ -68,6 +71,9 @@ static const uint32_t g_hw_decoder_cc = ESP_VIDEO_DEC_HW_MJPEG_TAG;
 
 // 🚀 新增：帧索引表支持
 #define MAX_FRAMES_PER_VIDEO    300  // 每个视频最多300帧（10秒@30fps）
+
+// L3: 解码循环周期性让步，给 idle/系统任务让出时间片
+#define MJPEG_L3_YIELD_INTERVAL 10
 
 /**
  * @brief 帧索引条目（关键优化：避免运行时扫描）
@@ -228,7 +234,26 @@ typedef struct emotion_video_player_t {
     // 🚀 优化：高精度帧率控制
     uint64_t frame_deadline_us;
     uint32_t frame_interval_us;
+    uint32_t normal_frame_interval_us;
     uint64_t last_frame_time_us;
+    uint64_t last_decode_success_us;
+    uint64_t last_resume_us;
+    uint64_t resume_warmup_until_us;
+    uint64_t soft_start_until_us;
+    uint64_t last_stall_diag_us;
+    
+    volatile bool decode_paused;
+    volatile bool preload_started;
+
+    /* S1: one RGB565 still per base emotion (boot seed; conversation blit-only). */
+    struct {
+        uint8_t *rgb;
+        uint32_t size;
+        uint32_t w;
+        uint32_t h;
+        bool ready;
+    } seed_stills[TOTAL_EMOTIONS_COUNT];
+    bool seed_stills_ready;
     
 } emotion_video_player_t;
 
@@ -256,6 +281,7 @@ static const char* resolve_emotion_alias(const char *emotion_name);
 static esp_err_t switch_to_emotion(emotion_video_player_t *player, const char *emotion_name);
 
 // 🔥 新增：预加载任务和循环播放处理
+static void preload_base_emotions(emotion_video_player_t *player);
 static void preload_emotions_task(void *arg);
 static void handle_emotion_playback_complete(emotion_video_player_t *player);
 static void reset_current_emotion_position(emotion_video_player_t *player);
@@ -308,6 +334,7 @@ esp_err_t emotion_video_player_init(const emotion_video_config_t *config, emotio
     player->state = EMOTION_VIDEO_STATE_IDLE;
     player->decode_error_count = 0;
     player->frame_interval_us = 1000000 / config->frame_rate;
+    player->normal_frame_interval_us = player->frame_interval_us;
     
     // 初始化播放状态
     player->current_cache_index = 0;
@@ -414,23 +441,7 @@ esp_err_t emotion_video_player_init(const emotion_video_config_t *config, emotio
         }
     }
     
-    // 🔥 修复2：启动后台预加载任务
-    ESP_LOGI(TAG, "📝 其他基础表情将在后台预加载");
-    
-    BaseType_t ret_preload = xTaskCreate(
-        preload_emotions_task,
-        "emotion_preload",
-        4096,
-        player,
-        1,
-        NULL
-    );
-    
-    if (ret_preload == pdPASS) {
-        ESP_LOGI(TAG, "✅ 预加载任务已启动");
-    } else {
-        ESP_LOGW(TAG, "⚠️ 预加载任务启动失败");
-    }
+    ESP_LOGI(TAG, "📝 其他基础表情将在唤醒稳定后预加载");
 
     return ESP_OK;
 
@@ -465,7 +476,13 @@ esp_err_t emotion_video_player_deinit(emotion_video_handle_t handle)
             heap_caps_free(player->video_caches[i].buffer);
             player->video_caches[i].buffer = NULL;
         }
+        if (player->seed_stills[i].rgb) {
+            heap_caps_free(player->seed_stills[i].rgb);
+            player->seed_stills[i].rgb = NULL;
+            player->seed_stills[i].ready = false;
+        }
     }
+    player->seed_stills_ready = false;
 
     esp_video_dec_unregister_mjpeg();
 
@@ -499,18 +516,33 @@ esp_err_t emotion_video_player_play_emotion_ex(emotion_video_handle_t handle,
         def = find_emotion_def(resolved_name);
     }
     
-    // 🔥 修复：如果请求的是standby且当前已在播放standby，直接返回
     if (strcmp(resolved_name, DEFAULT_STANDBY_EMOTION) == 0 && 
         strcmp(player->current_emotion, DEFAULT_STANDBY_EMOTION) == 0 &&
         player->state == EMOTION_VIDEO_STATE_PLAYING) {
-        ESP_LOGD(TAG, "已在播放standby，跳过重复请求");
+        ESP_LOGW(TAG, "CTRL EMO_REQ skip=already_standby paused=%d",
+                 (int)player->decode_paused);
         return ESP_OK;
     }
     
     if (strcmp(player->current_emotion, resolved_name) == 0 && queue_is_empty(player)) {
-        ESP_LOGD(TAG, "已在播放 %s 且队列为空，跳过", resolved_name);
+        ESP_LOGW(TAG, "CTRL EMO_REQ skip=same_playing name=%s paused=%d",
+                 resolved_name, (int)player->decode_paused);
         return ESP_OK;
     }
+
+    bool cache_ready = false;
+    bool index_built = false;
+    int cache_index = def ? def->cache_index : -1;
+    if (cache_index >= 0 && cache_index < TOTAL_EMOTIONS_COUNT) {
+        xSemaphoreTake(player->cache_mutex, portMAX_DELAY);
+        cache_ready = player->video_caches[cache_index].ready;
+        index_built = player->video_caches[cache_index].index_built;
+        xSemaphoreGive(player->cache_mutex);
+    }
+    ESP_LOGW(TAG,
+             "CTRL EMO_REQ raw=%s resolved=%s cur=%s paused=%d cache_idx=%d ready=%d index=%d",
+             emotion_name, resolved_name, player->current_emotion,
+             (int)player->decode_paused, cache_index, (int)cache_ready, (int)index_built);
     
     if (immediate) {
         xSemaphoreTake(player->state_mutex, portMAX_DELAY);
@@ -811,6 +843,7 @@ static void handle_emotion_playback_complete(emotion_video_player_t *player)
     
     // 重置帧率控制的deadline
     player->frame_deadline_us = esp_timer_get_time();
+    player->last_decode_success_us = player->frame_deadline_us;
     
     ESP_LOGD(TAG, "🔁 表情循环播放: %s", player->current_emotion);
 }
@@ -820,10 +853,15 @@ static void decode_task(void *arg)
 {
     emotion_video_player_t *player = (emotion_video_player_t *)arg;
     EventBits_t event_bits;
+    uint64_t last_diag_us = esp_timer_get_time();
+    const uint32_t kSoftStartMinIntervalUs = 100000;      // 10fps
+    const uint64_t kDecodeHangThresholdUs = 1500000ULL;   // 1.5s
     
     ESP_LOGI(TAG, "🎬 解码任务启动");
     
     player->frame_deadline_us = esp_timer_get_time();
+    player->last_decode_success_us = player->frame_deadline_us;
+    player->last_stall_diag_us = 0;
 
     while (1) {
         event_bits = xEventGroupWaitBits(
@@ -883,18 +921,26 @@ static void decode_task(void *arg)
                         
                         esp_err_t ret = switch_to_emotion(player, emotion_to_switch);
                         if (ret != ESP_OK) {
-                            ESP_LOGW(TAG, "⚠️ 表情切换失败: %s (%s)", 
-                                    emotion_to_switch, esp_err_to_name(ret));
-                            // 🔥 失败后恢复播放状态
+                            ESP_LOGW(TAG, "CTRL EMO_SWITCH fail name=%s err=%s paused=%d",
+                                    emotion_to_switch, esp_err_to_name(ret),
+                                    (int)player->decode_paused);
                             change_state(player, EMOTION_VIDEO_STATE_PLAYING);
+                        } else if (player->decode_paused) {
+                            // v9-r0: keep paused; no LVGL force-paint (bypass path comes later).
+                            ESP_LOGW(TAG,
+                                     "CTRL EMO_SWITCH ok name=%s cache_idx=%d paused=1 will_paint=0",
+                                     emotion_to_switch, player->current_cache_index);
+                        } else {
+                            ESP_LOGW(TAG,
+                                     "CTRL EMO_SWITCH ok name=%s cache_idx=%d paused=0 will_paint=loop",
+                                     emotion_to_switch, player->current_cache_index);
                         }
-                        // switch_to_emotion 成功后会自动设置为 PLAYING
                     } else {
                         // 🔥 目标表情与当前相同，只需重置播放位置
                         ESP_LOGD(TAG, "📍 表情相同，重置播放位置: %s", emotion_to_switch);
                         reset_current_emotion_position(player);
                     }
-                    
+
                     player->frame_deadline_us = esp_timer_get_time();
                 } else {
                     xSemaphoreGive(player->state_mutex);
@@ -907,17 +953,64 @@ static void decode_task(void *arg)
         }
 
         if (player->state == EMOTION_VIDEO_STATE_PLAYING) {
+            // v8/v9-r0: pause decode during wake/conversation (no force burst).
+            if (player->decode_paused) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+
             uint64_t current_time = esp_timer_get_time();
-            
+
+            // Resume 后先暖机，避免瞬时恢复引发显示链路冲击
+            if (player->resume_warmup_until_us > current_time) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+
+            // Resume 软启动：低帧率跑一段时间，再恢复到配置帧率
+            if (player->soft_start_until_us > current_time) {
+                if (player->frame_interval_us < kSoftStartMinIntervalUs) {
+                    player->frame_interval_us = kSoftStartMinIntervalUs;
+                }
+            } else if (player->frame_interval_us != player->normal_frame_interval_us &&
+                       player->soft_start_until_us <= current_time) {
+                player->frame_interval_us = player->normal_frame_interval_us;
+                ESP_LOGI(TAG, "MJPEG soft-start finished, restore %lu fps",
+                         (unsigned long)(1000000U / (player->normal_frame_interval_us ? player->normal_frame_interval_us : 1U)));
+            }
+
+            // 黑屏时通常不再有新帧输出，这里做超时探针并重置deadline自恢复
+            if ((current_time - player->last_decode_success_us) > kDecodeHangThresholdUs) {
+                if ((current_time - player->last_stall_diag_us) > 1000000ULL) {
+                    size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+                    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+                    ESP_LOGW(TAG,
+                             "STALL_DIAG core=%d no decoded frame for %ums (cache_idx=%d frame_idx=%d state=%d free_int=%u free_psram=%u)",
+                             xPortGetCoreID(),
+                             (unsigned)((current_time - player->last_decode_success_us) / 1000ULL),
+                             player->current_cache_index,
+                             player->current_frame_index,
+                             (int)player->state,
+                             (unsigned)free_int,
+                             (unsigned)free_psram);
+                    player->last_stall_diag_us = current_time;
+                }
+                player->frame_deadline_us = current_time + player->frame_interval_us;
+                taskYIELD();
+            }
+
             if (current_time >= player->frame_deadline_us) {
                 esp_err_t ret = hw_decode_frame_optimized(player);
-                
+
                 if (ret == ESP_OK) {
                     player->last_frame_time_us = current_time;
+                    player->last_decode_success_us = current_time;
                     player->current_frame++;
-                    player->frame_deadline_us += player->frame_interval_us;
                     player->decode_error_count = 0;
-                    
+                    player->frame_deadline_us = current_time + player->frame_interval_us;
+                    if ((player->current_frame % MJPEG_L3_YIELD_INTERVAL) == 0) {
+                        vTaskDelay(pdMS_TO_TICKS(1));
+                    }
                     int64_t drift = current_time - player->frame_deadline_us;
                     if (drift > (int64_t)(player->frame_interval_us * 2)) {
                         player->frame_deadline_us = current_time + player->frame_interval_us;
@@ -942,6 +1035,31 @@ static void decode_task(void *arg)
             }
         } else {
             vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        uint64_t now_us = esp_timer_get_time();
+        if (now_us - last_diag_us >= 5000000ULL) {
+            last_diag_us = now_us;
+            UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+            size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            const unsigned min_int =
+                (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+            const unsigned largest_int =
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+            ESP_LOGI(TAG,
+                     "MJPEG_DIAG core=%d state=%d frame_idx=%d cache_idx=%d err=%" PRIu32
+                     " hwm=%u | free_int=%u min_int=%u largest_int=%u | free_psram=%u",
+                     xPortGetCoreID(),
+                     (int)player->state,
+                     player->current_frame_index,
+                     player->current_cache_index,
+                     player->decode_error_count,
+                     (unsigned)hwm,
+                     (unsigned)free_int,
+                     min_int,
+                     largest_int,
+                     (unsigned)free_psram);
         }
     }
 
@@ -1026,7 +1144,9 @@ static esp_err_t hw_decode_frame_optimized(emotion_video_player_t *player)
         return ESP_ERR_INVALID_SIZE;
     }
     
+    uint64_t t_memcpy0 = esp_timer_get_time();
     memcpy(player->input_buffer, frame_data, frame_size);
+    uint32_t memcpy_ms = (uint32_t)((esp_timer_get_time() - t_memcpy0) / 1000ULL);
 
     if (!player->output_buffer) {
         uint32_t needed_size = player->config.canvas_width * player->config.canvas_height * 2;
@@ -1060,6 +1180,7 @@ static esp_err_t hw_decode_frame_optimized(emotion_video_player_t *player)
         .decoded_size = 0
     };
 
+    uint64_t t_hw0 = esp_timer_get_time();
     esp_vc_err_t vc_ret = esp_video_dec_process(player->hw_dec_handle, &in_frame, &out_frame);
     
     if (vc_ret == ESP_VC_ERR_BUF_NOT_ENOUGH) {
@@ -1097,10 +1218,31 @@ static esp_err_t hw_decode_frame_optimized(emotion_video_player_t *player)
         }
         
         if (player->frame_cb) {
+            uint64_t t_cb0 = esp_timer_get_time();
+            if (WdtContendWindowActive()) {
+                WdtContendBreadcrumb("pre_frame_cb");
+            }
             player->frame_cb((emotion_video_handle_t)player, out_frame.data, 
                             out_frame.decoded_size, player->frame_info.res.width, 
                             player->frame_info.res.height, player->frame_user_data);
+            if (WdtContendWindowActive()) {
+                WdtContendBreadcrumb("post_frame_cb");
+            }
+            uint32_t cb_ms = (uint32_t)((esp_timer_get_time() - t_cb0) / 1000ULL);
+            uint32_t hw_ms = (uint32_t)((t_cb0 - t_hw0) / 1000ULL);
+            WdtContendNoteMjpegFrame(memcpy_ms, hw_ms, cb_ms);
+            if (WdtContendWindowActive()) {
+                WdtContendBreadcrumb("post_frame_note");
+                taskYIELD();
+                WdtContendBreadcrumb("post_yield");
+            }
+        } else {
+            uint32_t hw_ms = (uint32_t)((esp_timer_get_time() - t_hw0) / 1000ULL);
+            WdtContendNoteMjpegFrame(memcpy_ms, hw_ms, 0);
         }
+    } else {
+        uint32_t hw_ms = (uint32_t)((esp_timer_get_time() - t_hw0) / 1000ULL);
+        WdtContendNoteMjpegFrame(memcpy_ms, hw_ms, 0);
     }
 
     return ESP_OK;
@@ -1157,61 +1299,719 @@ static esp_err_t deinit_hw_decoder(emotion_video_player_t *player)
     return ESP_OK;
 }
 
-// 🔥 新增：后台预加载任务
-static void preload_emotions_task(void *arg)
+// P2: load happy/sad/angry/loving/neutral into PSRAM+index (no decode/paint).
+static void preload_base_emotions(emotion_video_player_t *player)
 {
-    emotion_video_player_t *player = (emotion_video_player_t *)arg;
-    
-    // 等待2秒，让系统稳定运行
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    
-    ESP_LOGI(TAG, "🚀 开始后台预加载基础表情...");
-    
-    // 预加载顺序：按使用频率排序
+    uint64_t preload_begin_us = esp_timer_get_time();
+    StackDiagSetPreloadActive(true);
+    StackDiagLog("preload_task_begin", "before_any_emotion");
+    ESP_LOGW(TAG, "CTRL P2 preload_base begin");
+    ESP_LOGI(TAG, "🚀 开始预加载基础表情...");
+
     const char *preload_order[] = {"happy", "sad", "angry", "loving", "neutral"};
     int preload_count = sizeof(preload_order) / sizeof(preload_order[0]);
-    
+
     for (int i = 0; i < preload_count; i++) {
         const emotion_def_t *def = find_emotion_def(preload_order[i]);
         if (!def) continue;
-        
+
         int cache_index = def->cache_index;
-        
-        // 检查是否已加载
+
         xSemaphoreTake(player->cache_mutex, portMAX_DELAY);
-        bool already_loaded = player->video_caches[cache_index].ready && 
+        bool already_loaded = player->video_caches[cache_index].ready &&
                              player->video_caches[cache_index].index_built;
         xSemaphoreGive(player->cache_mutex);
-        
+
         if (already_loaded) {
             ESP_LOGI(TAG, "⏭️ 跳过已加载: %s", preload_order[i]);
+            StackDiagLog("preload_skip", preload_order[i]);
             continue;
         }
-        
-        ESP_LOGI(TAG, "📂 预加载表情: %s", preload_order[i]);
-        
-        // 加载表情
+
+        size_t heap_int_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        size_t heap_psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        uint64_t load_begin_us = esp_timer_get_time();
+        StackDiagLog("preload_before", preload_order[i]);
+        ESP_LOGI(TAG, "📂 预加载表情: %s free_int=%u free_psram=%u",
+                 preload_order[i], (unsigned)heap_int_before, (unsigned)heap_psram_before);
+
         esp_err_t ret = load_video_to_cache(player, cache_index);
+        StackDiagLog("preload_after_load", preload_order[i]);
         if (ret == ESP_OK) {
-            // 建立索引
+            uint64_t index_begin_us = esp_timer_get_time();
             ret = build_frame_index(player, cache_index);
+            uint64_t index_cost_ms = (esp_timer_get_time() - index_begin_us) / 1000ULL;
+            StackDiagLog("preload_after_index", preload_order[i]);
             if (ret == ESP_OK) {
-                ESP_LOGI(TAG, "✅ 预加载成功: %s", preload_order[i]);
+                size_t heap_int_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+                size_t heap_psram_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+                uint64_t total_cost_ms = (esp_timer_get_time() - load_begin_us) / 1000ULL;
+                ESP_LOGI(TAG,
+                         "✅ 预加载成功: %s total=%ums index=%ums free_int=%u->%u free_psram=%u->%u",
+                         preload_order[i],
+                         (unsigned)total_cost_ms,
+                         (unsigned)index_cost_ms,
+                         (unsigned)heap_int_before, (unsigned)heap_int_after,
+                         (unsigned)heap_psram_before, (unsigned)heap_psram_after);
             } else {
                 ESP_LOGW(TAG, "⚠️ 索引建立失败: %s", preload_order[i]);
             }
         } else {
             ESP_LOGW(TAG, "⚠️ 加载失败: %s", preload_order[i]);
         }
-        
-        // 让出CPU，避免影响主任务
+
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    
+
     player->base_emotions_loaded = true;
-    ESP_LOGI(TAG, "🎉 基础表情预加载完成");
-    
+    uint64_t preload_cost_ms = (esp_timer_get_time() - preload_begin_us) / 1000ULL;
+    StackDiagLog("preload_task_done", "all_emotions");
+    StackDiagSetPreloadActive(false);
+    ESP_LOGW(TAG, "CTRL P2 preload_base done total=%ums", (unsigned)preload_cost_ms);
+    ESP_LOGI(TAG, "🎉 基础表情预加载完成 total=%ums", (unsigned)preload_cost_ms);
+}
+
+static void preload_emotions_task(void *arg)
+{
+    emotion_video_player_t *player = (emotion_video_player_t *)arg;
+    preload_base_emotions(player);
     vTaskDelete(NULL);
+}
+
+static esp_err_t seed_one_emotion_still(emotion_video_player_t *player, const char *name)
+{
+    const emotion_def_t *def = find_emotion_def(name);
+    if (!def || def->cache_index < 0 || def->cache_index >= TOTAL_EMOTIONS_COUNT) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    const int idx = def->cache_index;
+    if (player->seed_stills[idx].ready && player->seed_stills[idx].rgb) {
+        return ESP_OK;
+    }
+
+    xSemaphoreTake(player->cache_mutex, portMAX_DELAY);
+    bool cache_ok = player->video_caches[idx].ready && player->video_caches[idx].index_built;
+    xSemaphoreGive(player->cache_mutex);
+    if (!cache_ok) {
+        esp_err_t lr = load_video_to_cache(player, idx);
+        if (lr == ESP_OK) {
+            lr = build_frame_index(player, idx);
+        }
+        if (lr != ESP_OK) {
+            ESP_LOGW(TAG, "CTRL S1 seed load fail name=%s err=%s", name, esp_err_to_name(lr));
+            return lr;
+        }
+    }
+
+    // Mid-clip still — frame0 is often near-white/idle pose (all emos looked identical).
+    uint32_t skip = 0;
+    xSemaphoreTake(player->cache_mutex, portMAX_DELAY);
+    const int fc = player->video_caches[idx].frame_count;
+    xSemaphoreGive(player->cache_mutex);
+    if (fc > 4) {
+        skip = (uint32_t)(fc / 3);
+    }
+
+    const uint8_t *rgb = NULL;
+    uint32_t size = 0, w = 0, h = 0;
+    esp_err_t dr = emotion_video_player_decode_one_rgb565(
+        (emotion_video_handle_t)player, name, skip, &rgb, &size, &w, &h);
+    if (dr != ESP_OK || rgb == NULL || size == 0 || w == 0 || h == 0) {
+        ESP_LOGW(TAG, "CTRL S1 seed decode fail name=%s err=%s skip=%u", name,
+                 esp_err_to_name(dr), (unsigned)skip);
+        return (dr == ESP_OK) ? ESP_FAIL : dr;
+    }
+
+    uint8_t *copy = (uint8_t *)heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!copy) {
+        copy = (uint8_t *)malloc(size);
+    }
+    if (!copy) {
+        ESP_LOGW(TAG, "CTRL S1 seed oom name=%s size=%u", name, (unsigned)size);
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(copy, rgb, size);
+    if (player->seed_stills[idx].rgb) {
+        heap_caps_free(player->seed_stills[idx].rgb);
+    }
+    player->seed_stills[idx].rgb = copy;
+    player->seed_stills[idx].size = size;
+    player->seed_stills[idx].w = w;
+    player->seed_stills[idx].h = h;
+    player->seed_stills[idx].ready = true;
+    // Quality fingerprint — corner/mid often 0xFFFF (white bg); count non-white.
+    {
+        const uint16_t *px = (const uint16_t *)copy;
+        const uint32_t np = size / 2;
+        uint32_t nw = 0, acc = 0;
+        uint16_t face = 0;
+        for (uint32_t i = 0; i < np; i += 64) {
+            if (px[i] != 0xFFFFu) {
+                nw++;
+            }
+            acc = (acc * 131u) + px[i];
+        }
+        if (w >= 241 && h >= 201) {
+            face = px[(uint32_t)200 * w + 240];
+        }
+        ESP_LOGW(TAG, "CTRL S1 seed ok name=%s %ux%u bytes=%u nw=%u hash=%08x face=%04x",
+                 name, (unsigned)w, (unsigned)h, (unsigned)size, (unsigned)nw,
+                 (unsigned)acc, (unsigned)face);
+    }
+    return ESP_OK;
+}
+
+/** Sparse RGB565 fingerprint — same stride as CTRL S1 seed ok hash. */
+static uint32_t rgb565_sparse_hash(const uint8_t *rgb, uint32_t size)
+{
+    if (!rgb || size < 2) {
+        return 0;
+    }
+    const uint16_t *px = (const uint16_t *)rgb;
+    const uint32_t np = size / 2;
+    uint32_t acc = 0;
+    for (uint32_t i = 0; i < np; i += 64) {
+        acc = (acc * 131u) + px[i];
+    }
+    return acc;
+}
+
+/**
+ * s1ce / P1: pure probe — decode frame0 + last, log hashes. Does not change seed path.
+ * Contract (rules): hash(f0[emo]) == hash(last[emo]) == hash(f0[standby]).
+ */
+static esp_err_t probe_emotion_contract_ends(emotion_video_player_t *player, const char *name,
+                                             uint32_t *out_fc, uint32_t *out_h0, uint32_t *out_hlast)
+{
+    if (!player || !name || !out_fc || !out_h0 || !out_hlast) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const emotion_def_t *def = find_emotion_def(name);
+    if (!def || def->cache_index < 0 || def->cache_index >= TOTAL_EMOTIONS_COUNT) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    const int idx = def->cache_index;
+    xSemaphoreTake(player->cache_mutex, portMAX_DELAY);
+    const int fc = player->video_caches[idx].frame_count;
+    const bool ready = player->video_caches[idx].ready && player->video_caches[idx].index_built;
+    xSemaphoreGive(player->cache_mutex);
+    if (!ready || fc <= 0) {
+        ESP_LOGW(TAG, "FACE_ASSET emo=%s skip=no_cache s1ce", name);
+        return ESP_ERR_INVALID_STATE;
+    }
+    *out_fc = (uint32_t)fc;
+    const uint32_t last_i = (fc > 0) ? (uint32_t)(fc - 1) : 0;
+
+    const uint8_t *rgb = NULL;
+    uint32_t size = 0, w = 0, h = 0;
+    esp_err_t r0 = emotion_video_player_decode_at_rgb565((emotion_video_handle_t)player, name, 0,
+                                                        &rgb, &size, &w, &h);
+    if (r0 != ESP_OK || rgb == NULL || size == 0) {
+        ESP_LOGW(TAG, "FACE_ASSET emo=%s f0_fail err=%s s1ce", name, esp_err_to_name(r0));
+        return (r0 == ESP_OK) ? ESP_FAIL : r0;
+    }
+    *out_h0 = rgb565_sparse_hash(rgb, size);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    rgb = NULL;
+    size = 0;
+    esp_err_t rl = emotion_video_player_decode_at_rgb565((emotion_video_handle_t)player, name, last_i,
+                                                        &rgb, &size, &w, &h);
+    if (rl != ESP_OK || rgb == NULL || size == 0) {
+        ESP_LOGW(TAG, "FACE_ASSET emo=%s last_fail err=%s idx=%u s1ce", name, esp_err_to_name(rl),
+                 (unsigned)last_i);
+        return (rl == ESP_OK) ? ESP_FAIL : rl;
+    }
+    *out_hlast = rgb565_sparse_hash(rgb, size);
+
+    const int same_ends = (*out_h0 == *out_hlast) ? 1 : 0;
+    ESP_LOGW(TAG, "FACE_ASSET emo=%s fc=%u f0=%08x last=%08x same_ends=%d s1ce", name,
+             (unsigned)*out_fc, (unsigned)*out_h0, (unsigned)*out_hlast, same_ends);
+    return ESP_OK;
+}
+
+static void seed_base_emotion_stills(emotion_video_player_t *player)
+{
+    static const char *kSeedOrder[] = {"standby", "happy", "sad", "angry", "loving", "neutral"};
+    ESP_LOGW(TAG, "CTRL S1 seed_stills begin");
+    int ok_n = 0;
+    uint32_t standby_f0 = 0;
+    int standby_f0_ok = 0;
+    int contract_n = 0;
+    int probed_n = 0;
+    for (size_t i = 0; i < sizeof(kSeedOrder) / sizeof(kSeedOrder[0]); i++) {
+        if (seed_one_emotion_still(player, kSeedOrder[i]) == ESP_OK) {
+            ok_n++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+        // P1 probe after each seed (cache warm); pure logs.
+        uint32_t fc = 0, h0 = 0, hlast = 0;
+        if (probe_emotion_contract_ends(player, kSeedOrder[i], &fc, &h0, &hlast) == ESP_OK) {
+            probed_n++;
+            if (strcmp(kSeedOrder[i], "standby") == 0) {
+                standby_f0 = h0;
+                standby_f0_ok = 1;
+            }
+            const int same_ends = (h0 == hlast) ? 1 : 0;
+            const int vs_standby = (standby_f0_ok && h0 == standby_f0) ? 1 : 0;
+            ESP_LOGW(TAG, "FACE_ASSET emo=%s vs_standby_f0=%d s1ce", kSeedOrder[i], vs_standby);
+            if (same_ends && vs_standby) {
+                contract_n++;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    player->seed_stills_ready = (ok_n > 0);
+    ESP_LOGW(TAG, "CTRL S1 seed_stills done ok=%d/%d ready=%d", ok_n,
+             (int)(sizeof(kSeedOrder) / sizeof(kSeedOrder[0])),
+             player->seed_stills_ready ? 1 : 0);
+
+    // contract=1 only if every probed emo has f0==last==standby.f0 (6/6).
+    const int n_emos = (int)(sizeof(kSeedOrder) / sizeof(kSeedOrder[0]));
+    const int contract = (standby_f0_ok && probed_n == n_emos && contract_n == n_emos) ? 1 : 0;
+    ESP_LOGW(TAG,
+             "FACE_ASSET contract=%d matched=%d/%d probed=%d standby_f0=%08x s1ce", contract,
+             contract_n, n_emos, probed_n, (unsigned)standby_f0);
+    esp_rom_printf("!!FACE_ASSET contract=%d matched=%d/%d s1ce\n", contract, contract_n, n_emos);
+}
+
+esp_err_t emotion_video_player_seed_emotion_still(emotion_video_handle_t handle,
+                                                  const char *emotion_name)
+{
+    if (!handle || !emotion_name) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return seed_one_emotion_still((emotion_video_player_t *)handle, emotion_name);
+}
+
+esp_err_t emotion_video_player_preload_base_sync(emotion_video_handle_t handle)
+{
+    if (!handle) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    emotion_video_player_t *player = (emotion_video_player_t *)handle;
+    // s1ct: seed standby BEFORE loading the other five MJPEGs so the host can paint
+    // a face while the rest of P2 is still reading SD (avoids long black canvas).
+    if (seed_one_emotion_still(player, "standby") == ESP_OK) {
+        ESP_LOGW(TAG, "CTRL S1 seed_early emo=standby s1ct");
+        esp_rom_printf("!!FACE_BOOT seed_early standby\n");
+    }
+    if (!player->base_emotions_loaded) {
+        if (player->preload_started) {
+            ESP_LOGW(TAG, "CTRL P2 preload_base wait async");
+            for (int i = 0; i < 300 && !player->base_emotions_loaded; i++) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            if (!player->base_emotions_loaded) {
+                return ESP_ERR_TIMEOUT;
+            }
+        } else {
+            player->preload_started = true;
+            preload_base_emotions(player);
+        }
+    } else {
+        ESP_LOGW(TAG, "CTRL P2 preload_base skip already_loaded");
+    }
+    if (!player->seed_stills_ready) {
+        seed_base_emotion_stills(player);
+    } else {
+        ESP_LOGW(TAG, "CTRL S1 seed_stills skip already_ready");
+    }
+    return player->seed_stills_ready ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t emotion_video_player_get_seed_rgb565(emotion_video_handle_t handle,
+                                               const char *emotion_name,
+                                               const uint8_t **out_rgb565,
+                                               uint32_t *out_size,
+                                               uint32_t *out_w,
+                                               uint32_t *out_h)
+{
+    if (!handle || !emotion_name || !out_rgb565) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    emotion_video_player_t *player = (emotion_video_player_t *)handle;
+    const char *resolved = resolve_emotion_alias(emotion_name);
+    const emotion_def_t *def = find_emotion_def(resolved);
+    if (!def || def->cache_index < 0 || def->cache_index >= TOTAL_EMOTIONS_COUNT) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    const int idx = def->cache_index;
+    if (!player->seed_stills[idx].ready || !player->seed_stills[idx].rgb) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    *out_rgb565 = player->seed_stills[idx].rgb;
+    if (out_size) {
+        *out_size = player->seed_stills[idx].size;
+    }
+    if (out_w) {
+        *out_w = player->seed_stills[idx].w;
+    }
+    if (out_h) {
+        *out_h = player->seed_stills[idx].h;
+    }
+    return ESP_OK;
+}
+
+bool emotion_video_player_seed_stills_ready(emotion_video_handle_t handle)
+{
+    if (!handle) {
+        return false;
+    }
+    return ((emotion_video_player_t *)handle)->seed_stills_ready;
+}
+
+uint32_t emotion_video_player_mid_stride_skip(emotion_video_handle_t handle,
+                                             const char *emotion_name)
+{
+    if (!handle || !emotion_name) {
+        return 0;
+    }
+    emotion_video_player_t *player = (emotion_video_player_t *)handle;
+    const char *resolved = resolve_emotion_alias(emotion_name);
+    const emotion_def_t *def = find_emotion_def(resolved);
+    if (!def || def->cache_index < 0 || def->cache_index >= TOTAL_EMOTIONS_COUNT) {
+        return 0;
+    }
+    const int idx = def->cache_index;
+    xSemaphoreTake(player->cache_mutex, portMAX_DELAY);
+    const int fc = player->video_caches[idx].frame_count;
+    xSemaphoreGive(player->cache_mutex);
+    if (fc > 4) {
+        return (uint32_t)(fc / 3);
+    }
+    return 0;
+}
+
+uint32_t emotion_video_player_mid_arc_start(emotion_video_handle_t handle,
+                                            const char *emotion_name)
+{
+    // s1cd: do NOT open MID at frame0 — SD clip head is often blink/closed-eye (wake looked
+    // eyes-shut). Start at seed index (fc/3) = open-eye rest, same as bookend.
+    return emotion_video_player_mid_stride_skip(handle, emotion_name);
+}
+
+uint32_t emotion_video_player_mid_arc_step(emotion_video_handle_t handle,
+                                          const char *emotion_name,
+                                          uint32_t mid_frames)
+{
+    if (mid_frames == 0) {
+        mid_frames = 1;
+    }
+    if (!handle || !emotion_name) {
+        return 1;
+    }
+    emotion_video_player_t *player = (emotion_video_player_t *)handle;
+    const char *resolved = resolve_emotion_alias(emotion_name);
+    const emotion_def_t *def = find_emotion_def(resolved);
+    if (!def || def->cache_index < 0 || def->cache_index >= TOTAL_EMOTIONS_COUNT) {
+        return 1;
+    }
+    const int idx = def->cache_index;
+    xSemaphoreTake(player->cache_mutex, portMAX_DELAY);
+    const int fc = player->video_caches[idx].frame_count;
+    xSemaphoreGive(player->cache_mutex);
+    // s1cd: span from seed start (fc/3) to end so arc still covers the expressive tail.
+    const uint32_t start = (fc > 4) ? (uint32_t)(fc / 3) : 0;
+    const uint32_t remain = (fc > (int)start) ? (uint32_t)fc - start : (uint32_t)fc;
+    const uint32_t step = remain / mid_frames;
+    return step > 0 ? step : 1;
+}
+
+esp_err_t emotion_video_player_pause_loop(emotion_video_handle_t handle)
+{
+    if (!handle) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    emotion_video_player_t *player = (emotion_video_player_t *)handle;
+    player->decode_paused = true;
+    return ESP_OK;
+}
+
+bool emotion_video_player_is_decode_paused(emotion_video_handle_t handle)
+{
+    if (!handle) {
+        return false;
+    }
+    emotion_video_player_t *player = (emotion_video_player_t *)handle;
+    return player->decode_paused;
+}
+
+esp_err_t emotion_video_player_decode_one_rgb565(emotion_video_handle_t handle,
+                                                 const char *emotion_name,
+                                                 uint32_t skip_frames,
+                                                 const uint8_t **out_rgb565,
+                                                 uint32_t *out_size,
+                                                 uint32_t *out_w,
+                                                 uint32_t *out_h)
+{
+    if (!handle || !emotion_name || !out_rgb565) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    emotion_video_player_t *player = (emotion_video_player_t *)handle;
+
+    // Do NOT hold state_mutex here: change_state()/switch_to_emotion() take it
+    // (non-recursive) → FreeRTOS priority-disinherit assert / panic.
+    esp_err_t ret = ESP_OK;
+    if (strcmp(player->current_emotion, emotion_name) != 0) {
+        ESP_LOGW(TAG, "CTRL BYPASS decode_one switch name=%s", emotion_name);
+        ret = switch_to_emotion(player, emotion_name);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "CTRL BYPASS decode_one switch fail name=%s err=%s",
+                     emotion_name, esp_err_to_name(ret));
+            return ret;
+        }
+    }
+    reset_current_emotion_position(player);
+
+    emotion_video_frame_cb_t saved_cb = player->frame_cb;
+    player->frame_cb = NULL;
+    // Decode skip_frames+1 times; keep the last (often more expressive mid-clip).
+    for (uint32_t i = 0; i <= skip_frames; i++) {
+        ret = hw_decode_frame_optimized(player);
+        if (ret != ESP_OK) {
+            break;
+        }
+    }
+    player->frame_cb = saved_cb;
+
+    if (ret != ESP_OK || player->output_buffer == NULL) {
+        ESP_LOGW(TAG, "CTRL BYPASS decode_one fail name=%s err=%s skip=%u",
+                 emotion_name, esp_err_to_name(ret), (unsigned)skip_frames);
+        return (ret == ESP_OK) ? ESP_FAIL : ret;
+    }
+
+    uint32_t w = player->frame_info.res.width;
+    uint32_t h = player->frame_info.res.height;
+    if (w == 0 || h == 0) {
+        w = player->config.canvas_width;
+        h = player->config.canvas_height;
+    }
+    *out_rgb565 = player->output_buffer;
+    if (out_size) {
+        *out_size = w * h * 2;
+    }
+    if (out_w) {
+        *out_w = w;
+    }
+    if (out_h) {
+        *out_h = h;
+    }
+    ESP_LOGW(TAG, "CTRL BYPASS decode_one ok name=%s w=%u h=%u skip=%u", emotion_name,
+             (unsigned)w, (unsigned)h, (unsigned)skip_frames);
+    return ESP_OK;
+}
+
+esp_err_t emotion_video_player_decode_next_rgb565(emotion_video_handle_t handle,
+                                                  const uint8_t **out_rgb565,
+                                                  uint32_t *out_size,
+                                                  uint32_t *out_w,
+                                                  uint32_t *out_h)
+{
+    return emotion_video_player_decode_next_n_rgb565(handle, 1, out_rgb565, out_size, out_w,
+                                                     out_h);
+}
+
+esp_err_t emotion_video_player_decode_next_n_rgb565(emotion_video_handle_t handle,
+                                                    uint32_t n,
+                                                    const uint8_t **out_rgb565,
+                                                    uint32_t *out_size,
+                                                    uint32_t *out_w,
+                                                    uint32_t *out_h)
+{
+    if (!handle || !out_rgb565) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (n == 0) {
+        n = 1;
+    }
+    emotion_video_player_t *player = (emotion_video_player_t *)handle;
+
+    emotion_video_frame_cb_t saved_cb = player->frame_cb;
+    player->frame_cb = NULL;
+    esp_err_t ret = ESP_FAIL;
+    for (uint32_t i = 0; i < n; i++) {
+        ret = hw_decode_frame_optimized(player);
+        if (ret == ESP_ERR_NOT_FOUND) {
+            // Loop clip for short bypass anim.
+            reset_current_emotion_position(player);
+            ret = hw_decode_frame_optimized(player);
+        }
+        if (ret != ESP_OK) {
+            break;
+        }
+    }
+    player->frame_cb = saved_cb;
+
+    if (ret != ESP_OK || player->output_buffer == NULL) {
+        return (ret == ESP_OK) ? ESP_FAIL : ret;
+    }
+
+    uint32_t w = player->frame_info.res.width;
+    uint32_t h = player->frame_info.res.height;
+    if (w == 0 || h == 0) {
+        w = player->config.canvas_width;
+        h = player->config.canvas_height;
+    }
+    *out_rgb565 = player->output_buffer;
+    if (out_size) {
+        *out_size = w * h * 2;
+    }
+    if (out_w) {
+        *out_w = w;
+    }
+    if (out_h) {
+        *out_h = h;
+    }
+    return ESP_OK;
+}
+
+esp_err_t emotion_video_player_decode_at_rgb565(emotion_video_handle_t handle,
+                                                const char *emotion_name,
+                                                uint32_t frame_index,
+                                                const uint8_t **out_rgb565,
+                                                uint32_t *out_size,
+                                                uint32_t *out_w,
+                                                uint32_t *out_h)
+{
+    // s1by: index-table seek + one JPEG. Avoids decode_next_n(step) burning step
+    // consecutive hw_decode calls (idle breathe step≈fc/6 ≈13 → WDT / InstrFault).
+    if (!handle || !emotion_name || !out_rgb565) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    emotion_video_player_t *player = (emotion_video_player_t *)handle;
+
+    esp_err_t ret = ESP_OK;
+    if (strcmp(player->current_emotion, emotion_name) != 0) {
+        ESP_LOGW(TAG, "CTRL BYPASS decode_at switch name=%s", emotion_name);
+        ret = switch_to_emotion(player, emotion_name);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+    if (player->current_cache_index < 0 ||
+        player->current_cache_index >= TOTAL_EMOTIONS_COUNT) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    video_cache_t *cache = &player->video_caches[player->current_cache_index];
+    if (!cache->ready || !cache->index_built || cache->frame_count <= 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const uint32_t fc = (uint32_t)cache->frame_count;
+    const uint32_t idx = frame_index % fc;
+    xSemaphoreTake(player->cache_mutex, portMAX_DELAY);
+    player->current_frame_index = (int)idx;
+    xSemaphoreGive(player->cache_mutex);
+
+    emotion_video_frame_cb_t saved_cb = player->frame_cb;
+    player->frame_cb = NULL;
+    ret = hw_decode_frame_optimized(player);
+    player->frame_cb = saved_cb;
+
+    if (ret != ESP_OK || player->output_buffer == NULL) {
+        ESP_LOGW(TAG, "CTRL BYPASS decode_at fail name=%s err=%s idx=%u", emotion_name,
+                 esp_err_to_name(ret), (unsigned)idx);
+        return (ret == ESP_OK) ? ESP_FAIL : ret;
+    }
+
+    uint32_t w = player->frame_info.res.width;
+    uint32_t h = player->frame_info.res.height;
+    if (w == 0 || h == 0) {
+        w = player->config.canvas_width;
+        h = player->config.canvas_height;
+    }
+    *out_rgb565 = player->output_buffer;
+    if (out_size) {
+        *out_size = w * h * 2;
+    }
+    if (out_w) {
+        *out_w = w;
+    }
+    if (out_h) {
+        *out_h = h;
+    }
+    return ESP_OK;
+}
+
+esp_err_t emotion_video_player_resume_loop(emotion_video_handle_t handle)
+{
+    return emotion_video_player_resume_loop_at_fps(handle, 0);
+}
+
+esp_err_t emotion_video_player_resume_loop_at_fps(emotion_video_handle_t handle, uint32_t fps)
+{
+    if (!handle) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    emotion_video_player_t *player = (emotion_video_player_t *)handle;
+    const uint64_t now_us = esp_timer_get_time();
+    const uint64_t kResumeWarmupUs = 300000ULL;      // 0.3s
+    const uint64_t kResumeSoftStartUs = 2000000ULL;  // 2s
+    const uint32_t kSoftStartMinIntervalUs = 200000; // 5fps ceiling during ramp
+
+    if (fps > 0) {
+        if (fps > 30) {
+            fps = 30;
+        }
+        player->config.frame_rate = fps;
+        player->normal_frame_interval_us = 1000000U / fps;
+    } else if (player->normal_frame_interval_us == 0) {
+        uint32_t base_fps = player->config.frame_rate ? player->config.frame_rate : 30;
+        player->normal_frame_interval_us = 1000000U / base_fps;
+    }
+
+    player->last_resume_us = now_us;
+    player->resume_warmup_until_us = now_us + kResumeWarmupUs;
+    player->soft_start_until_us = now_us + kResumeSoftStartUs;
+    player->frame_deadline_us = player->resume_warmup_until_us;
+    player->last_decode_success_us = now_us;
+    player->last_stall_diag_us = 0;
+
+    uint32_t start_interval = player->normal_frame_interval_us;
+    if (start_interval < kSoftStartMinIntervalUs) {
+        start_interval = kSoftStartMinIntervalUs;
+    }
+    player->frame_interval_us = start_interval;
+    player->decode_paused = false;
+    ESP_LOGI(TAG,
+             "MJPEG resume soft-start: warmup=%ums soft_start=%ums target_fps=%u interval=%luus",
+             (unsigned)(kResumeWarmupUs / 1000ULL),
+             (unsigned)(kResumeSoftStartUs / 1000ULL),
+             (unsigned)(player->normal_frame_interval_us
+                            ? (1000000U / player->normal_frame_interval_us)
+                            : 0),
+             (unsigned long)player->frame_interval_us);
+    return ESP_OK;
+}
+
+esp_err_t emotion_video_player_start_deferred_preload(emotion_video_handle_t handle)
+{
+    if (!handle) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    emotion_video_player_t *player = (emotion_video_player_t *)handle;
+    if (player->preload_started) {
+        return ESP_OK;
+    }
+    player->preload_started = true;
+    BaseType_t ret_preload = xTaskCreate(
+        preload_emotions_task,
+        "emotion_preload",
+        4096,
+        player,
+        1,
+        NULL
+    );
+    if (ret_preload != pdPASS) {
+        player->preload_started = false;
+        ESP_LOGW(TAG, "⚠️ 预加载任务启动失败");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "✅ 预加载任务已启动（唤醒稳定后）");
+    return ESP_OK;
 }
 
 static void async_load_task(void *arg)
@@ -1394,6 +2194,7 @@ static esp_err_t build_frame_index(emotion_video_player_t *player, int cache_ind
     size_t buffer_size = cache->size;
     size_t search_pos = 0;
     int frame_count = 0;
+    int yield_budget = 0;
     
     while (search_pos < buffer_size && frame_count < MAX_FRAMES_PER_VIDEO) {
         uint8_t *frame_start = (uint8_t *)memmem(
@@ -1430,6 +2231,10 @@ static esp_err_t build_frame_index(emotion_video_player_t *player, int cache_ind
         }
         
         search_pos = end_offset;
+        if (++yield_budget >= 8) {
+            yield_budget = 0;
+            taskYIELD();
+        }
     }
     
     cache->frame_count = frame_count;
@@ -1532,6 +2337,14 @@ static esp_err_t switch_to_emotion(emotion_video_player_t *player, const char *e
     xSemaphoreGive(player->cache_mutex);
     
     if (!cache_ready) {
+        if (player->decode_paused) {
+            // Diag-only safety: do not SD-load during pause.
+            ESP_LOGW(TAG,
+                     "CTRL EMO_SWITCH cache_miss name=%s idx=%d paused=1 skip_sd=1",
+                     emotion_name, cache_index);
+            change_state(player, EMOTION_VIDEO_STATE_PLAYING);
+            return ESP_ERR_NOT_FOUND;
+        }
         ESP_LOGI(TAG, "🔄 按需加载表情: %s", emotion_name);
         esp_err_t ret = load_video_to_cache(player, cache_index);
         if (ret != ESP_OK) {
@@ -1543,6 +2356,13 @@ static esp_err_t switch_to_emotion(emotion_video_player_t *player, const char *e
     
     // 🚀 关键：确保帧索引表已建立
     if (!index_built) {
+        if (player->decode_paused) {
+            ESP_LOGW(TAG,
+                     "CTRL EMO_SWITCH index_miss name=%s idx=%d paused=1 skip_build=1",
+                     emotion_name, cache_index);
+            change_state(player, EMOTION_VIDEO_STATE_PLAYING);
+            return ESP_ERR_NOT_FOUND;
+        }
         ESP_LOGI(TAG, "🔨 按需建立帧索引表: %s", emotion_name);
         esp_err_t ret = build_frame_index(player, cache_index);
         if (ret != ESP_OK) {
@@ -1573,8 +2393,8 @@ static esp_err_t switch_to_emotion(emotion_video_player_t *player, const char *e
     change_state(player, EMOTION_VIDEO_STATE_PLAYING);
     
     uint64_t switch_time = (esp_timer_get_time() - switch_start_time) / 1000;
-    ESP_LOGI(TAG, "✅ 切换完成: %s (耗时: %llu ms)", def->name, switch_time);
-    
+    ESP_LOGI(TAG, "✅ 切换完成: %s (耗时: %u ms)", def->name, (unsigned)switch_time);
+
     return ESP_OK;
 }
 

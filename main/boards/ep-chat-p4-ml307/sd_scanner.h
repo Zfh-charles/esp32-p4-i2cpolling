@@ -38,6 +38,7 @@ typedef struct {
     bool is_mounted;                                    ///< SD卡是否已挂载
     sdmmc_card_t *card;                                ///< SD卡句柄
     esp_vfs_fat_sdmmc_mount_config_t mount_config;     ///< 挂载配置
+    void *pwr_ctrl_handle;                             ///< SD IO LDO（SOC_SDMMC_IO_POWER_EXTERNAL）
 } sd_scanner_t;
 
 /**

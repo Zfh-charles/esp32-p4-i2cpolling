@@ -20,6 +20,9 @@ void BootTraceMark(const char* phase, const char* detail);
 void BootTraceMarkHeap(const char* phase);
 void BootTraceDumpSummary(const char* reason);
 const char* BootTraceLastPhase();
+uint32_t BootTraceCrashStreak();
+bool BootTraceInCrashStorm(uint32_t threshold = 2);
+void BootTraceClearCrashStreak();
 
 #else
 
@@ -31,5 +34,11 @@ inline void BootTraceMark(const char* phase, const char* detail) {
 inline void BootTraceMarkHeap(const char* phase) { (void)phase; }
 inline void BootTraceDumpSummary(const char* reason) { (void)reason; }
 inline const char* BootTraceLastPhase() { return "-"; }
+inline uint32_t BootTraceCrashStreak() { return 0; }
+inline bool BootTraceInCrashStorm(uint32_t threshold = 2) {
+    (void)threshold;
+    return false;
+}
+inline void BootTraceClearCrashStreak() {}
 
 #endif

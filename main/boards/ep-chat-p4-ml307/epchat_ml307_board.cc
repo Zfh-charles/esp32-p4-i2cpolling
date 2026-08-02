@@ -15,6 +15,7 @@
 
 // #include <wifi_station.h>
 #include <esp_log.h>
+#include <esp_rom_sys.h>
 #include <driver/i2c_master.h>
 #include <esp_lvgl_port.h>
 #if CONFIG_USE_REMINDER_POLL
@@ -154,14 +155,17 @@ private:
     void InitializeLvglDisplay() {
         // 初始化LVGL端口
         ESP_LOGI(TAG, "初始化LVGL端口");
+        // s1ap: pin LVGL to HP core1 — audio_input is pinned core0; serial WDT showed
+        // taskLVGL+face unlock on core0 under TTS (same-core starve).
         const lvgl_port_cfg_t lvgl_cfg = {
             .task_priority = 4,
             .task_stack = 8192,
-            .task_affinity = -1,
+            .task_affinity = 1,
             .task_max_sleep_ms = 500,
             .timer_period_ms = 5
         };
         ESP_ERROR_CHECK(lvgl_port_init(&lvgl_cfg));
+        ESP_LOGW(TAG, "LVGL port affinity=1 (s1ap isolate from audio_input@0)");
         
         // 创建MIPI EEZ UI显示器实例
         ESP_LOGI(TAG, "创建MIPI EEZ UI显示器实例");
@@ -176,9 +180,36 @@ private:
 #if CONFIG_USE_REMINDER_POLL
         BootTraceMark("SD_MOUNT", "begin");
 #endif
-        esp_err_t ret = sd_scanner_init_and_scan();
+        // USB 烧录硬复位后 SDMMC 常 ESP_ERR_TIMEOUT；先等电源轨再挂，失败再重试。
+        {
+            const esp_reset_reason_t rr = esp_reset_reason();
+            if (rr == ESP_RST_USB || rr == ESP_RST_POWERON || rr == ESP_RST_JTAG) {
+                ESP_LOGW(TAG, "SD settle delay after reset_reason=%d", (int)rr);
+                vTaskDelay(pdMS_TO_TICKS(800));
+            }
+        }
+        esp_err_t ret = ESP_FAIL;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            ret = sd_scanner_init_and_scan();
+            if (ret == ESP_OK) {
+                break;
+            }
+            ESP_LOGW(TAG, "SD mount attempt %d/3 fail: %s", attempt, esp_err_to_name(ret));
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "⚠️ SD卡初始化失败: %s", esp_err_to_name(ret));
+            const esp_reset_reason_t rr = esp_reset_reason();
+            if (rr == ESP_RST_USB || rr == ESP_RST_JTAG) {
+                // USB/esptool 硬复位后 SDMMC OCR 常 TIMEOUT；冷启（断电上电）才能稳挂。
+                // 勿在此误判为「表情读取代码坏了」——见 .cursor/rules 烧录后强制门。
+                ESP_LOGE(TAG,
+                         "SD_POWER_CYCLE_REQUIRED | reset_reason=%d mount=%s | "
+                         "USB flash reset left SD bus dead — unplug POWER then replug "
+                         "(not RST). Wait SD_MOUNT_OK + seed_stills ok=6/6 before face test.",
+                         (int)rr, esp_err_to_name(ret));
+                esp_rom_printf("!!SD_POWER_CYCLE_REQUIRED\n");
+            }
 #if CONFIG_USE_REMINDER_POLL
             BootTraceMark("SD_MOUNT", "fail");
 #endif
@@ -186,6 +217,8 @@ private:
             ESP_LOGI(TAG, "✅ SD卡初始化成功");
 #if CONFIG_USE_REMINDER_POLL
             BootTraceMarkHeap("SD_MOUNT_OK");
+            // Do NOT clear crash_streak here — SD OK does not mean WDT storm is over
+            // (serial: clear then ASSETS MJPEG → rst:0x7 loop). Clear after wake stable.
 #endif
         }
     }
@@ -252,11 +285,13 @@ public:
         
         // 2. 初始化电池监控器（使用共享 I2C 总线）
         InitializeBatteryMonitor();
+
+        // 3. SD before MIPI display — avoid LDO3/display rail starving SD LDO4 at OCR.
+        InitializeSDCard();
         
-        // 3. 初始化其他组件
+        // 4. 显示
         InitializeLCD();
         InitializeLvglDisplay();
-        InitializeSDCard();
         InitializeButtons();
         
         RegisterMcpTools();

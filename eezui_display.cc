@@ -40,7 +40,7 @@ EezuiDisplay::EezuiDisplay() : emotion_player_(nullptr), emotion_canvas_(nullptr
     if (objects.label_ai_1 != nullptr) {
         lv_obj_add_flag(objects.label_ai_1, LV_OBJ_FLAG_HIDDEN);
     }
-
+    
     // Configure panel_ai container: disable scrollbars when empty
     // 配置panel_ai容器：内容为空时禁用滚动条
     if (objects.panel_ai != nullptr) {

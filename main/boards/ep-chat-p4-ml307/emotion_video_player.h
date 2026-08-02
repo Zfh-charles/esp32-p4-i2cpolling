@@ -432,6 +432,128 @@ int emotion_video_player_get_emotion_type(const char *emotion_name);
 const char* emotion_video_player_get_video_file(const char *emotion_name);
 
 /**
+ * @brief 暂停 MJPEG 循环解码（保持当前帧）
+ */
+esp_err_t emotion_video_player_pause_loop(emotion_video_handle_t handle);
+
+/**
+ * @brief 当前是否处于 decode_paused（对话/唤醒策略冻结）
+ */
+bool emotion_video_player_is_decode_paused(emotion_video_handle_t handle);
+
+/**
+ * @brief I2+: decode one RGB565 frame (cache-ready emotion). Does not call frame_cb / LVGL.
+ * @param skip_frames discard this many frames after reset (0 = first frame).
+ * @param out_rgb565 points into player buffer; valid until next decode on this handle.
+ */
+esp_err_t emotion_video_player_decode_one_rgb565(emotion_video_handle_t handle,
+                                                 const char *emotion_name,
+                                                 uint32_t skip_frames,
+                                                 const uint8_t **out_rgb565,
+                                                 uint32_t *out_size,
+                                                 uint32_t *out_w,
+                                                 uint32_t *out_h);
+
+/**
+ * @brief Decode the next frame of the current emotion (no reset). No frame_cb.
+ */
+esp_err_t emotion_video_player_decode_next_rgb565(emotion_video_handle_t handle,
+                                                  const uint8_t **out_rgb565,
+                                                  uint32_t *out_size,
+                                                  uint32_t *out_w,
+                                                  uint32_t *out_h);
+
+/**
+ * @brief Decode n consecutive frames; keep the last (n=1 == decode_next). No frame_cb.
+ * s1bl: MID arc step — advance multiple frames per ROI tick without raising present count.
+ */
+esp_err_t emotion_video_player_decode_next_n_rgb565(emotion_video_handle_t handle,
+                                                    uint32_t n,
+                                                    const uint8_t **out_rgb565,
+                                                    uint32_t *out_size,
+                                                    uint32_t *out_w,
+                                                    uint32_t *out_h);
+
+/**
+ * @brief s1by: seek by frame index + ONE JPEG decode (no intermediate skip-loop).
+ * Uses MJPEG frame index table; O(1) decode cost per call. Prefer over decode_next_n
+ * when stride > 1 (idle breathe / long MID step).
+ */
+esp_err_t emotion_video_player_decode_at_rgb565(emotion_video_handle_t handle,
+                                                const char *emotion_name,
+                                                uint32_t frame_index,
+                                                const uint8_t **out_rgb565,
+                                                uint32_t *out_size,
+                                                uint32_t *out_w,
+                                                uint32_t *out_h);
+
+/**
+ * @brief 恢复 MJPEG 循环解码
+ */
+esp_err_t emotion_video_player_resume_loop(emotion_video_handle_t handle);
+
+/**
+ * @brief 以指定目标帧率恢复解码（稳态保持该帧率，不再回到 30fps）
+ * @param fps 1..30；用于对话期限流，降低 LVGL flush 负载
+ */
+esp_err_t emotion_video_player_resume_loop_at_fps(emotion_video_handle_t handle, uint32_t fps);
+
+/**
+ * @brief 唤醒稳定后启动表情预加载（避免与 AFE 启动并发）
+ */
+esp_err_t emotion_video_player_start_deferred_preload(emotion_video_handle_t handle);
+
+/**
+ * @brief P2: 同步预加载基础表情（happy/sad/angry/loving/neutral）
+ *
+ * 必须在唤醒未武装时调用。加载进 PSRAM+帧索引，并 seed 各表情 1 帧 RGB565 静帧。
+ * 对话期只 blit seed，不再实时 JPEG。
+ */
+esp_err_t emotion_video_player_preload_base_sync(emotion_video_handle_t handle);
+
+/**
+ * @brief Seed one emotion still early (e.g. standby) so UI can paint before full P2 preload.
+ * Idempotent if that emotion is already seeded.
+ */
+esp_err_t emotion_video_player_seed_emotion_still(emotion_video_handle_t handle,
+                                                  const char *emotion_name);
+
+/**
+ * @brief S1: 取开机 seed 的 RGB565 静帧（PSRAM）。别名会 resolve。
+ * @return ESP_OK 且指针有效直至 deinit；未 seed 返回 ESP_ERR_NOT_FOUND。
+ */
+esp_err_t emotion_video_player_get_seed_rgb565(emotion_video_handle_t handle,
+                                               const char *emotion_name,
+                                               const uint8_t **out_rgb565,
+                                               uint32_t *out_size,
+                                               uint32_t *out_w,
+                                               uint32_t *out_h);
+
+/** S1: 静帧 seed 是否已完成 */
+bool emotion_video_player_seed_stills_ready(emotion_video_handle_t handle);
+
+/**
+ * @brief MID stride skip (= seed mid-clip): frame_count/3 when fc>4, else 0.
+ * Used by LVGL time-slice prime so MID starts near expressive mid-clip, not frame0.
+ */
+uint32_t emotion_video_player_mid_stride_skip(emotion_video_handle_t handle,
+                                             const char *emotion_name);
+
+/**
+ * @brief s1bq: MID arc start — always 0 (clip head; no mid-clip jump).
+ */
+uint32_t emotion_video_player_mid_arc_start(emotion_video_handle_t handle,
+                                            const char *emotion_name);
+
+/**
+ * @brief s1bq: frames to advance per MID tick after prime.
+ * step = max(1, frame_count / mid_frames) — uniform sample across the whole clip.
+ */
+uint32_t emotion_video_player_mid_arc_step(emotion_video_handle_t handle,
+                                          const char *emotion_name,
+                                          uint32_t mid_frames);
+
+/**
  * @brief 异步加载所有基础表情到缓存
  *
  * 此函数会创建一个后台任务来加载所有基础表情，不会阻塞当前线程。

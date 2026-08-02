@@ -215,13 +215,12 @@ def process_text_font(text_font_file, assets_dir):
     return None
 
 
-def process_emoji_collection(emoji_collection_dir, assets_dir, emoji_extra_dir=None):
+def process_emoji_collection(emoji_collection_dir, assets_dir):
     """Process emoji_collection parameter"""
     if not emoji_collection_dir:
         return []
     
     emoji_list = []
-    seen_names = set()
     
     # Copy each image from input directory to build/assets directory
     for root, dirs, files in os.walk(emoji_collection_dir):
@@ -239,28 +238,6 @@ def process_emoji_collection(emoji_collection_dir, assets_dir, emoji_extra_dir=N
                         "name": filename_without_ext,
                         "file": file
                     })
-                    seen_names.add(filename_without_ext)
-
-    if emoji_extra_dir and os.path.isdir(emoji_extra_dir):
-        for root, dirs, files in os.walk(emoji_extra_dir):
-            for file in files:
-                if file.startswith('.'):
-                    continue
-                if not file.lower().endswith(('.png', '.gif')):
-                    continue
-                src_file = os.path.join(root, file)
-                dst_file = os.path.join(assets_dir, file)
-                if copy_file(src_file, dst_file):
-                    filename_without_ext = os.path.splitext(file)[0]
-                    if filename_without_ext in seen_names:
-                        emoji_list = [e for e in emoji_list if e["name"] != filename_without_ext]
-                    else:
-                        seen_names.add(filename_without_ext)
-                    emoji_list.append({
-                        "name": filename_without_ext,
-                        "file": file
-                    })
-        print(f"Merged emoji extras from: {emoji_extra_dir}")
     
     return emoji_list
 
@@ -455,6 +432,24 @@ def pack_assets_simple(target_path, include_path, out_file, assets_path, max_nam
 # Configuration and main functions
 # =============================================================================
 
+def iter_sdkconfig_lines(sdkconfig_path):
+    """
+    Yield sdkconfig lines with tolerant encoding handling.
+    Prefer UTF-8, fallback to GBK (common on Windows CN locales).
+    """
+    encodings = ("utf-8", "gbk")
+    last_error = None
+    for enc in encodings:
+        try:
+            with io.open(sdkconfig_path, "r", encoding=enc) as f:
+                for line in f:
+                    yield line
+            return
+        except UnicodeDecodeError as e:
+            last_error = e
+    if last_error:
+        raise last_error
+
 def read_wakenet_from_sdkconfig(sdkconfig_path):
     """
     Read wakenet models from sdkconfig (based on movemodel.py logic)
@@ -465,18 +460,17 @@ def read_wakenet_from_sdkconfig(sdkconfig_path):
         return []
         
     models = []
-    with io.open(sdkconfig_path, "r", encoding="utf-8") as f:
-        for label in f:
-            label = label.strip("\n")
-            if 'CONFIG_SR_WN' in label and '#' not in label[0]:
-                if '_NONE' in label:
-                    continue
-                if '=' in label:
-                    label = label.split("=")[0]
-                if '_MULTI' in label:
-                    label = label[:-6]
-                model_name = label.split("_SR_WN_")[-1].lower()
-                models.append(model_name)
+    for label in iter_sdkconfig_lines(sdkconfig_path):
+        label = label.strip("\n")
+        if 'CONFIG_SR_WN' in label and '#' not in label[0]:
+            if '_NONE' in label:
+                continue
+            if '=' in label:
+                label = label.split("=")[0]
+            if '_MULTI' in label:
+                label = label[:-6]
+            model_name = label.split("_SR_WN_")[-1].lower()
+            models.append(model_name)
 
     return models
 
@@ -490,12 +484,11 @@ def read_multinet_from_sdkconfig(sdkconfig_path):
         print(f"Warning: sdkconfig file not found: {sdkconfig_path}")
         return []
         
-    with io.open(sdkconfig_path, "r", encoding="utf-8") as f:
-        models_string = ''
-        for label in f:
-            label = label.strip("\n")
-            if 'CONFIG_SR_MN' in label and label[0] != '#':
-                models_string += label
+    models_string = ''
+    for label in iter_sdkconfig_lines(sdkconfig_path):
+        label = label.strip("\n")
+        if 'CONFIG_SR_MN' in label and label[0] != '#':
+            models_string += label
 
     models = []
     if "CONFIG_SR_MN_CN_MULTINET3_SINGLE_RECOGNITION" in models_string:
@@ -551,21 +544,20 @@ def read_wake_word_type_from_sdkconfig(sdkconfig_path):
         'wake_word_disabled': False
     }
     
-    with io.open(sdkconfig_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip("\n")
-            if line.startswith('#'):
-                continue
-                
-            # Check for wake word type configuration
-            if 'CONFIG_USE_ESP_WAKE_WORD=y' in line:
-                config_values['use_esp_wake_word'] = True
-            elif 'CONFIG_USE_AFE_WAKE_WORD=y' in line:
-                config_values['use_afe_wake_word'] = True
-            elif 'CONFIG_USE_CUSTOM_WAKE_WORD=y' in line:
-                config_values['use_custom_wake_word'] = True
-            elif 'CONFIG_WAKE_WORD_DISABLED=y' in line:
-                config_values['wake_word_disabled'] = True
+    for line in iter_sdkconfig_lines(sdkconfig_path):
+        line = line.strip("\n")
+        if line.startswith('#'):
+            continue
+            
+        # Check for wake word type configuration
+        if 'CONFIG_USE_ESP_WAKE_WORD=y' in line:
+            config_values['use_esp_wake_word'] = True
+        elif 'CONFIG_USE_AFE_WAKE_WORD=y' in line:
+            config_values['use_afe_wake_word'] = True
+        elif 'CONFIG_USE_CUSTOM_WAKE_WORD=y' in line:
+            config_values['use_custom_wake_word'] = True
+        elif 'CONFIG_WAKE_WORD_DISABLED=y' in line:
+            config_values['wake_word_disabled'] = True
     
     return config_values
 
@@ -580,34 +572,33 @@ def read_custom_wake_word_from_sdkconfig(sdkconfig_path):
         return None
         
     config_values = {}
-    with io.open(sdkconfig_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip("\n")
-            if line.startswith('#') or '=' not in line:
-                continue
-                
-            # Check for custom wake word configuration
-            if 'CONFIG_USE_CUSTOM_WAKE_WORD=y' in line:
-                config_values['use_custom_wake_word'] = True
-            elif 'CONFIG_CUSTOM_WAKE_WORD=' in line and not line.startswith('#'):
-                # Extract string value (remove quotes)
-                value = line.split('=', 1)[1].strip('"')
-                config_values['wake_word'] = value
-            elif 'CONFIG_CUSTOM_WAKE_WORD_DISPLAY=' in line and not line.startswith('#'):
-                # Extract string value (remove quotes)
-                value = line.split('=', 1)[1].strip('"')
-                config_values['display'] = value
-            elif 'CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=' in line and not line.startswith('#'):
-                # Extract numeric value
-                value = line.split('=', 1)[1]
+    for line in iter_sdkconfig_lines(sdkconfig_path):
+        line = line.strip("\n")
+        if line.startswith('#') or '=' not in line:
+            continue
+            
+        # Check for custom wake word configuration
+        if 'CONFIG_USE_CUSTOM_WAKE_WORD=y' in line:
+            config_values['use_custom_wake_word'] = True
+        elif 'CONFIG_CUSTOM_WAKE_WORD=' in line and not line.startswith('#'):
+            # Extract string value (remove quotes)
+            value = line.split('=', 1)[1].strip('"')
+            config_values['wake_word'] = value
+        elif 'CONFIG_CUSTOM_WAKE_WORD_DISPLAY=' in line and not line.startswith('#'):
+            # Extract string value (remove quotes)
+            value = line.split('=', 1)[1].strip('"')
+            config_values['display'] = value
+        elif 'CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=' in line and not line.startswith('#'):
+            # Extract numeric value
+            value = line.split('=', 1)[1]
+            try:
+                config_values['threshold'] = int(value)
+            except ValueError:
                 try:
-                    config_values['threshold'] = int(value)
+                    config_values['threshold'] = float(value)
                 except ValueError:
-                    try:
-                        config_values['threshold'] = float(value)
-                    except ValueError:
-                        print(f"Warning: Invalid threshold value: {value}")
-                        config_values['threshold'] = 20  # default (will be converted to 0.2)
+                    print(f"Warning: Invalid threshold value: {value}")
+                    config_values['threshold'] = 20  # default (will be converted to 0.2)
     
     # Return config only if custom wake word is enabled and required fields are present
     if (config_values.get('use_custom_wake_word', False) and 
@@ -721,7 +712,7 @@ def get_emoji_collection_path(default_emoji_collection, xiaozhi_fonts_path):
         return None
 
 
-def build_assets_integrated(wakenet_model_paths, multinet_model_paths, text_font_path, emoji_collection_path, extra_files_path, output_path, multinet_model_info=None, emoji_extra_dir=None):
+def build_assets_integrated(wakenet_model_paths, multinet_model_paths, text_font_path, emoji_collection_path, extra_files_path, output_path, multinet_model_info=None):
     """
     Build assets using integrated functions (no external dependencies)
     """
@@ -741,7 +732,7 @@ def build_assets_integrated(wakenet_model_paths, multinet_model_paths, text_font
         # Process each component
         srmodels = process_sr_models(wakenet_model_paths, multinet_model_paths, temp_build_dir, assets_dir) if (wakenet_model_paths or multinet_model_paths) else None
         text_font = process_text_font(text_font_path, assets_dir) if text_font_path else None
-        emoji_collection = process_emoji_collection(emoji_collection_path, assets_dir, emoji_extra_dir) if emoji_collection_path else None
+        emoji_collection = process_emoji_collection(emoji_collection_path, assets_dir) if emoji_collection_path else None
         extra_files = process_extra_files(extra_files_path, assets_dir) if extra_files_path else None
         
         # Generate index.json
@@ -791,7 +782,6 @@ def main():
     parser.add_argument('--esp_sr_model_path', help='Path to ESP-SR model directory')
     parser.add_argument('--xiaozhi_fonts_path', help='Path to xiaozhi-fonts component directory')
     parser.add_argument('--extra_files', help='Path to extra files directory to be included in assets')
-    parser.add_argument('--emoji_extra_dir', help='Extra emoji PNG/GIF directory merged into emoji_collection')
     
     args = parser.parse_args()
     
@@ -856,7 +846,6 @@ def main():
     
     # Get extra files path if provided
     extra_files_path = args.extra_files
-    emoji_extra_dir = args.emoji_extra_dir
     
     # Read custom wake word configuration
     custom_wake_word_config = read_custom_wake_word_from_sdkconfig(args.sdkconfig)
@@ -895,7 +884,7 @@ def main():
     
     # Build the assets
     success = build_assets_integrated(wakenet_model_paths, multinet_model_paths, text_font_path, emoji_collection_path, 
-                                     extra_files_path, args.output, multinet_model_info, emoji_extra_dir)
+                                     extra_files_path, args.output, multinet_model_info)
     
     if not success:
         sys.exit(1)

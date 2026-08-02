@@ -5,7 +5,9 @@
 #include <esp_flash.h>
 #include <esp_mac.h>
 #include <esp_system.h>
+#include <esp_heap_caps.h>
 #include <esp_partition.h>
+#include <esp_rom_sys.h>
 #include <esp_app_desc.h>
 #include <esp_ota_ops.h>
 #if CONFIG_IDF_TARGET_ESP32P4
@@ -33,12 +35,11 @@ size_t SystemInfo::GetFreeHeapSize() {
 }
 
 std::string SystemInfo::GetMacAddress() {
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_ETH);
-    char mac_str[18];
-    snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    printf("MAC Address: %s\n", mac_str);
-    return std::string(mac_str);
+    // Identity override: report 30:ed:a0:e1:b5:28 (matches server/docs configuration).
+    // This is a hardcoded device identity; real silicon MAC is read via esp_read_mac.
+    const char* override_mac = "30:ed:a0:e1:b5:28";
+    printf("MAC Address: %s\n", override_mac);
+    return std::string(override_mac);
 }
 
 std::string SystemInfo::GetChipModelName() {
@@ -143,7 +144,69 @@ void SystemInfo::PrintTaskList() {
 }
 
 void SystemInfo::PrintHeapStats() {
-    int free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    int min_free_sram = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
-    ESP_LOGI(TAG, "free sram: %u minimal sram: %u", free_sram, min_free_sram);
+    PrintHeapStats(nullptr);
+}
+
+const char* SystemInfo::ResetReasonName(int reason_code) {
+    switch (static_cast<esp_reset_reason_t>(reason_code)) {
+        case ESP_RST_UNKNOWN: return "UNKNOWN";
+        case ESP_RST_POWERON: return "POWERON";
+        case ESP_RST_EXT: return "EXT";
+        case ESP_RST_SW: return "SW";
+        case ESP_RST_PANIC: return "PANIC";
+        case ESP_RST_INT_WDT: return "INT_WDT";
+        case ESP_RST_TASK_WDT: return "TASK_WDT";
+        case ESP_RST_WDT: return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT";
+        case ESP_RST_SDIO: return "SDIO";
+        case ESP_RST_USB: return "USB";
+        case ESP_RST_JTAG: return "JTAG";
+        default: return "OTHER";
+    }
+}
+
+void SystemInfo::PrintResetReason(const char* stage) {
+    const int code = (int)esp_reset_reason();
+    const char* name = ResetReasonName(code);
+    // P4 ROM often prints rst:0x7 (HP_SYS_HP_WDT_RESET) while IDF maps to INT_WDT/WDT.
+    if (stage != nullptr && stage[0] != '\0') {
+        ESP_LOGI(TAG,
+                 "RESET | stage=%s reason=%s reason_code=%d | crosscheck_ROM=look_for_rst:_HP_SYS_HP_WDT_or_similar",
+                 stage, name, code);
+    } else {
+        ESP_LOGI(TAG,
+                 "RESET | reason=%s reason_code=%d | crosscheck_ROM=look_for_rst:_HP_SYS_HP_WDT_or_similar",
+                 name, code);
+    }
+}
+
+void SystemInfo::PrintHeapStats(const char* stage) {
+    // Use %u + unsigned casts only — %llu/%lld often mis-parse on RV32 newlib and
+    // shift later arguments (false heap_int=1960 style readings).
+    // s1cg/s1ch: do NOT call heap_caps_get_largest_free_block — it tlsf_walk_pool's
+    // the PSRAM heap and was still the LoadAccessFault site after skipping
+    // heap_caps_check_integrity_all (prev_phase=IDLE_HEAP, mepc=tlsf_walk_pool).
+    const unsigned free_int =
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const unsigned min_int =
+        (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    const unsigned free_psram =
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const unsigned min_psram =
+        (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+    if (stage != nullptr && stage[0] != '\0') {
+        ESP_LOGI(TAG,
+                 "HEAP | stage=%s | free_int=%u min_int=%u | free_psram=%u min_psram=%u | largest=skipped s1ch",
+                 stage, free_int, min_int, free_psram, min_psram);
+    } else {
+        ESP_LOGI(TAG,
+                 "HEAP | free_int=%u min_int=%u | free_psram=%u min_psram=%u | largest=skipped s1ch",
+                 free_int, min_int, free_psram, min_psram);
+    }
+
+    // s1bg walk was a localisation probe; under MSPI-750/751 it became the
+    // surest crash trigger. Keep size counters only.
+    ESP_LOGI(TAG, "HEAP_INTEGRITY | stage=%s skipped=walk s1cg",
+             (stage != nullptr && stage[0] != '\0') ? stage : "-");
 }

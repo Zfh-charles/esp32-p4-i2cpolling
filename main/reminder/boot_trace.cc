@@ -4,7 +4,6 @@
 #if CONFIG_USE_REMINDER_POLL && CONFIG_REMINDER_BOOT_TRACE
 
 #include <cstring>
-#include <deque>
 #include <string>
 
 #include <esp_heap_caps.h>
@@ -12,9 +11,11 @@
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
+#include "debug/afe_fetch_gate.h"
 
 #define TAG "BootTrace"
-#define FW_MARKER "boot_trace_v2_scheme_b"
+// s1db: behavior-preserving extract (ShowFaceCanvasLayers / band ROI helpers); paths = s1da.
+#define FW_MARKER "boot_trace_v10_s1db_clean_extract"
 
 namespace {
 
@@ -23,6 +24,7 @@ constexpr size_t kBootCountRtcWords = 2;
 
 RTC_NOINIT_ATTR uint32_t g_rtc_boot_magic;
 RTC_NOINIT_ATTR uint32_t g_rtc_boot_count;
+RTC_NOINIT_ATTR uint32_t g_rtc_crash_streak;
 RTC_NOINIT_ATTR char g_rtc_last_phase[20];
 RTC_NOINIT_ATTR uint32_t g_rtc_last_phase_ms;
 
@@ -36,7 +38,13 @@ struct PhaseEntry {
 };
 
 int64_t g_boot_us = 0;
-std::deque<PhaseEntry> g_phases;
+// BootTraceMark is called from Core0 audio/network tasks and the Core1 face worker.
+// A std::deque here used to mutate its allocator state concurrently and eventually
+// crashed in RecordPhase with heap poison (0xBAAD5678).  Keep tracing allocation-free.
+PhaseEntry g_phases[kPhaseRingCap];
+size_t g_phase_head = 0;   // Next insertion slot.
+size_t g_phase_count = 0;
+portMUX_TYPE g_phase_mux = portMUX_INITIALIZER_UNLOCKED;
 char g_last_phase[20] = "BOOT";
 
 uint32_t BootMs() {
@@ -102,26 +110,30 @@ void RecordPhase(const char* phase, const char* detail, bool log_heap) {
     entry.t_ms = BootMs();
     entry.heap_int = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     entry.heap_psram = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    entry.heap_largest = static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    g_phases.push_back(entry);
-    while (g_phases.size() > kPhaseRingCap) {
-        g_phases.pop_front();
+    // s1ch: largest_free_block walks tlsf — skip under MSPI errata (same as PrintHeapStats).
+    entry.heap_largest = 0;
+    portENTER_CRITICAL(&g_phase_mux);
+    g_phases[g_phase_head] = entry;
+    g_phase_head = (g_phase_head + 1) % kPhaseRingCap;
+    if (g_phase_count < kPhaseRingCap) {
+        ++g_phase_count;
     }
     CopyField(g_last_phase, sizeof(g_last_phase), phase);
     PersistCrashHint(phase);
+    portEXIT_CRITICAL(&g_phase_mux);
 
     if (log_heap) {
         ESP_LOGI(TAG,
-                 "PH | t=%lums phase=%s detail=%s heap_int=%lu heap_psram=%lu largest=%lu",
-                 (unsigned long)entry.t_ms,
+                 "PH | t=%ums phase=%s detail=%s | free_int=%u free_psram=%u largest_int=%u",
+                 (unsigned)entry.t_ms,
                  entry.phase,
                  entry.detail[0] ? entry.detail : "-",
-                 (unsigned long)entry.heap_int,
-                 (unsigned long)entry.heap_psram,
-                 (unsigned long)entry.heap_largest);
+                 (unsigned)entry.heap_int,
+                 (unsigned)entry.heap_psram,
+                 (unsigned)entry.heap_largest);
     } else {
-        ESP_LOGI(TAG, "PH | t=%lums phase=%s detail=%s",
-                 (unsigned long)entry.t_ms,
+        ESP_LOGI(TAG, "PH | t=%ums phase=%s detail=%s",
+                 (unsigned)entry.t_ms,
                  entry.phase,
                  entry.detail[0] ? entry.detail : "-");
     }
@@ -137,8 +149,8 @@ void RegisterCrashHandlers() {
     esp_register_shutdown_handler([]() {
         const esp_reset_reason_t pending = esp_reset_reason();
         (void)pending;
-        ESP_LOGW(TAG, "CRASH | shutdown last_phase=%s t=%lums",
-                 g_last_phase, (unsigned long)BootMs());
+        ESP_LOGW(TAG, "CRASH | shutdown last_phase=%s t=%ums",
+                 g_last_phase, (unsigned)BootMs());
         BootTraceDumpSummary("shutdown");
     });
 }
@@ -151,25 +163,60 @@ void BootTraceInit() {
 
     if (g_rtc_boot_magic != 0xB0070002) {
         g_rtc_boot_count = 0;
+        g_rtc_crash_streak = 0;
         g_rtc_boot_magic = 0xB0070002;
     }
     g_rtc_boot_count++;
 
     const esp_reset_reason_t reason = esp_reset_reason();
+    // P4 HP_SYS_HP_WDT_RESET usually surfaces as INT_WDT / WDT / TASK_WDT.
+    const bool crash_reboot = reason == ESP_RST_WDT || reason == ESP_RST_TASK_WDT ||
+        reason == ESP_RST_INT_WDT || reason == ESP_RST_PANIC ||
+        reason == ESP_RST_BROWNOUT;
+    if (crash_reboot) {
+        g_rtc_crash_streak++;
+    } else if (reason == ESP_RST_POWERON || reason == ESP_RST_SW || reason == ESP_RST_EXT ||
+               reason == ESP_RST_USB || reason == ESP_RST_JTAG) {
+        // USB/JTAG flash must clear streak — otherwise HoldFlashWindow fires forever
+        // after WDT experiments and changes SD mount timing.
+        g_rtc_crash_streak = 0;
+    }
     ESP_LOGI(TAG, "FW_MARKER %s", FW_MARKER);
-    ESP_LOGI(TAG, "BOOT | reason=%s boot_count=%lu prev_phase=%s prev_t=%lums",
+    // s1cf: bootloader INFO exceeds 0x6000 partition budget — print compile-time
+    // SPIRAM speed here so the cold-start gate can verify it without bloating BL.
+    // s1ck: also print nominal MEM_CLK (CPU360→MEM180 per IDF rtc_clk.c) for
+    // MSPI-751 ratio notes; does not change clocks.
+    {
+        const int cpu_mhz = (int)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+        const int mem_mhz = (cpu_mhz >= 360) ? (cpu_mhz / 2) : cpu_mhz;
+        ESP_LOGW(TAG, "SPIRAM_CFG speed_mhz=%d mode_hex=%d cpu_mhz=%d mem_mhz=%d s1cm",
+                 (int)CONFIG_SPIRAM_SPEED,
+#if CONFIG_SPIRAM_MODE_HEX
+                 1,
+#else
+                 0,
+#endif
+                 cpu_mhz, mem_mhz);
+    }
+    ESP_LOGI(TAG, "BOOT | reason=%s reason_code=%d boot_count=%lu crash_streak=%lu prev_phase=%s prev_t=%lums",
              ResetReasonName(reason),
+             (int)reason,
              (unsigned long)g_rtc_boot_count,
+             (unsigned long)g_rtc_crash_streak,
              g_rtc_last_phase[0] ? g_rtc_last_phase : "-",
              (unsigned long)g_rtc_last_phase_ms);
 
-    if (reason == ESP_RST_WDT || reason == ESP_RST_TASK_WDT ||
-        reason == ESP_RST_INT_WDT || reason == ESP_RST_PANIC) {
-        ESP_LOGW(TAG, "REBOOT_AFTER | reason=%s prev_phase=%s prev_t=%lums",
+    if (crash_reboot) {
+        ESP_LOGW(TAG, "REBOOT_AFTER | reason=%s reason_code=%d prev_phase=%s prev_t=%lums",
                  ResetReasonName(reason),
+                 (int)reason,
                  g_rtc_last_phase[0] ? g_rtc_last_phase : "-",
                  (unsigned long)g_rtc_last_phase_ms);
     }
+
+    // s1cv: print and clear the previous boot's allocation-free audio/display
+    // transaction breadcrumbs. This survives bare HP-WDT resets with no panic.
+    AfeFetchGateBootReportAndReset();
 
     RecordPhase("APP_MAIN", ResetReasonName(reason), true);
 }
@@ -183,6 +230,18 @@ void BootTraceMarkHeap(const char* phase) {
 }
 
 void BootTraceDumpSummary(const char* reason) {
+    PhaseEntry snapshot[kPhaseRingCap];
+    size_t snapshot_count = 0;
+    portENTER_CRITICAL(&g_phase_mux);
+    snapshot_count = g_phase_count;
+    const size_t oldest = (g_phase_head + kPhaseRingCap - g_phase_count) % kPhaseRingCap;
+    for (size_t i = 0; i < snapshot_count; ++i) {
+        snapshot[i] = g_phases[(oldest + i) % kPhaseRingCap];
+    }
+    char last_phase[sizeof(g_last_phase)];
+    CopyField(last_phase, sizeof(last_phase), g_last_phase);
+    portEXIT_CRITICAL(&g_phase_mux);
+
     std::string line;
     line.reserve(512);
     line += "SUMMARY | reason=";
@@ -190,11 +249,12 @@ void BootTraceDumpSummary(const char* reason) {
     line += " boots=";
     line += std::to_string(g_rtc_boot_count);
     line += " last=";
-    line += g_last_phase;
+    line += last_phase;
     line += " t=";
     line += std::to_string(BootMs());
     line += "ms | ring:";
-    for (const auto& e : g_phases) {
+    for (size_t i = 0; i < snapshot_count; ++i) {
+        const auto& e = snapshot[i];
         line += " ";
         line += e.phase;
         line += "@";
@@ -205,6 +265,22 @@ void BootTraceDumpSummary(const char* reason) {
 
 const char* BootTraceLastPhase() {
     return g_last_phase;
+}
+
+uint32_t BootTraceCrashStreak() {
+    return g_rtc_crash_streak;
+}
+
+bool BootTraceInCrashStorm(uint32_t threshold) {
+    if (threshold == 0) {
+        return false;
+    }
+    return g_rtc_crash_streak >= threshold;
+}
+
+void BootTraceClearCrashStreak() {
+    g_rtc_crash_streak = 0;
+    ESP_LOGI(TAG, "crash_streak cleared");
 }
 
 #endif

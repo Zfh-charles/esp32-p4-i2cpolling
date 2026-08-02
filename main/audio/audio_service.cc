@@ -2,6 +2,10 @@
 #include <esp_log.h>
 #include <cstring>
 
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+#include "face_mouth_layer.h"
+#endif
+
 #if CONFIG_USE_AUDIO_PROCESSOR
 #include "processors/afe_audio_processor.h"
 #else
@@ -299,6 +303,10 @@ void AudioService::AudioOutputTask() {
             }
         }
         codec_->OutputData(task->pcm);
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+        // s1cr-h: publish mouth_level only — no LVGL from audio task.
+        FaceMouth_PublishFromPcm(task->pcm.data(), task->pcm.size());
+#endif
 #if CONFIG_USE_REMINDER_POLL
         ReminderHwTraceSpeakerPcm((int)task->pcm.size(), "output_task");
 #endif
@@ -526,9 +534,11 @@ void AudioService::EnableWakeWordDetection(bool enable) {
             wake_word_initialized_ = true;
             BootTraceMarkHeap("WAKE_INIT_OK");
         }
+        // s1bt: stop Feed first, then AFE reset on fetch owner — never reset while Feed in flight.
         if (IsWakeWordRunning()) {
-            wake_word_->Stop();
             xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+            vTaskDelay(pdMS_TO_TICKS(20));
+            wake_word_->Stop();
         }
         wake_word_->Start();
         xEventGroupSetBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
@@ -538,8 +548,10 @@ void AudioService::EnableWakeWordDetection(bool enable) {
         ReminderHwTraceWake(1, 1, ReminderTraceAudioRoute(audio_route_));
 #endif
     } else {
-        wake_word_->Stop();
+        // s1bt: clear input Feed gate before Stop/reset (was reverse — Feed∩reset_buffer race).
         xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        wake_word_->Stop();
 #if CONFIG_USE_REMINDER_POLL
         ReminderHwTraceWake(0, 0, ReminderTraceAudioRoute(audio_route_));
 #endif
@@ -573,8 +585,10 @@ void AudioService::EnableVoiceProcessing(bool enable) {
         ReminderHwTraceVoice(1);
 #endif
     } else {
-        audio_processor_->Stop();
+        // s1bt: stop Feed before processor Stop/reset (same ownership as wake path).
         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        audio_processor_->Stop();
 #if CONFIG_USE_REMINDER_POLL
         ReminderHwTraceVoice(0);
 #endif

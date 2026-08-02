@@ -2,6 +2,7 @@
 
 #include "reminder_poller.h"
 #include "reminder_mqtt_tls.h"
+#include "reminder/boot_trace.h"
 #include "board.h"
 #include "settings.h"
 #include "system_info.h"
@@ -93,7 +94,11 @@ static std::string DeriveMqttPassword() {
 
 void ReminderMqttWake::EnsureNvsConfigured() {
     Settings settings("reminder_mqtt", true);
-    if (!settings.GetString("broker").empty()) {
+    std::string nvs_broker = settings.GetString("broker");
+    bool stale_broker = !nvs_broker.empty() &&
+        (nvs_broker.find("114.245.178.62") != std::string::npos ||
+         nvs_broker.find("broker.emqx.io") != std::string::npos);
+    if (!stale_broker && !nvs_broker.empty()) {
         return;
     }
 
@@ -107,6 +112,9 @@ void ReminderMqttWake::EnsureNvsConfigured() {
         return;
     }
 
+    if (!nvs_broker.empty() && stale_broker) {
+        ESP_LOGW(TAG, "Migrated stale MQTT wake broker to menuconfig default");
+    }
     settings.SetString("broker", broker);
 #ifdef CONFIG_REMINDER_MQTT_WAKE_DEFAULT_TOPIC
     std::string topic = CONFIG_REMINDER_MQTT_WAKE_DEFAULT_TOPIC;
@@ -164,18 +172,30 @@ void ReminderMqttWake::Start(ReminderPoller* poller) {
 }
 
 void ReminderMqttWake::Stop() {
+    // s1aw: 只置 running_=false，禁止在此立刻 mqtt_.reset()。
+    // 历史竞态：Stop 与 ConnectOnce/Subscribe 并发销毁 → Core1 LoadProhibited
+    // (xQueueSemaphoreTake←pthread_mutex←AtUart::SendCommandWithData)。
     running_ = false;
+    if (task_handle_ != nullptr) {
+        for (int i = 0; i < 100 && task_handle_ != nullptr; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
     if (mqtt_) {
         mqtt_->Disconnect();
+        vTaskDelay(pdMS_TO_TICKS(50));
         mqtt_.reset();
-    }
-    if (task_handle_ != nullptr) {
-        xTaskNotifyGive(task_handle_);
     }
     poller_ = nullptr;
 }
 
 bool ReminderMqttWake::ConnectOnce() {
+    if (!running_) {
+        return false;
+    }
+
+    BootTraceMark("MQTT_BEG", "connect");
+
     Settings settings("reminder_mqtt", false);
     const std::string broker_endpoint = settings.GetString("broker");
     const std::string topic_template = settings.GetString("topic", "xiaozhi/reminder/wake/{device_id}");
@@ -189,6 +209,7 @@ bool ReminderMqttWake::ConnectOnce() {
 #endif
 
     if (broker_endpoint.empty()) {
+        BootTraceMark("MQTT_END", "no_broker");
         return false;
     }
 
@@ -215,61 +236,119 @@ bool ReminderMqttWake::ConnectOnce() {
         auto* at_modem = dynamic_cast<AtModem*>(network);
         if (at_modem == nullptr || !ReminderMqttInstallCaCert(at_modem->GetAtUart())) {
             ESP_LOGE(TAG, "MQTT CA cert install failed");
+            BootTraceMark("MQTT_END", "ca_fail");
             return false;
         }
     }
 #endif
+
+    // 旧连接残留：本任务内先安全释放
+    if (mqtt_) {
+        mqtt_->Disconnect();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        mqtt_.reset();
+    }
+
+    if (!running_) {
+        BootTraceMark("MQTT_END", "stop_pre");
+        return false;
+    }
+
     mqtt_ = network->CreateMqtt(1);
     if (!mqtt_) {
         ESP_LOGE(TAG, "Failed to create MQTT client (index 1)");
+        BootTraceMark("MQTT_END", "create_fail");
         return false;
     }
 
     ReminderPoller* poller = poller_;
     mqtt_->SetKeepAlive(120);
-    mqtt_->OnMessage([poller](const std::string& topic, const std::string& payload) {
+    mqtt_->OnMessage([this, poller](const std::string& topic, const std::string& payload) {
         ESP_LOGI(TAG, "Wake message [%s]: %s", topic.c_str(), payload.c_str());
-        if (poller != nullptr) {
+        if (running_ && poller != nullptr) {
             poller->TriggerPoll();
         }
     });
 
     ESP_LOGI(TAG, "Connecting MQTT wake broker %s:%d topic=%s",
              broker_address.c_str(), broker_port, subscribe_topic.c_str());
+    if (!running_) {
+        mqtt_.reset();
+        BootTraceMark("MQTT_END", "stop_pre_conn");
+        return false;
+    }
+    BootTraceMark("MQTT_CONN_BEG", "at");
     if (!mqtt_->Connect(broker_address, broker_port, client_id, username, password)) {
         ESP_LOGW(TAG, "MQTT wake connect failed");
         mqtt_.reset();
+        BootTraceMark("MQTT_END", "conn_fail");
+        return false;
+    }
+    BootTraceMark("MQTT_CONN_OK", "at");
+
+    if (!running_) {
+        mqtt_->Disconnect();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        mqtt_.reset();
+        BootTraceMark("MQTT_END", "stop_post");
         return false;
     }
 
+    BootTraceMark("MQTT_SUB_BEG", "at");
     if (!mqtt_->Subscribe(subscribe_topic)) {
         ESP_LOGW(TAG, "MQTT wake subscribe failed: %s", subscribe_topic.c_str());
         mqtt_->Disconnect();
+        vTaskDelay(pdMS_TO_TICKS(50));
         mqtt_.reset();
+        BootTraceMark("MQTT_END", "sub_fail");
         return false;
     }
+    BootTraceMark("MQTT_SUB_OK", "at");
 
     ESP_LOGI(TAG, "MQTT wake subscribed: %s", subscribe_topic.c_str());
+    BootTraceMark("MQTT_OK", subscribe_topic.c_str());
 
-    while (running_ && mqtt_ && mqtt_->IsConnected()) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    // s1ay: IsConnected() 每次发 AT+MQTTSTATE（占 UART）。
+    // 相位：MQTT_STATE_BEG→…→MQTT_STATE_OK；若崩在 BEG=卡在 AT；若 HTTP_POLL_*=卡在 poll。
+    int wait_ticks = 0;
+    BootTraceMark("MQTT_WAIT", "alive");
+    while (running_ && mqtt_) {
+        BootTraceMark("MQTT_STATE_BEG", "chk");
+        const bool connected = mqtt_->IsConnected();
+        BootTraceMark("MQTT_STATE_OK", connected ? "1" : "0");
+        if (!connected) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        if (++wait_ticks % 12 == 0) { // ~60s
+            BootTraceMark("MQTT_WAIT", "alive");
+        }
     }
 
     if (mqtt_) {
+        BootTraceMark("MQTT_DISC_BEG", "disc");
         mqtt_->Disconnect();
+        vTaskDelay(pdMS_TO_TICKS(50)); // 给 UART URC 回调退场
         mqtt_.reset();
+        BootTraceMark("MQTT_DISC_END", "ok");
     }
+    BootTraceMark("MQTT_END", running_ ? "disc" : "stop");
     return true;
 }
 
 void ReminderMqttWake::MqttTask() {
+    ESP_LOGI(TAG, "task start");
+    BootTraceMark("MQTT_TASK", "start");
     while (running_) {
         if (!ConnectOnce()) {
-            vTaskDelay(pdMS_TO_TICKS(10000));
+            // s1aw: 失败退避拉长，减少与 HTTP poll 同 UART 连打
+            vTaskDelay(pdMS_TO_TICKS(30000));
         } else {
-            vTaskDelay(pdMS_TO_TICKS(3000));
+            vTaskDelay(pdMS_TO_TICKS(10000));
         }
     }
+    ESP_LOGI(TAG, "task exit");
+    BootTraceMark("MQTT_TASK", "exit");
     task_handle_ = nullptr;
     vTaskDelete(nullptr);
 }

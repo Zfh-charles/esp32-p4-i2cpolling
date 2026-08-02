@@ -16,6 +16,20 @@
 
 static const char *SD_TAG = "SD扫描器";
 
+#if SOC_SDMMC_IO_POWER_EXTERNAL
+static void sd_scanner_release_pwr_ctrl(sd_scanner_t *scanner)
+{
+    if (!scanner || !scanner->pwr_ctrl_handle) {
+        return;
+    }
+    esp_err_t ret = sd_pwr_ctrl_del_on_chip_ldo((sd_pwr_ctrl_handle_t)scanner->pwr_ctrl_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGW(SD_TAG, "释放SD IO LDO失败: %s", esp_err_to_name(ret));
+    }
+    scanner->pwr_ctrl_handle = NULL;
+}
+#endif
+
 // 全局文件夹信息缓存
 static sd_folder_info_t g_folder_cache[10];
 static int g_folder_count = 0;
@@ -240,6 +254,7 @@ esp_err_t sd_scanner_init(sd_scanner_handle_t *handle)
     sd_scanner_t *scanner = *handle;
     scanner->is_mounted = false;
     scanner->card = NULL;
+    scanner->pwr_ctrl_handle = NULL;
 
     // SD卡挂载配置（标准速度模式）
     scanner->mount_config = (esp_vfs_fat_sdmmc_mount_config_t) {
@@ -270,74 +285,71 @@ esp_err_t sd_scanner_mount(sd_scanner_handle_t handle)
 
     ESP_LOGI(SD_TAG, "正在初始化SD卡...");
 
-    // 使用SDMMC外设（尽可能高的安全频率）
+    // Restore proven single-mount path (bak). Dual-freq retry without host cleanup
+    // left the bus half-initialized and caused OCR/mount failures with the same card.
     ESP_LOGI(SD_TAG, "使用SDMMC外设");
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    // 高速模式（40MHz），若卡或布线不支持会在初始化协商时回退
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT;  // 20MHz — safer OCR than HIGHSPEED after power storms
     host.slot = SDMMC_HOST_SLOT_0;
-    // 移除DDR模式，保持标准速度
-    // 设置合适的读取超时
     host.command_timeout_ms = 5000;
-    // 启用DMA提高传输效率
     host.flags |= SDMMC_HOST_FLAG_DEINIT_ARG | SDMMC_HOST_FLAG_4BIT;
-    // 移除1位模式标志，强制4线模式
     host.flags &= ~SDMMC_HOST_FLAG_1BIT;
-    ESP_LOGI(SD_TAG, "SD卡标准速度模式配置: 频率=%d kHz, 超时=%d ms", host.max_freq_khz, host.command_timeout_ms);
+    ESP_LOGI(SD_TAG, "SD卡标准速度模式配置: 频率=%d kHz, 超时=%d ms",
+             host.max_freq_khz, host.command_timeout_ms);
 
-    // 电源控制配置（ESP32-P4专用）
 #if SOC_SDMMC_IO_POWER_EXTERNAL
     ESP_LOGI(SD_TAG, "启用ESP32-P4片上LDO电源控制，LDO通道ID: 4");
-    sd_pwr_ctrl_ldo_config_t ldo_config = {
-        .ldo_chan_id = 4,
-    };
-    sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
-
-    ret = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &pwr_ctrl_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(SD_TAG, "创建片上LDO电源控制驱动失败: %s", esp_err_to_name(ret));
-        return ret;
+    if (scanner->pwr_ctrl_handle == NULL) {
+        sd_pwr_ctrl_ldo_config_t ldo_config = {
+            .ldo_chan_id = 4,
+        };
+        sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
+        ret = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &pwr_ctrl_handle);
+        if (ret != ESP_OK) {
+            ESP_LOGE(SD_TAG, "创建片上LDO电源控制驱动失败: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        scanner->pwr_ctrl_handle = pwr_ctrl_handle;
+        ESP_LOGI(SD_TAG, "片上LDO电源控制驱动创建成功");
+        // USB/esptool hard_reset 后卡需更长上电稳定（此前 250ms 仍 OCR TIMEOUT）。
+        vTaskDelay(pdMS_TO_TICKS(600));
+        (void)sd_pwr_ctrl_set_io_voltage(pwr_ctrl_handle, 3300);
+        vTaskDelay(pdMS_TO_TICKS(150));
     }
-    ESP_LOGI(SD_TAG, "片上LDO电源控制驱动创建成功");
-    host.pwr_ctrl_handle = pwr_ctrl_handle;
+    host.pwr_ctrl_handle = (sd_pwr_ctrl_handle_t)scanner->pwr_ctrl_handle;
 #else
     ESP_LOGW(SD_TAG, "未启用ESP32-P4片上LDO电源控制");
 #endif
 
-    // 配置SDMMC插槽和引脚（高速模式）
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot_config.width = 4;  // 4线模式
-    
-    // 使用预定义的引脚配置
+    slot_config.width = 4;
     slot_config.clk = SDMMC_CLK_PIN;
     slot_config.cmd = SDMMC_CMD_PIN;
     slot_config.d0 = SDMMC_D0_PIN;
     slot_config.d1 = SDMMC_D1_PIN;
     slot_config.d2 = SDMMC_D2_PIN;
     slot_config.d3 = SDMMC_D3_PIN;
-    
     slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-    // 如硬件满足UHS-I（1.8V）与走线条件，可启用以下选项
-    // slot_config.flags |= SDMMC_SLOT_FLAG_UHS1;  // 谨慎启用
 
     ESP_LOGI(SD_TAG, "正在挂载文件系统...");
-    ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config, &scanner->mount_config, &scanner->card);
-
+    ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config,
+                                  &scanner->mount_config, &scanner->card);
     if (ret != ESP_OK) {
         if (ret == ESP_FAIL) {
             ESP_LOGE(SD_TAG, "挂载文件系统失败。如果需要格式化SD卡，请设置相应的配置选项。");
         } else {
-            ESP_LOGE(SD_TAG, "初始化SD卡失败 (%s)。请确保SD卡线路有上拉电阻。", esp_err_to_name(ret));
+            ESP_LOGE(SD_TAG, "初始化SD卡失败 (%s)。请确保SD卡线路有上拉电阻。",
+                     esp_err_to_name(ret));
         }
+#if SOC_SDMMC_IO_POWER_EXTERNAL
+        sd_scanner_release_pwr_ctrl(scanner);
+#endif
         return ret;
     }
 
     scanner->is_mounted = true;
     ESP_LOGI(SD_TAG, "文件系统挂载成功");
-
-    // 打印SD卡信息
     sdmmc_card_print_info(stdout, scanner->card);
-
     return ESP_OK;
 }
 
@@ -396,13 +408,8 @@ esp_err_t sd_scanner_unmount(sd_scanner_handle_t handle)
     scanner->card = NULL;
     ESP_LOGI(SD_TAG, "SD卡已卸载");
 
-    // 清理电源控制驱动
-#if CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
-    esp_err_t ret = sd_pwr_ctrl_del_on_chip_ldo(pwr_ctrl_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(SD_TAG, "删除片上LDO电源控制驱动失败");
-        return ret;
-    }
+#if SOC_SDMMC_IO_POWER_EXTERNAL
+    sd_scanner_release_pwr_ctrl(scanner);
 #endif
 
     return ESP_OK;
@@ -416,9 +423,13 @@ esp_err_t sd_scanner_deinit(sd_scanner_handle_t handle)
 
     sd_scanner_t *scanner = handle;
     
-    // 如果还在挂载状态，先卸载
+    // 如果还在挂载状态，先卸载；失败挂载也要释放 LDO，避免残留电源句柄
     if (scanner->is_mounted) {
         sd_scanner_unmount(handle);
+    } else {
+#if SOC_SDMMC_IO_POWER_EXTERNAL
+        sd_scanner_release_pwr_ctrl(scanner);
+#endif
     }
 
     free(scanner);
@@ -459,10 +470,16 @@ esp_err_t sd_scanner_init_and_scan(void)
 {
     ESP_LOGI(SD_TAG, "🔍 初始化SD卡并保持挂载...");
 
-    // 如果已经初始化过，先释放资源
+    // Already mounted — never tear down a working card (remount-on-fail was
+    // unmounting then timing out after USB reset, killing SD faces).
+    if (g_scanner != NULL && g_scanner->is_mounted) {
+        ESP_LOGI(SD_TAG, "SD already mounted — skip re-init");
+        return ESP_OK;
+    }
+
+    // 如果已经初始化过但未挂载，先释放资源
     if (g_scanner != NULL) {
         ESP_LOGI(SD_TAG, "SD卡扫描器已存在，先释放资源");
-        // 注意：这里不再卸载SD卡，而是保持挂载状态以供视频播放器使用
         sd_scanner_deinit(g_scanner);
         g_scanner = NULL;
     }

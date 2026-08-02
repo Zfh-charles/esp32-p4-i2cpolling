@@ -4,6 +4,9 @@ CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=1024
 CONFIG_COMPILER_CXX_RTTI=y
 
 CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_PERF=y
+# s1cf: INFO bloated bootloader past 0x6000 (partition offset 0x8000) → build fail.
+# Keep NONE; app BootTrace prints CONFIG_SPIRAM_SPEED (s1cf). DQS still blind —
+# acceptable vs enlarging partition table mid-campaign.
 CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
 CONFIG_BOOTLOADER_SKIP_VALIDATE_ALWAYS=y
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
@@ -16,6 +19,12 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
 CONFIG_PARTITION_TABLE_OFFSET=0x8000
 
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_PANIC=y
+# After panic, pause before reboot so USB-Serial/JTAG can be reclaimed for flashing.
+CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=3
+# Keep the panic handler in IRAM so INT_WDT / cache-stall crashes can still
+# print a backtrace ("Interrupt wdt timeout on CPUx") instead of resetting silently.
+CONFIG_ESP_PANIC_HANDLER_IRAM=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
 

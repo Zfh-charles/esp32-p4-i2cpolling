@@ -3,6 +3,7 @@
 #include "application.h"
 #include "board.h"
 #include "device_state.h"
+#include "reminder/boot_trace.h"
 #include "reminder/reminder_trace.h"
 #include "reminder/reminder_lifecycle_trace.h"
 #include "settings.h"
@@ -45,10 +46,12 @@ std::string ReminderPoller::ExpandDeviceIdInUrl(const std::string& url_template)
 void ReminderPoller::EnsureNvsConfigured() {
     Settings settings("reminder_poll", true);
     std::string poll_url = settings.GetString("poll_url");
-    if (!poll_url.empty() && poll_url.find(":8444") != std::string::npos) {
+    if (!poll_url.empty() &&
+        (poll_url.find(":8444") != std::string::npos ||
+         poll_url.find("114.245.178.62") != std::string::npos)) {
 #ifdef CONFIG_REMINDER_POLL_DEFAULT_URL
         settings.SetString("poll_url", CONFIG_REMINDER_POLL_DEFAULT_URL);
-        ESP_LOGW(TAG, "Migrated stale poll_url from :8444 to menuconfig default");
+        ESP_LOGW(TAG, "Migrated stale poll_url (old host/port) to menuconfig default");
 #else
         return;
 #endif
@@ -157,20 +160,24 @@ bool ReminderPoller::PostAck(const std::string& ack_url, const std::string& id) 
     ApplyReminderHttpHeaders(http);
     std::string body = "{\"id\":\"" + id + "\"}";
     http->SetContent(std::move(body));
+    BootTraceMark("HTTP_ACK_BEG", "post");
     if (http->Open("POST", ack_url)) {
         const int status = http->GetStatusCode();
         if (status == 200) {
             ESP_LOGI(TAG, "Ack posted for %s", id.c_str());
             REMINDER_TRACE_LOG("ack_ok | id=%s", id.c_str());
             http->Close();
+            BootTraceMark("HTTP_ACK_END", "ok");
             return true;
         }
         ESP_LOGW(TAG, "Ack POST status %d for %s", status, id.c_str());
         REMINDER_TRACE_LOG("ack_http_fail | id=%s status=%d", id.c_str(), status);
         http->Close();
+        BootTraceMark("HTTP_ACK_END", "status_fail");
         return false;
     }
     REMINDER_TRACE_LOG("ack_open_fail | id=%s", id.c_str());
+    BootTraceMark("HTTP_ACK_END", "open_fail");
     return false;
 }
 
@@ -244,31 +251,40 @@ void ReminderPoller::DoPollOnce() {
     }
 
     REMINDER_TRACE_LOG("poll_begin | url=%s", poll_url.c_str());
+    // s1ay: 只诊断。崩时 prev_phase 落在 HTTP_* / MQTT_STATE_* 才能判 UART 争用。
+    BootTraceMark("HTTP_POLL_BEG", "get");
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(4);
     if (!http) {
         REMINDER_TRACE_LOG("poll_fail | reason=http_create");
         ESP_LOGW(TAG, "Failed to create HTTP client");
+        BootTraceMark("HTTP_POLL_END", "create_fail");
         return;
     }
     http->SetHeader("Content-Type", "application/json");
     ApplyReminderHttpHeaders(http);
 
+    BootTraceMark("HTTP_POLL_OPEN", "beg");
     if (!http->Open("GET", poll_url)) {
         REMINDER_TRACE_LOG("poll_fail | reason=http_open");
         ESP_LOGW(TAG, "HTTP open failed: %s", poll_url.c_str());
+        BootTraceMark("HTTP_POLL_END", "open_fail");
         return;
     }
+    BootTraceMark("HTTP_POLL_OPEN", "ok");
     const int status = http->GetStatusCode();
     if (status != 200) {
         REMINDER_TRACE_LOG("poll_fail | reason=http_status status=%d", status);
         ESP_LOGW(TAG, "HTTP status %d for %s", status, poll_url.c_str());
         http->Close();
+        BootTraceMark("HTTP_POLL_END", "status_fail");
         return;
     }
 
+    BootTraceMark("HTTP_POLL_READ", "beg");
     std::string body = http->ReadAll();
     http->Close();
+    BootTraceMark("HTTP_POLL_END", "ok");
     REMINDER_TRACE_LOG("poll_ok | body_len=%u", (unsigned)body.size());
 
     std::string id, prompt, emotion, wake_text;
@@ -285,10 +301,10 @@ void ReminderPoller::DoPollOnce() {
         const int64_t ack_ts = rw_settings.GetInt("last_ack_ts", 0);
         constexpr int64_t kAckDedupeSec = 300;
         if (ack_ts > 0 && (now_sec - ack_ts) < kAckDedupeSec) {
-            REMINDER_TRACE_LOG("poll_skip | reason=already_acked id=%s age=%llds",
-                               id.c_str(), (long long)(now_sec - ack_ts));
-            ESP_LOGI(TAG, "Reminder %s already acked %llds ago, skip", id.c_str(),
-                     (long long)(now_sec - ack_ts));
+            REMINDER_TRACE_LOG("poll_skip | reason=already_acked id=%s age=%ds",
+                               id.c_str(), (int)(now_sec - ack_ts));
+            ESP_LOGI(TAG, "Reminder %s already acked %ds ago, skip", id.c_str(),
+                     (int)(now_sec - ack_ts));
             return;
         }
     }
