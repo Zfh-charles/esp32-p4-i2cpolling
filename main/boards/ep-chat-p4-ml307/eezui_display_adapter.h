@@ -5,6 +5,7 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <atomic>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <map>
@@ -57,6 +58,16 @@ protected:
     // eezui UI对象引用
     lv_obj_t* dialogue_box_ = nullptr;
     lv_obj_t* main_image_ = nullptr;
+    lv_obj_t* battery_panel_ = nullptr;
+    lv_obj_t* battery_gauge_ = nullptr;
+    lv_obj_t* battery_body_ = nullptr;
+    lv_obj_t* battery_fill_ = nullptr;
+    lv_obj_t* battery_tip_ = nullptr;
+    lv_obj_t* battery_percent_label_ = nullptr;
+    int last_battery_level_ = -1;
+    bool last_battery_charging_ = false;
+    bool last_battery_low_ = false;
+    int64_t last_battery_update_us_ = 0;
     
     // 逐字显示效果相关
     std::string typewriter_text_;
@@ -96,6 +107,7 @@ protected:
     // void EnsureWifiUIOnTop();
     
     void SetupUI();
+    void SetupBatteryUI();
     void StartTypewriterEffect(const std::string& text);
     void StopTypewriterEffect();
     void UpdateDialogueBoxHeight();
@@ -143,6 +155,7 @@ public:
   //  virtual void SetIcon(const char* icon) override;
    // virtual void SetPreviewImage(const lv_img_dsc_t* img_dsc) override;
     virtual void SetChatMessage(const char* role, const char* content) override;
+    virtual void UpdateStatusBar(bool update_all = false) override;
   //  virtual void SetTheme(const std::string& theme_name) override;
     
     // 强制表情切换方法

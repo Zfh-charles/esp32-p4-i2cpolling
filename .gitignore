@@ -1,5 +1,8 @@
 tmp/
-components/
+components/*
+!components/eezui/
+!components/esp-ml307/
+!components/esp-ml307/**
 managed_components/
 build/
 .vscode/

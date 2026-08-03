@@ -331,7 +331,8 @@ void ReminderLcSummary(ReminderLcOwner owner) {
     if (s == nullptr || !s->active) {
         return;
     }
-    const int64_t dur_ms = (esp_timer_get_time() - s->begin_us) / 1000;
+    const unsigned dur_ms =
+        static_cast<unsigned>((esp_timer_get_time() - s->begin_us) / 1000);
     bool pass = true;
     const char* root_cause = "-";
 
@@ -343,11 +344,11 @@ void ReminderLcSummary(ReminderLcOwner owner) {
                 root_cause = ProactiveRootCause(s);
             }
             REMINDER_TRACE_LOG(
-                "LC_SUMMARY | owner=Proactive id=%s RESULT=%s dur=%lldms "
+                "LC_SUMMARY | owner=Proactive id=%s RESULT=%s dur=%ums "
                 "display=%s emotion=%s channel=%s wake_sent=%s "
                 "tts_json=%s tts_audio=%s(%dpkt) tts_drop=%d feedback=%s ack=%s "
                 "ROOT_CAUSE=%s",
-                PreviewText(s->id), pass ? "PASS" : "FAIL", (long long)dur_ms,
+                PreviewText(s->id), pass ? "PASS" : "FAIL", dur_ms,
                 OkFail(s->display_text), OkFail(s->emotion_set), OkFail(s->channel_open),
                 OkFail(s->wake_sent),
                 OkFail(s->tts_json_start && s->tts_json_stop),
@@ -360,10 +361,10 @@ void ReminderLcSummary(ReminderLcOwner owner) {
                 root_cause = UserRootCause(s);
             }
             REMINDER_TRACE_LOG(
-                "LC_SUMMARY | owner=User id=%s RESULT=%s dur=%lldms "
+                "LC_SUMMARY | owner=User id=%s RESULT=%s dur=%ums "
                 "wake_detect=%s channel=%s tts_json=%s tts_audio=%s(%dpkt) display=%s "
                 "ROOT_CAUSE=%s",
-                PreviewText(s->id), pass ? "PASS" : "FAIL", (long long)dur_ms,
+                PreviewText(s->id), pass ? "PASS" : "FAIL", dur_ms,
                 OkFail(s->wake_detect), OkFail(s->channel_open),
                 OkFail(s->tts_json_start && s->tts_json_stop),
                 OkFail(s->tts_audio), s->tts_audio_packets,
@@ -375,9 +376,9 @@ void ReminderLcSummary(ReminderLcOwner owner) {
                 root_cause = AlarmRootCause(s);
             }
             REMINDER_TRACE_LOG(
-                "LC_SUMMARY | owner=Alarm RESULT=%s dur=%lldms ring=%s display=%s preempt=%s "
+                "LC_SUMMARY | owner=Alarm RESULT=%s dur=%ums ring=%s display=%s preempt=%s "
                 "ROOT_CAUSE=%s",
-                pass ? "PASS" : "FAIL", (long long)dur_ms,
+                pass ? "PASS" : "FAIL", dur_ms,
                 OkFail(s->ring), OkFail(s->display_text), OkFail(s->preempt), root_cause);
             break;
         case ReminderLcOwner::Standby:
@@ -386,9 +387,9 @@ void ReminderLcSummary(ReminderLcOwner owner) {
                 root_cause = StandbyRootCause(s);
             }
             REMINDER_TRACE_LOG(
-                "LC_SUMMARY | owner=Standby RESULT=%s dur=%lldms wake_arm=%s display=%s "
+                "LC_SUMMARY | owner=Standby RESULT=%s dur=%ums wake_arm=%s display=%s "
                 "ROOT_CAUSE=%s",
-                pass ? "PASS" : "FAIL", (long long)dur_ms,
+                pass ? "PASS" : "FAIL", dur_ms,
                 OkFail(s->wake_arm), OkFail(s->display_text), root_cause);
             break;
         default:

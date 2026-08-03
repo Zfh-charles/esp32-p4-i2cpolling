@@ -21,6 +21,7 @@ struct HwUiState {
     char last_tts[24];
     char last_screen_via[24];
     int speaker_pcm_writes = 0;
+    int tts_enqueue_ok = 0;
     int tts_decode_ok = 0;
 };
 
@@ -162,12 +163,17 @@ void ReminderHwTraceSpeakerPcm(int samples, const char* source) {
 }
 
 void ReminderHwTraceTtsPipeline(const char* stage, int ok, int detail) {
-    if (ok && stage != nullptr && std::strcmp(stage, "decoded") == 0) {
-        g_state.tts_decode_ok++;
+    int event_index = detail;
+    if (ok && stage != nullptr) {
+        if (std::strcmp(stage, "enqueue") == 0) {
+            event_index = ++g_state.tts_enqueue_ok;
+        } else if (std::strcmp(stage, "decoded") == 0) {
+            event_index = ++g_state.tts_decode_ok;
+        }
     }
-    if (detail <= 3 || detail % 50 == 0 || !ok) {
-        REMINDER_TRACE_LOG("HW | tts_pipe stage=%s ok=%d detail=%d",
-                           Preview(stage), ok, detail);
+    if (event_index <= 3 || event_index % 50 == 0 || !ok) {
+        REMINDER_TRACE_LOG("HW | tts_pipe stage=%s ok=%d frame=%d detail=%d",
+                           Preview(stage), ok, event_index, detail);
     }
 }
 

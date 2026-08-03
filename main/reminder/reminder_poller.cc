@@ -11,6 +11,7 @@
 #include "http.h"
 
 #include <esp_log.h>
+#include <cstdio>
 #include <cstring>
 #include <cJSON.h>
 #include <esp_timer.h>
@@ -100,9 +101,20 @@ static ReminderDeliveryMode ParseDeliveryMode(cJSON* root) {
     return ReminderDeliveryMode::kMcpWake;
 }
 
+static ReminderAlarmMode ParseAlarmMode(cJSON* root) {
+    auto alarm_item = cJSON_GetObjectItem(root, "alarm_mode");
+    if (!cJSON_IsString(alarm_item)) {
+        return ReminderAlarmMode::kNone;
+    }
+    if (strcmp(alarm_item->valuestring, "ring_repeat") == 0) {
+        return ReminderAlarmMode::kRingRepeat;
+    }
+    return ReminderAlarmMode::kNone;
+}
+
 bool ReminderPoller::ParsePendingResponse(const std::string& body, std::string& id, std::string& prompt,
                                           std::string& emotion, ReminderDeliveryMode& mode,
-                                          std::string& wake_text) {
+                                          ReminderAlarmMode& alarm_mode, std::string& wake_text) {
     cJSON* root = cJSON_Parse(body.c_str());
     if (root == nullptr) {
         return false;
@@ -126,6 +138,7 @@ bool ReminderPoller::ParsePendingResponse(const std::string& body, std::string& 
         emotion = emotion_item->valuestring;
     }
     mode = ParseDeliveryMode(root);
+    alarm_mode = ParseAlarmMode(root);
     wake_text.clear();
     auto wake_item = cJSON_GetObjectItem(root, "wake_text");
     if (cJSON_IsString(wake_item)) {
@@ -209,31 +222,63 @@ void ReminderPoller::Stop() {
 }
 
 void ReminderPoller::TriggerPoll() {
+    ESP_LOGI(TAG, "MQTT wake -> queue HTTP poll");
+    DeferPoll("mqtt");
+}
+
+void ReminderPoller::DeferPoll(const char* reason) {
+    const bool was_pending = deferred_poll_pending_.exchange(true);
+    if (!was_pending) {
+        deferred_wait_logged_.store(false);
+        REMINDER_TRACE_LOG("poll_deferred_set | reason=%s", reason ? reason : "unknown");
+    }
     if (poll_task_handle_ != nullptr) {
-        ESP_LOGI(TAG, "MQTT wake -> trigger HTTP poll");
         xTaskNotifyGive(poll_task_handle_);
+    }
+}
+
+void ReminderPoller::NotifyIdleReady() {
+    if (!deferred_poll_pending_.load() || poll_task_handle_ == nullptr) {
+        return;
+    }
+    deferred_wait_logged_.store(false);
+    REMINDER_TRACE_LOG("poll_deferred_resume | reason=idle_ready");
+    xTaskNotifyGive(poll_task_handle_);
+}
+
+void ReminderPoller::TracePollBlocked(const char* reason) {
+    if (deferred_poll_pending_.load()) {
+        if (!deferred_wait_logged_.exchange(true)) {
+            REMINDER_TRACE_LOG("poll_deferred_wait | reason=%s", reason);
+        }
+    } else {
+        REMINDER_TRACE_LOG("poll_skip | reason=%s", reason);
     }
 }
 
 void ReminderPoller::DoPollOnce() {
     auto& app = Application::GetInstance();
-#if CONFIG_USE_ALARM
-    if (app.GetDeviceState() == kDeviceStateAlarm || app.IsAlarmRinging()) {
-        REMINDER_TRACE_LOG("poll_skip | reason=alarm");
-        ESP_LOGD(TAG, "Skip poll, local alarm ringing");
-        return;
-    }
-#endif
     if (app.GetDeviceState() != kDeviceStateIdle) {
-        REMINDER_TRACE_LOG("poll_skip | reason=state_%s", ReminderTraceDeviceStateName(app.GetDeviceState()));
+        char reason[48];
+        snprintf(reason, sizeof(reason), "state_%s",
+                 ReminderTraceDeviceStateName(app.GetDeviceState()));
+        TracePollBlocked(reason);
         ESP_LOGD(TAG, "Skip poll, device state not idle");
         return;
     }
     if (app.GetSessionKind() != SessionKind::None) {
-        REMINDER_TRACE_LOG("poll_skip | reason=session_%s",
-                           ReminderTraceSessionKindName(static_cast<int>(app.GetSessionKind())));
+        char reason[48];
+        snprintf(reason, sizeof(reason), "session_%s",
+                 ReminderTraceSessionKindName(static_cast<int>(app.GetSessionKind())));
+        TracePollBlocked(reason);
         ESP_LOGI(TAG, "Skip poll, session active (kind=%d)", (int)app.GetSessionKind());
         return;
+    }
+
+    const bool was_deferred = deferred_poll_pending_.exchange(false);
+    deferred_wait_logged_.store(false);
+    if (was_deferred) {
+        REMINDER_TRACE_LOG("poll_deferred_begin");
     }
 
     Settings settings("reminder_poll", false);
@@ -273,7 +318,8 @@ void ReminderPoller::DoPollOnce() {
 
     std::string id, prompt, emotion, wake_text;
     ReminderDeliveryMode mode = ReminderDeliveryMode::kMcpWake;
-    if (!ParsePendingResponse(body, id, prompt, emotion, mode, wake_text)) {
+    ReminderAlarmMode alarm_mode = ReminderAlarmMode::kNone;
+    if (!ParsePendingResponse(body, id, prompt, emotion, mode, alarm_mode, wake_text)) {
         REMINDER_TRACE_LOG("poll_no_reminder");
         return;
     }
@@ -285,10 +331,11 @@ void ReminderPoller::DoPollOnce() {
         const int64_t ack_ts = rw_settings.GetInt("last_ack_ts", 0);
         constexpr int64_t kAckDedupeSec = 300;
         if (ack_ts > 0 && (now_sec - ack_ts) < kAckDedupeSec) {
-            REMINDER_TRACE_LOG("poll_skip | reason=already_acked id=%s age=%llds",
-                               id.c_str(), (long long)(now_sec - ack_ts));
-            ESP_LOGI(TAG, "Reminder %s already acked %llds ago, skip", id.c_str(),
-                     (long long)(now_sec - ack_ts));
+            const unsigned age_sec = static_cast<unsigned>(now_sec - ack_ts);
+            REMINDER_TRACE_LOG("poll_skip | reason=already_acked id=%s age=%us",
+                               id.c_str(), age_sec);
+            ESP_LOGI(TAG, "Reminder %s already acked %us ago, skip", id.c_str(),
+                     age_sec);
             return;
         }
     }
@@ -299,8 +346,10 @@ void ReminderPoller::DoPollOnce() {
     } else if (mode == ReminderDeliveryMode::kAlertOnly) {
         mode_name = "alert_only";
     }
-    ESP_LOGI(TAG, "New reminder %s [%s]: %s", id.c_str(), mode_name, prompt.c_str());
-    REMINDER_TRACE_LOG("poll_new | id=%s mode=%s", id.c_str(), mode_name);
+    const char* alarm_name = alarm_mode == ReminderAlarmMode::kRingRepeat ? "ring_repeat" : "none";
+    ESP_LOGI(TAG, "New reminder %s [%s alarm=%s]: %s", id.c_str(), mode_name,
+             alarm_name, prompt.c_str());
+    REMINDER_TRACE_LOG("poll_new | id=%s mode=%s alarm=%s", id.c_str(), mode_name, alarm_name);
     ReminderLcMark(ReminderLcOwner::Proactive, ReminderLcPhase::PollNew, 1, id.c_str());
 
     std::string ack_url = settings.GetString("ack_url");
@@ -313,24 +362,19 @@ void ReminderPoller::DoPollOnce() {
         ack_url = ExpandDeviceIdInUrl(ack_url);
     }
 
-    app.Schedule([id, prompt, emotion, wake_text, mode, ack_url]() {
+    app.Schedule([this, id, prompt, emotion, wake_text, mode, alarm_mode, ack_url]() {
         auto& application = Application::GetInstance();
-#if CONFIG_USE_ALARM
-        if (application.GetDeviceState() == kDeviceStateAlarm || application.IsAlarmRinging()) {
-            REMINDER_TRACE_LOG("deliver_skip | reason=alarm id=%s", id.c_str());
-            ESP_LOGW(TAG, "Skip delivery for %s, local alarm ringing", id.c_str());
-            return;
-        }
-#endif
         if (application.GetDeviceState() != kDeviceStateIdle) {
             REMINDER_TRACE_LOG("deliver_skip | reason=state_%s id=%s",
                                ReminderTraceDeviceStateName(application.GetDeviceState()), id.c_str());
             ESP_LOGW(TAG, "Skip delivery for %s, device no longer idle", id.c_str());
+            DeferPoll("deliver_state");
             return;
         }
         if (application.IsProactiveReminderPending()) {
             REMINDER_TRACE_LOG("deliver_skip | reason=proactive_pending id=%s", id.c_str());
             ESP_LOGW(TAG, "Skip delivery for %s, proactive reminder in flight", id.c_str());
+            DeferPoll("deliver_proactive_pending");
             return;
         }
         if (application.GetSessionKind() != SessionKind::None) {
@@ -338,6 +382,7 @@ void ReminderPoller::DoPollOnce() {
                                ReminderTraceSessionKindName(static_cast<int>(application.GetSessionKind())),
                                id.c_str());
             ESP_LOGW(TAG, "Skip delivery for %s, session active", id.c_str());
+            DeferPoll("deliver_session");
             return;
         }
 
@@ -347,28 +392,13 @@ void ReminderPoller::DoPollOnce() {
         } else if (mode == ReminderDeliveryMode::kAlertOnly) {
             deliver_mode = "alert_only";
         }
-        REMINDER_TRACE_LOG("deliver_schedule | id=%s mode=%s", id.c_str(), deliver_mode);
+        const char* alarm_name =
+            alarm_mode == ReminderAlarmMode::kRingRepeat ? "ring_repeat" : "none";
+        REMINDER_TRACE_LOG("deliver_schedule | id=%s mode=%s alarm=%s", id.c_str(),
+                           deliver_mode, alarm_name);
         ReminderLcMark(ReminderLcOwner::Proactive, ReminderLcPhase::DeliverSchedule, 1, id.c_str());
 
-        if (mode == ReminderDeliveryMode::kAlertOnly) {
-            application.Alert("提醒", prompt.c_str(), emotion.c_str(), Lang::Sounds::OGG_VIBRATION);
-            if (ReminderPoller::PostAck(ack_url, id)) {
-                Settings ack_settings("reminder_poll", true);
-                ack_settings.SetString("last_id", id);
-                ack_settings.SetInt("last_ack_ts", (int32_t)(esp_timer_get_time() / 1000000LL));
-            }
-            return;
-        }
-
-        application.DeliverReminder(mode, id, prompt, wake_text, emotion.c_str(), ack_url);
-
-        if (mode == ReminderDeliveryMode::kDirectWake) {
-            if (ReminderPoller::PostAck(ack_url, id)) {
-                Settings ack_settings("reminder_poll", true);
-                ack_settings.SetString("last_id", id);
-                ack_settings.SetInt("last_ack_ts", (int32_t)(esp_timer_get_time() / 1000000LL));
-            }
-        }
+        application.DeliverReminder(mode, alarm_mode, id, prompt, wake_text, emotion.c_str(), ack_url);
     });
 }
 
@@ -376,7 +406,8 @@ void ReminderPoller::PollTask() {
     while (running_) {
         DoPollOnce();
         const uint32_t interval_ms = CONFIG_REMINDER_POLL_INTERVAL_SEC * 1000U;
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(interval_ms));
+        const uint32_t wait_ms = deferred_poll_pending_.load() ? 1000U : interval_ms;
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms));
     }
     poll_task_handle_ = nullptr;
     vTaskDelete(nullptr);

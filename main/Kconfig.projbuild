@@ -726,24 +726,7 @@ menu "TAIJIPAI_S3_CONFIG"
 
 endmenu
 
-menu "XVSENFENG_ALARM"
-    config USE_ALARM
-        bool "启用闹钟功能"
-        default y
-        help
-            启用闹钟功能
-    config ALARM_USE_SD_CARD
-        bool "闹钟使用SD卡存储"
-        default n
-        help
-            闹钟数据存储在SD卡中
-    config ALARM_SD_CARD_MOUNT_POINT
-        string "闹钟SD卡挂载点"
-        default "/sdcard"
-        depends on ALARM_USE_SD_CARD
-        help
-            闹钟SD卡挂载点
-
+menu "PROACTIVE_REMINDER"
     config USE_REMINDER_POLL
         bool "启用推理提醒 HTTP 轮询（待机播报）"
         default n
@@ -753,7 +736,7 @@ menu "XVSENFENG_ALARM"
 
     config REMINDER_POLL_DEFAULT_URL
         string "默认 poll_url（支持 {device_id} 占位符）"
-        default ""
+        default "http://114.245.176.144:8443/v1/devices/{device_id}/reminders/pending"
         depends on USE_REMINDER_POLL
         help
             首次启动且 NVS 无 poll_url 时自动写入。
@@ -775,13 +758,21 @@ menu "XVSENFENG_ALARM"
         help
             设备 idle 且无会话时 HTTP 拉取待提醒的周期。默认 60 秒；间隔越短越耗电。
 
-    config REMINDER_FEEDBACK_SEC
-        int "主动提醒播报后听用户反馈时长（秒）"
-        default 5
-        range 0 120
+    config REMINDER_ALARM_REPEAT_SEC
+        int "主动提醒播报后的闹铃重复间隔（秒）"
+        default 10
+        range 1 60
         depends on USE_REMINDER_POLL
         help
-            mcp_wake 提醒 TTS 结束后开麦监听；超时无反馈则关会话、恢复唤醒词。方案 D 默认 5 秒；设为 0 则 TTS 结束立即回 idle。
+            主动提醒先完成 TTS 播报，随后立即响铃，并按此间隔重复。
+
+    config REMINDER_ALARM_DURATION_SEC
+        int "主动提醒闹铃最长持续时间（秒）"
+        default 30
+        range 5 300
+        depends on USE_REMINDER_POLL
+        help
+            从第一次响铃开始计时；超时后停止播放、ACK，并恢复待机和唤醒词。
 
     config REMINDER_WAKE_PHRASE
         string "MCP 唤醒短语（delivery_mode=mcp_wake 时发给云的 detect）"
@@ -845,14 +836,14 @@ menu "XVSENFENG_ALARM"
 
     config REMINDER_MQTT_WAKE_DEFAULT_BROKER
         string "默认 MQTT broker（host:port）"
-        default "broker.emqx.io:1883"
+        default "114.245.176.144:8883"
         depends on REMINDER_MQTT_WAKE
         help
             首次启动写入 NVS reminder_mqtt.broker。本地调试可用公网 broker 或 ngrok tcp 1883。
 
     config REMINDER_MQTT_WAKE_DEFAULT_TOPIC
         string "MQTT 订阅主题（支持 {device_id}/{mac}/{mac_clean}）"
-        default "xiaozhi/reminder/wake/{device_id}"
+        default "v1/notify/{mac_clean}"
         depends on REMINDER_MQTT_WAKE
         help
             推理服务 push 后应向同一主题发布唤醒。

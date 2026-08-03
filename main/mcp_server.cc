@@ -76,99 +76,16 @@ void McpServer::AddCommonTools() {
                 return true;
             });
     }
-#if CONFIG_USE_ALARM
-    AddTool("self.get_device_time",
-    "获取当前设备的时间, 可以用于为设置闹钟提供参考, 设置闹钟需要使用`self.alarm_clock`工具。",
-    PropertyList(),
-    [](const PropertyList& properties) -> ReturnValue {
-        // 获取当前的时间，并以 JSON 格式返回，包含年、月、日、时、分、秒等信息
-        time_t now = time(nullptr);
-        struct tm tm_buf;
-        localtime_r(&now, &tm_buf);
-
-        cJSON* root = cJSON_CreateObject();
-        cJSON_AddNumberToObject(root, "year", tm_buf.tm_year + 1900);
-        cJSON_AddNumberToObject(root, "month", tm_buf.tm_mon + 1);
-        cJSON_AddNumberToObject(root, "day", tm_buf.tm_mday);
-        cJSON_AddNumberToObject(root, "hour", tm_buf.tm_hour);
-        cJSON_AddNumberToObject(root, "minute", tm_buf.tm_min);
-        cJSON_AddNumberToObject(root, "second", tm_buf.tm_sec);
-        cJSON_AddNumberToObject(root, "weekday", tm_buf.tm_wday);
-        cJSON_AddNumberToObject(root, "timestamp", (int64_t)now);
-
-        char* json_str = cJSON_PrintUnformatted(root);
-        std::string json = json_str ? std::string(json_str) : "{}";
-        ESP_LOGI(TAG, "Current device time JSON: %s", json.c_str());
-        cJSON_free(json_str);
-        cJSON_Delete(root);
-        return json;
-    });
-
-
-    AddTool("self.alarm_clock",
-    "设备闹钟, 在使用相对时间设置闹钟的时候, 需要使用self.get_device_time获取设备的当前时间, 以确保时间的准确性。",
-    PropertyList({
-        Property("year", kPropertyTypeInteger, 1700, 2050),
-        Property("month", kPropertyTypeInteger, 1, 12),
-        Property("day", kPropertyTypeInteger, 1, 31),
-        Property("hour", kPropertyTypeInteger, 0, 23),
-        Property("minute", kPropertyTypeInteger, 0, 59),
-        Property("second", kPropertyTypeInteger, 0, 59),
-        Property("message", kPropertyTypeString)
-    }),
-    [](const PropertyList& properties) -> ReturnValue {
-        auto& app = Application::GetInstance();
-        // 通用时钟未初始化
-        if(app.general_timer_ == nullptr){
-            return "general_timer_ is not available";
-        }
-        // INSERT_YOUR_CODE
-        // 使用参数合成具体的时间
-        int year = properties["year"].value<int>();
-        int month = properties["month"].value<int>();
-        int day = properties["day"].value<int>();
-        int hour = properties["hour"].value<int>();
-        int minute = properties["minute"].value<int>();
-        int second = properties["second"].value<int>();
-        std::string message = properties["message"].value<std::string>();
-        struct tm tm_time = {0};
-        tm_time.tm_year = year - 1900;
-        tm_time.tm_mon = month - 1;
-        tm_time.tm_mday = day;
-        tm_time.tm_hour = hour;
-        tm_time.tm_min = minute;
-        tm_time.tm_sec = second;
-        tm_time.tm_isdst = -1; // 让mktime自动判断夏令时
-
-        time_t trigger_time = mktime(&tm_time);
-        if (trigger_time == -1) {
-            ESP_LOGE(TAG, "Failed to convert time.");
-            return false;
-        }
-
-        // 设置闹钟/定时器，消息类型
-        // MESSAGE类型定时事件，参数arg传消息字符串地址
-        char* msg_buf = (char*)malloc(message.size() + 1);
-        if (!msg_buf) {
-            ESP_LOGE(TAG, "Failed to allocate memory for alarm message.");
-            return false;
-        }
-        strcpy(msg_buf, message.c_str());
-
-        // 添加定时事件(绝对时间, 消息类型，不重复)
-        app.general_timer_->TimerAddTimerEventAbsolute(trigger_time, E_PET_TIMER_FUNCTION, 1, (void*)msg_buf, false);
-
-        // 返回信息
-        cJSON* ret_json = cJSON_CreateObject();
-        cJSON_AddNumberToObject(ret_json, "trigger_time", (int64_t)trigger_time);
-        cJSON_AddStringToObject(ret_json, "message", message.c_str());
-        char* ret_str = cJSON_PrintUnformatted(ret_json);
-        std::string result = ret_str ? ret_str : "{}";
-        if (ret_str) cJSON_free(ret_str);
-        cJSON_Delete(ret_json);
-        ESP_LOGI(TAG, "Current device time JSON: %s", result.c_str());
-        return result;
-    });
+#if CONFIG_USE_REMINDER_POLL
+    AddTool("self.reminder_alarm.stop",
+        "Stop the currently ringing proactive reminder alarm. Use this when the user asks to stop or dismiss the alarm.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            const bool was_ringing = app.IsReminderAlarmRinging();
+            app.RequestStopReminderAlarm("mcp_tool");
+            return was_ringing ? "alarm stop requested" : "no reminder alarm is ringing";
+        });
 #endif
 
 #ifdef HAVE_LVGL

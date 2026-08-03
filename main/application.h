@@ -10,14 +10,12 @@
 #include <mutex>
 #include <deque>
 #include <memory>
+#include <atomic>
 
 #include "protocol.h"
 #include "ota.h"
 #include "audio_service.h"
 #include "device_state_event.h"
-#if CONFIG_USE_ALARM
-#include "general_timer.h"
-#endif
 #if CONFIG_USE_REMINDER_POLL
 #include "reminder/reminder_poller.h"
 #include "reminder/reminder_diag.h"
@@ -34,9 +32,6 @@
 #define MAIN_EVENT_ERROR (1 << 4)
 #define MAIN_EVENT_CHECK_NEW_VERSION_DONE (1 << 5)
 #define MAIN_EVENT_CLOCK_TICK (1 << 6)
-#if CONFIG_USE_ALARM
-#define MAIN_EVENT_ALARM (1 << 7)
-#endif
 
 
 
@@ -85,24 +80,25 @@ public:
     void PlaySound(const std::string_view& sound);
     void DeliverReminderSpeech(const std::string& message, const char* emotion = "neutral");
 #if CONFIG_USE_REMINDER_POLL
-    void DeliverReminder(ReminderDeliveryMode mode, const std::string& id, const std::string& prompt,
-                         const std::string& wake_text, const char* emotion, const std::string& ack_url);
+    void DeliverReminder(ReminderDeliveryMode mode, ReminderAlarmMode alarm_mode,
+                         const std::string& id, const std::string& prompt,
+                         const std::string& wake_text, const char* emotion,
+                         const std::string& ack_url);
     SessionKind GetSessionKind() const { return session_kind_; }
-    bool IsProactiveReminderPending() const { return !pending_reminder_ack_id_.empty(); }
+    bool IsProactiveReminderPending() const {
+        return session_kind_ == SessionKind::ProactiveReminder ||
+               proactive_alarm_active_.load() || proactive_alarm_pending_start_ ||
+               !pending_reminder_ack_id_.empty();
+    }
     bool IsUserConversationActive() const;
     bool CanDeliverReminder() const;
+    bool IsReminderAlarmRinging() const { return proactive_alarm_active_.load(); }
+    void RequestStopReminderAlarm(const char* reason = "api");
     void ReminderTraceLog(const char* event, const char* detail = nullptr) const;
     ReminderDiagSnapshot BuildReminderDiagSnapshot();
     void RunReminderDiagnostics(const char* trigger, bool allow_auto_heal = false);
 #endif
     AudioService& GetAudioService() { return audio_service_; }
-    #if CONFIG_USE_ALARM
-    GeneralTimer *general_timer_ = nullptr;
-    bool IsAlarmRinging() const;
-    void SendMessage(std::string& message);
-    void SetAlarmEvent();
-    void ClearAlarmEvent();
-#endif
 
 private:
     Application();
@@ -145,16 +141,31 @@ private:
     bool proactive_reminder_tts_started_ = false;
     int proactive_audio_packets_ = 0;
     esp_timer_handle_t proactive_reminder_timer_handle_ = nullptr;
-    void CompletePendingReminderAck();
+    void CompletePendingReminderAck(bool return_to_idle = true, bool show_wake_hint = true);
     void CancelPendingReminderAck();
     void StartProactiveReminderTimeout();
     void StopProactiveReminderTimeout();
-    void StartProactiveFeedbackWindow();
-    void FinishProactiveReminder();
-    void StopProactiveFeedbackTimer();
+    std::atomic<bool> proactive_alarm_active_{false};
+    bool proactive_alarm_pending_start_ = false;
+    bool proactive_alarm_tts_playing_ = false;
+    bool proactive_alarm_ring_playing_ = false;
+    bool proactive_alarm_repeat_speech_enabled_ = false;
+    bool proactive_alarm_delivered_ = false;
+    ReminderAlarmMode proactive_alarm_mode_ = ReminderAlarmMode::kNone;
+    int64_t proactive_alarm_pending_since_us_ = 0;
+    int64_t proactive_alarm_ring_until_us_ = 0;
+    std::string proactive_alarm_repeat_detect_text_;
+    esp_timer_handle_t proactive_alarm_timer_handle_ = nullptr;
+    void QueueProactiveAlarmAfterSpeech();
+    void ServiceProactiveAlarm();
+    void StartProactiveAlarm();
+    void StopProactiveAlarm(const char* reason, bool acknowledge = true);
+    void StartProactiveAlarmTimeout();
+    void StopProactiveAlarmTimeout();
     void SetSessionKind(SessionKind kind, const char* reason);
     struct ReminderDeliverPayload {
         ReminderDeliveryMode effective_mode = ReminderDeliveryMode::kMcpWake;
+        ReminderAlarmMode alarm_mode = ReminderAlarmMode::kNone;
         std::string id;
         std::string display_text;
         std::string detect_text;
@@ -166,7 +177,6 @@ private:
     void EnterIdleStandby(bool show_wake_hint = true);
     void UpdateCapturePowerHold();
     void TryStartDeferredReminderNet();
-    esp_timer_handle_t proactive_feedback_timer_handle_ = nullptr;
     bool deferred_reminder_services_pending_ = false;
     int64_t wake_running_since_us_ = 0;
     bool idle_rearm_in_progress_ = false;

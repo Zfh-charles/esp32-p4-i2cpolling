@@ -10,13 +10,13 @@
 #include <algorithm>
 #include <cctype>
 #include "ui.h"
+#include "ui/fonts.h"
 #include "lvgl.h"
 #include "src/misc/lv_timer.h"
 #include "sd_scanner.h"
 #include <sys/stat.h>
 #include "application.h"
 #include "board.h"
-#include "font_awesome.h"
 
 extern "C" {
 #include "emotion_video_player.h"
@@ -95,14 +95,7 @@ void EezuiDisplayAdapter::SetupUI() {
     main_image_ = nullptr;
     
     
-    // 立即隐藏电池相关标签，防止开机时显示
-    // 注意：charging和low_bat在当前EEZ UI中不存在，已注释
-    // if (objects.charging) {
-    //     lv_obj_add_flag(objects.charging, LV_OBJ_FLAG_HIDDEN);
-    // }
-    // if (objects.low_bat) {
-    //     lv_obj_add_flag(objects.low_bat, LV_OBJ_FLAG_HIDDEN);
-    // }
+    SetupBatteryUI();
     
     // 初始化时隐藏音量条
     if (objects.volume_bar) {
@@ -144,6 +137,148 @@ void EezuiDisplayAdapter::SetupUI() {
     // 设置UI就绪标志
     init_state_ = static_cast<InitState>(static_cast<int>(init_state_) | static_cast<int>(InitState::UI_READY));
     ESP_LOGI(TAG, "✅ UI初始化完成");
+}
+
+void EezuiDisplayAdapter::SetupBatteryUI() {
+    if (objects.main == nullptr || battery_panel_ != nullptr) {
+        return;
+    }
+
+    battery_panel_ = lv_obj_create(objects.main);
+    lv_obj_set_size(battery_panel_, 66, 32);
+    lv_obj_align(battery_panel_, LV_ALIGN_TOP_RIGHT, -120, 52);
+    lv_obj_clear_flag(battery_panel_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(battery_panel_, 0, 0);
+    lv_obj_set_style_border_width(battery_panel_, 0, 0);
+    lv_obj_set_style_bg_opa(battery_panel_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(battery_panel_, 0, 0);
+
+    battery_gauge_ = lv_obj_create(battery_panel_);
+    lv_obj_set_size(battery_gauge_, 63, 28);
+    lv_obj_align(battery_gauge_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(battery_gauge_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_border_width(battery_gauge_, 0, 0);
+    lv_obj_set_style_bg_opa(battery_gauge_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(battery_gauge_, 0, 0);
+
+    battery_body_ = lv_obj_create(battery_gauge_);
+    lv_obj_set_size(battery_body_, 56, 26);
+    lv_obj_set_pos(battery_body_, 0, 1);
+    lv_obj_clear_flag(battery_body_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(battery_body_, 4, 0);
+    lv_obj_set_style_border_width(battery_body_, 2, 0);
+    lv_obj_set_style_border_color(battery_body_, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(battery_body_, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(battery_body_, LV_OPA_40, 0);
+    lv_obj_set_style_pad_all(battery_body_, 0, 0);
+
+    battery_fill_ = lv_obj_create(battery_body_);
+    lv_obj_set_size(battery_fill_, 2, 3);
+    lv_obj_align(battery_fill_, LV_ALIGN_BOTTOM_LEFT, 2, -2);
+    lv_obj_clear_flag(battery_fill_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(battery_fill_, 1, 0);
+    lv_obj_set_style_border_width(battery_fill_, 0, 0);
+    lv_obj_set_style_bg_color(battery_fill_, lv_color_white(), 0);
+    lv_obj_set_style_pad_all(battery_fill_, 0, 0);
+
+    battery_tip_ = lv_obj_create(battery_gauge_);
+    lv_obj_set_size(battery_tip_, 5, 12);
+    lv_obj_align(battery_tip_, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_clear_flag(battery_tip_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(battery_tip_, 2, 0);
+    lv_obj_set_style_border_width(battery_tip_, 0, 0);
+    lv_obj_set_style_bg_color(battery_tip_, lv_color_white(), 0);
+    lv_obj_set_style_pad_all(battery_tip_, 0, 0);
+
+    battery_percent_label_ = lv_label_create(battery_body_);
+    lv_obj_set_style_text_font(battery_percent_label_, LV_FONT_DEFAULT, 0);
+    lv_obj_set_style_text_color(battery_percent_label_, lv_color_white(), 0);
+    lv_obj_align(battery_percent_label_, LV_ALIGN_CENTER, 0, -2);
+    lv_label_set_text(battery_percent_label_, "--%");
+
+    lv_obj_add_flag(battery_panel_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(battery_panel_);
+}
+
+void EezuiDisplayAdapter::UpdateStatusBar(bool update_all) {
+    const int64_t now_us = esp_timer_get_time();
+    constexpr int64_t kBatteryRefreshIntervalUs = 5 * 1000000LL;
+    constexpr int64_t kBatteryStartupVisibleUs = 30 * 1000000LL;
+    if (!update_all && last_battery_update_us_ > 0 &&
+        now_us - last_battery_update_us_ < kBatteryRefreshIntervalUs) {
+        return;
+    }
+    last_battery_update_us_ = now_us;
+
+    int level = 0;
+    bool charging = false;
+    bool discharging = false;
+    const bool available =
+        Board::GetInstance().GetBatteryLevel(level, charging, discharging);
+
+    if (!SafeLVGLLock(50)) {
+        return;
+    }
+
+    if (battery_panel_ == nullptr || battery_body_ == nullptr ||
+        battery_fill_ == nullptr || battery_tip_ == nullptr ||
+        battery_percent_label_ == nullptr) {
+        SafeLVGLUnlock();
+        return;
+    }
+
+    if (!available) {
+        lv_obj_add_flag(battery_panel_, LV_OBJ_FLAG_HIDDEN);
+        SafeLVGLUnlock();
+        return;
+    }
+
+    if (level < 0) {
+        level = 0;
+    } else if (level > 100) {
+        level = 100;
+    }
+
+    const bool low_battery = discharging && level <= 20;
+    const bool should_show = now_us < kBatteryStartupVisibleUs || low_battery;
+    if (!should_show) {
+        lv_obj_add_flag(battery_panel_, LV_OBJ_FLAG_HIDDEN);
+        last_battery_level_ = level;
+        last_battery_charging_ = charging;
+        last_battery_low_ = low_battery;
+        SafeLVGLUnlock();
+        return;
+    }
+
+    const bool changed =
+        update_all || level != last_battery_level_ ||
+        charging != last_battery_charging_ ||
+        low_battery != last_battery_low_ ||
+        lv_obj_has_flag(battery_panel_, LV_OBJ_FLAG_HIDDEN);
+    if (changed) {
+        lv_color_t color = lv_color_white();
+        if (charging) {
+            color = lv_color_hex(0x58D68D);
+        } else if (low_battery) {
+            color = lv_color_hex(0xFF5A5F);
+        }
+
+        char level_text[8];
+        snprintf(level_text, sizeof(level_text), charging ? "+%d%%" : "%d%%", level);
+        const int fill_width = std::max(2, (48 * level) / 100);
+        lv_obj_set_width(battery_fill_, fill_width);
+        lv_label_set_text(battery_percent_label_, level_text);
+        lv_obj_set_style_border_color(battery_body_, color, 0);
+        lv_obj_set_style_bg_color(battery_fill_, color, 0);
+        lv_obj_set_style_bg_color(battery_tip_, color, 0);
+        lv_obj_set_style_text_color(battery_percent_label_, color, 0);
+        lv_obj_clear_flag(battery_panel_, LV_OBJ_FLAG_HIDDEN);
+        last_battery_level_ = level;
+        last_battery_charging_ = charging;
+        last_battery_low_ = low_battery;
+    }
+    lv_obj_move_foreground(battery_panel_);
+    SafeLVGLUnlock();
 }
 
 void EezuiDisplayAdapter::StartTypewriterEffect(const std::string& text) {
@@ -720,7 +855,7 @@ bool EezuiDisplayAdapter::InitEmotionSystem() {
     // 简化的视频播放器配置（与LcdDisplay一致，基于范例更新）
     emotion_video_config_t config = {
         .output_format = ESP_VIDEO_CODEC_PIXEL_FMT_RGB565_LE,
-        .frame_rate = 30,
+        .frame_rate = 20,
         .canvas_width = static_cast<uint32_t>(width_),        // 修复narrowing conversion
         .canvas_height = static_cast<uint32_t>(height_)       // 修复narrowing conversion
     };
@@ -822,6 +957,9 @@ esp_err_t EezuiDisplayAdapter::PlayMjpegEmotion(const char* emotion_name) {
             // 确保对话框在最顶层
             if (dialogue_box_) {
                 lv_obj_move_foreground(dialogue_box_);
+            }
+            if (battery_panel_) {
+                lv_obj_move_foreground(battery_panel_);
             }
             
             SafeLVGLUnlock();
@@ -985,6 +1123,9 @@ void EezuiDisplayAdapter::EnsureUILayerOrder() {
         lv_obj_move_foreground(dialogue_box_);
         lv_obj_clear_flag(dialogue_box_, LV_OBJ_FLAG_HIDDEN);
     }
+    if (battery_panel_) {
+        lv_obj_move_foreground(battery_panel_);
+    }
 
     SafeLVGLUnlock();
 }
@@ -1043,32 +1184,24 @@ void EezuiDisplayAdapter::EmotionVideoFrameCallback(emotion_video_handle_t handl
         return;
     }
     
-    // 优化内存复制：使用更高效的方法
-    if (copy_width == (uint32_t)canvas_width && copy_height == (uint32_t)canvas_height) {
-        // 尺寸完全匹配，使用DMA友好的内存复制
-        memcpy(canvas_buf, frame_data, expected_size);
-    } else {
-        // 按行复制（处理尺寸不匹配的情况），优化内存访问模式
-        uint8_t* dst_ptr = canvas_buf;
-        uint8_t* src_ptr = frame_data;
-        const uint32_t dst_stride = canvas_width * 2;
-        const uint32_t src_stride = copy_width * 2;
-        
-        for (uint32_t y = 0; y < copy_height; y++) {
-            memcpy(dst_ptr, src_ptr, src_stride);
-            dst_ptr += dst_stride;
-            src_ptr += src_stride;
-        }
+    // 避免一次 460800 字节的 PSRAM 到 PSRAM 长突发复制。逐行复制可缩短
+    // CPU 连续占用 PSRAM 总线的时间，并正确处理源图比画布宽的情况。
+    uint8_t* dst_ptr = canvas_buf;
+    const uint8_t* src_ptr = frame_data;
+    const uint32_t dst_stride = (uint32_t)canvas_width * 2;
+    const uint32_t src_stride = width * 2;
+    const uint32_t row_bytes = copy_width * 2;
+
+    for (uint32_t y = 0; y < copy_height; y++) {
+        memcpy(dst_ptr, src_ptr, row_bytes);
+        dst_ptr += dst_stride;
+        src_ptr += src_stride;
     }
     
     // 标记画布需要重绘
     lv_obj_invalidate(adapter->video_canvas_);
     
-    // 确保对话框在最前景
-    if (adapter->dialogue_box_) {
-        lv_obj_move_foreground(adapter->dialogue_box_);
-    }
-    
+
     adapter->SafeLVGLUnlock();
 }
 
@@ -1120,4 +1253,3 @@ void EezuiDisplayAdapter::EmotionVideoEventCallback(emotion_video_event_t event,
             break;
     }
 }
-

@@ -86,11 +86,11 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     afe_data_ = afe_iface_->create_from_config(afe_config);
     BootTraceMarkHeap("AFE_CREATE_OK");
 
-    xTaskCreate([](void* arg) {
+    xTaskCreatePinnedToCore([](void* arg) {
         auto this_ = (AfeWakeWord*)arg;
         this_->AudioDetectionTask();
         vTaskDelete(NULL);
-    }, "audio_detection", 4096, this, 3, nullptr);
+    }, "audio_detection", 4096, this, 3, nullptr, 0);
 
     return true;
 }

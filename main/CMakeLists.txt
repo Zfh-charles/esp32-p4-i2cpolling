@@ -39,11 +39,6 @@ set(SOURCES "audio/audio_codec.cc"
 
 set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "protocols")
 
-if(CONFIG_USE_ALARM)
-    list(APPEND SOURCES "alarm/general_timer.cc")
-    list(APPEND INCLUDE_DIRS "alarm")
-endif()
-
 set(REMINDER_EMBED_FILES "")
 if(CONFIG_USE_REMINDER_POLL)
     list(APPEND SOURCES "reminder/reminder_poller.cc" "reminder/reminder_diag.cc" "reminder/reminder_lifecycle_trace.cc" "reminder/reminder_hw_trace.cc" "reminder/boot_trace.cc")
@@ -555,7 +550,6 @@ endif()
 file(GLOB BOARD_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/*.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/*.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/ui/*.c
 )
 list(APPEND SOURCES ${BOARD_SOURCES})
 

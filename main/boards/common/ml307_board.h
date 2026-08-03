@@ -12,11 +12,15 @@ protected:
     gpio_num_t tx_pin_;
     gpio_num_t rx_pin_;
     gpio_num_t dtr_pin_;
+    int baud_rate_;
+
+    void PrepareModemUartPins();
 
     virtual std::string GetBoardJson() override;
 
 public:
-    Ml307Board(gpio_num_t tx_pin, gpio_num_t rx_pin, gpio_num_t dtr_pin = GPIO_NUM_NC);
+    Ml307Board(gpio_num_t tx_pin, gpio_num_t rx_pin, gpio_num_t dtr_pin = GPIO_NUM_NC,
+               int baud_rate = 921600);
     virtual std::string GetBoardType() override;
     virtual void StartNetwork() override;
     virtual NetworkInterface* GetNetwork() override;

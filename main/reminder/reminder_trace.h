@@ -58,7 +58,7 @@ inline const char* ReminderTraceDeviceStateName(DeviceState state) {
             return "activating";
         case kDeviceStateAudioTesting:
             return "audio_testing";
-#if CONFIG_USE_ALARM
+#if CONFIG_USE_REMINDER_POLL
         case kDeviceStateAlarm:
             return "alarm";
 #endif

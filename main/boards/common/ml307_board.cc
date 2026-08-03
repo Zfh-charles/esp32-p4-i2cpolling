@@ -8,13 +8,32 @@
 #endif
 
 #include <esp_log.h>
+#include <esp_system.h>
 #include <esp_timer.h>
+#include <driver/gpio.h>
 #include <font_awesome.h>
 #include <opus_encoder.h>
 
 static const char *TAG = "Ml307Board";
 
-Ml307Board::Ml307Board(gpio_num_t tx_pin, gpio_num_t rx_pin, gpio_num_t dtr_pin) : tx_pin_(tx_pin), rx_pin_(rx_pin), dtr_pin_(dtr_pin) {
+Ml307Board::Ml307Board(gpio_num_t tx_pin, gpio_num_t rx_pin, gpio_num_t dtr_pin,
+                       int baud_rate)
+    : tx_pin_(tx_pin), rx_pin_(rx_pin), dtr_pin_(dtr_pin), baud_rate_(baud_rate) {
+    PrepareModemUartPins();
+}
+
+void Ml307Board::PrepareModemUartPins() {
+    if (tx_pin_ != GPIO_NUM_NC) {
+        gpio_reset_pin(tx_pin_);
+        gpio_set_level(tx_pin_, 1);
+        gpio_set_direction(tx_pin_, GPIO_MODE_OUTPUT);
+        gpio_set_pull_mode(tx_pin_, GPIO_FLOATING);
+    }
+    if (rx_pin_ != GPIO_NUM_NC) {
+        gpio_reset_pin(rx_pin_);
+        gpio_set_direction(rx_pin_, GPIO_MODE_INPUT);
+        gpio_set_pull_mode(rx_pin_, GPIO_FLOATING);
+    }
 }
 
 std::string Ml307Board::GetBoardType() {
@@ -26,10 +45,35 @@ void Ml307Board::StartNetwork() {
     auto display = Board::GetInstance().GetDisplay();
     display->SetStatus(Lang::Strings::DETECTING_MODULE);
 
+    const esp_reset_reason_t reset_reason = esp_reset_reason();
+    const bool cold_start = reset_reason == ESP_RST_POWERON ||
+                            reset_reason == ESP_RST_BROWNOUT ||
+                            reset_reason == ESP_RST_UNKNOWN;
+    ESP_LOGI(TAG, "Modem startup: reset_reason=%d desired_baud=%d cold=%d",
+             static_cast<int>(reset_reason), baud_rate_, cold_start ? 1 : 0);
+    constexpr int64_t kColdBootUartReadyUs = 12 * 1000000LL;
+    if (cold_start) {
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us < kColdBootUartReadyUs) {
+            const unsigned wait_ms = static_cast<unsigned>(
+                (kColdBootUartReadyUs - now_us + 999) / 1000);
+            ESP_LOGW(TAG, "Cold boot: keep modem UART quiet for %u ms", wait_ms);
+            vTaskDelay(pdMS_TO_TICKS(wait_ms));
+        }
+    }
+
+    unsigned detect_failures = 0;
     while (true) {
-        modem_ = AtModem::Detect(tx_pin_, rx_pin_, dtr_pin_, 921600);
+        modem_ = AtModem::Detect(tx_pin_, rx_pin_, dtr_pin_, baud_rate_);
         if (modem_ != nullptr) {
             break;
+        }
+        ++detect_failures;
+        PrepareModemUartPins();
+        if (cold_start && detect_failures == 1) {
+            ESP_LOGE(TAG, "Cold-boot modem handshake failed; restarting P4 once");
+            vTaskDelay(pdMS_TO_TICKS(200));
+            esp_restart();
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

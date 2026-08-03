@@ -218,6 +218,9 @@ public:
         mcp_server.AddTool("self.battery.get_level", 
             "获取电池电量百分比(0-100%)",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                if (!ep_battery_level_.is_ready()) {
+                    return "battery monitor unavailable";
+                }
                 int level = ep_battery_level_.getBatterySOC();
                 ESP_LOGI(TAG, "获取电池电量: %d%%", level);
                 return level;
@@ -227,6 +230,9 @@ public:
         mcp_server.AddTool("self.battery.get_voltage", 
             "获取电池电压(mV)",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                if (!ep_battery_level_.is_ready()) {
+                    return "battery monitor unavailable";
+                }
                 int voltage = ep_battery_level_.getVoltage();
                 ESP_LOGI(TAG, "获取电池电压: %dmV", voltage);
                 return voltage;
@@ -236,6 +242,9 @@ public:
         mcp_server.AddTool("self.battery.get_temperature", 
             "获取电池温度(°C)",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                if (!ep_battery_level_.is_ready()) {
+                    return "battery monitor unavailable";
+                }
                 int temp = ep_battery_level_.getTemperature();
                 ESP_LOGI(TAG, "获取电池温度: %d°C", temp);
                 return temp;
@@ -244,7 +253,7 @@ public:
       
     }
 
-    EpChatP4ML307() : Ml307Board(Module_4G_TX_PIN, Module_4G_RX_PIN, ML307_DTR_PIN),
+    EpChatP4ML307() : Ml307Board(Module_4G_TX_PIN, Module_4G_RX_PIN, ML307_DTR_PIN, 460800),
         i2c_bus_(nullptr),
         boot_button_(BOOT_BUTTON_GPIO) {
         // 1. 先初始化共享 I2C 总线
@@ -286,6 +295,25 @@ public:
         return display_;
     }
 
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        if (!ep_battery_level_.is_ready()) {
+            level = 0;
+            charging = false;
+            discharging = false;
+            return false;
+        }
+
+        level = static_cast<int>(ep_battery_level_.getBatterySOC());
+        if (level < 0) {
+            level = 0;
+        } else if (level > 100) {
+            level = 100;
+        }
+        charging = ep_battery_level_.is_charging();
+        discharging = ep_battery_level_.is_discharging();
+        return true;
+    }
+    
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;

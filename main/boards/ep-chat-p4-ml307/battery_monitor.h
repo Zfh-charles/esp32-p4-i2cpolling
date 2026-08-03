@@ -13,6 +13,7 @@
 #include "driver/i2c_master.h"
 
 #ifdef __cplusplus
+#include <atomic>
 #include <functional>
 #include <cstdint>
 
@@ -83,7 +84,17 @@ public:
      */
     bool is_charging() const
     {
-        return battery_status.DSG == 0;
+        return charging_.load(std::memory_order_relaxed);
+    }
+
+    bool is_discharging() const
+    {
+        return !charging_.load(std::memory_order_relaxed);
+    }
+
+    bool is_ready() const
+    {
+        return bq27220Handle != nullptr;
     }
 
     /**
@@ -122,6 +133,8 @@ private:
     bq27220_handle_t bq27220Handle;
     TimerHandle_t timer;
     battery_status_t battery_status;
+    std::atomic<uint8_t> battery_soc_{0};
+    std::atomic<bool> charging_{false};
     static void monitor_period(TimerHandle_t xTimer);
     void check_shutdown(void);
     std::function<void(const battery_status_t &)> status_cb;

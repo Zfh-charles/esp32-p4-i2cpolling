@@ -37,11 +37,13 @@
 
 #define OPUS_FRAME_DURATION_MS 60
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
-#define MAX_PLAYBACK_TASKS_IN_QUEUE 2
+#define MAX_PLAYBACK_TASKS_IN_QUEUE 6
 #define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
 #define MAX_TIMESTAMPS_IN_QUEUE 3
+#define PROACTIVE_PLAYBACK_PREBUFFER_FRAMES 4
+#define PLAYBACK_PREBUFFER_TIMEOUT_MS 420
 
 #define AUDIO_POWER_TIMEOUT_MS 15000
 #define AUDIO_POWER_CHECK_INTERVAL_MS 1000
@@ -135,6 +137,8 @@ public:
 
     void PrepareSpeakerPlayback();
     void EndSpeakerPlayback();
+    void BeginPlaybackPrebuffer(size_t target_frames = PROACTIVE_PLAYBACK_PREBUFFER_FRAMES);
+    void ReleasePlaybackPrebuffer();
     void DrainLocalPlayback(int timeout_ms = 2000);
     bool IsSpeakerPlaybackHeld() const { return speaker_playback_hold_; }
     void RestoreCaptureForWakeWord();
@@ -183,6 +187,12 @@ private:
     bool capture_power_hold_ = false;
     AudioRoute audio_route_ = AudioRoute::Capture;
     bool restore_capture_after_local_playback_ = false;
+    size_t playback_prebuffer_target_ = 0;
+    bool playback_prebuffer_filling_ = false;
+    bool playback_prebuffer_initial_fill_ = false;
+    bool playback_prebuffer_deadline_started_ = false;
+    uint32_t playback_rebuffer_count_ = 0;
+    std::chrono::steady_clock::time_point playback_prebuffer_deadline_;
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;

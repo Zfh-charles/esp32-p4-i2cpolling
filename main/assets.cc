@@ -55,32 +55,44 @@ bool Assets::InitializePartition() {
         return false;
     }
 
-    int free_pages = spi_flash_mmap_get_free_pages(SPI_FLASH_MMAP_DATA);
-    uint32_t storage_size = free_pages * 64 * 1024;
-    ESP_LOGI(TAG, "The storage free size is %ld KB", storage_size / 1024);
-    ESP_LOGI(TAG, "The partition size is %ld KB", partition_->size / 1024);
-    if (storage_size < partition_->size) {
-        ESP_LOGE(TAG, "The free size %ld KB is less than assets partition required %ld KB", storage_size / 1024, partition_->size / 1024);
+    uint32_t header[3] = {};
+    esp_err_t err = esp_partition_read(partition_, 0, header, sizeof(header));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read assets header: %s", esp_err_to_name(err));
         return false;
     }
 
-    esp_err_t err = esp_partition_mmap(partition_, 0, partition_->size, ESP_PARTITION_MMAP_DATA, (const void**)&mmap_root_, &mmap_handle_);
+    const uint32_t stored_files = header[0];
+    const uint32_t stored_chksum = header[1];
+    const uint32_t stored_len = header[2];
+    if (stored_len > partition_->size - sizeof(header) ||
+        stored_files > stored_len / sizeof(mmap_assets_table)) {
+        ESP_LOGE(TAG, "Invalid assets header: files=%lu len=0x%lx partition=0x%lx",
+                 stored_files, stored_len, partition_->size);
+        return false;
+    }
+
+    const size_t map_size = sizeof(header) + stored_len;
+    int free_pages = spi_flash_mmap_get_free_pages(SPI_FLASH_MMAP_DATA);
+    uint32_t storage_size = free_pages * 64 * 1024;
+    ESP_LOGI(TAG, "The storage free size is %ld KB", storage_size / 1024);
+    ESP_LOGI(TAG, "The assets data size is %u KB (partition %ld KB)",
+             static_cast<unsigned>((map_size + 1023) / 1024), partition_->size / 1024);
+    if (storage_size < map_size) {
+        ESP_LOGE(TAG, "The free size %ld KB is less than assets data required %u KB",
+                 storage_size / 1024,
+                 static_cast<unsigned>((map_size + 1023) / 1024));
+        return false;
+    }
+
+    err = esp_partition_mmap(partition_, 0, map_size, ESP_PARTITION_MMAP_DATA,
+                             (const void**)&mmap_root_, &mmap_handle_);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to mmap assets partition: %s", esp_err_to_name(err));
         return false;
     }
 
     partition_valid_ = true;
-
-    uint32_t stored_files = *(uint32_t*)(mmap_root_ + 0);
-    uint32_t stored_chksum = *(uint32_t*)(mmap_root_ + 4);
-    uint32_t stored_len = *(uint32_t*)(mmap_root_ + 8);
-
-    if (stored_len > partition_->size - 12) {
-        ESP_LOGD(TAG, "The stored_len (0x%lx) is greater than the partition size (0x%lx) - 12", stored_len, partition_->size);
-        return false;
-    }
-
     auto start_time = esp_timer_get_time();
     uint32_t calculated_checksum = CalculateChecksum(mmap_root_ + 12, stored_len);
     auto end_time = esp_timer_get_time();

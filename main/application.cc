@@ -42,7 +42,7 @@ static const char* const STATE_STRINGS[] = {
     "upgrading",
     "activating",
     "audio_testing",
-#if CONFIG_USE_ALARM
+#if CONFIG_USE_REMINDER_POLL
     "alarm",
 #endif
     "fatal_error",
@@ -87,17 +87,17 @@ Application::Application() {
     };
     esp_timer_create(&proactive_reminder_timer_args, &proactive_reminder_timer_handle_);
 
-    esp_timer_create_args_t proactive_feedback_timer_args = {
+    esp_timer_create_args_t proactive_alarm_timer_args = {
         .callback = [](void* arg) {
             auto* app = static_cast<Application*>(arg);
-            app->Schedule([app]() { app->FinishProactiveReminder(); });
+            app->Schedule([app]() { app->StopProactiveAlarm("timeout"); });
         },
         .arg = this,
         .dispatch_method = ESP_TIMER_TASK,
-        .name = "reminder_feedback",
+        .name = "reminder_alarm_timeout",
         .skip_unhandled_events = true
     };
-    esp_timer_create(&proactive_feedback_timer_args, &proactive_feedback_timer_handle_);
+    esp_timer_create(&proactive_alarm_timer_args, &proactive_alarm_timer_handle_);
 #endif
 }
 
@@ -111,9 +111,9 @@ Application::~Application() {
         esp_timer_stop(proactive_reminder_timer_handle_);
         esp_timer_delete(proactive_reminder_timer_handle_);
     }
-    if (proactive_feedback_timer_handle_ != nullptr) {
-        esp_timer_stop(proactive_feedback_timer_handle_);
-        esp_timer_delete(proactive_feedback_timer_handle_);
+    if (proactive_alarm_timer_handle_ != nullptr) {
+        esp_timer_stop(proactive_alarm_timer_handle_);
+        esp_timer_delete(proactive_alarm_timer_handle_);
     }
 #endif
     vEventGroupDelete(event_group_);
@@ -285,7 +285,8 @@ void Application::Alert(const char* status, const char* message, const char* emo
         PlaySound(sound);
     }
 #if CONFIG_USE_REMINDER_POLL
-    if (!pending_reminder_ack_id_.empty() && status != nullptr &&
+    if (!pending_reminder_ack_id_.empty() && !IsReminderAlarmRinging() &&
+        !proactive_alarm_pending_start_ && status != nullptr &&
         strcmp(status, Lang::Strings::ERROR) == 0) {
         Schedule([this]() { CancelPendingReminderAck(); });
     }
@@ -316,11 +317,9 @@ void Application::ToggleChatState() {
         return;
     }
 
-    #if CONFIG_USE_ALARM
-    if (device_state_ == kDeviceStateAlarm) {
-        general_timer_->ClearRinging();
-        // ESP_LOGI(TAG, "Alarm cleared, Toggle to idle");
-        SetDeviceState(kDeviceStateIdle);
+#if CONFIG_USE_REMINDER_POLL
+    if (IsReminderAlarmRinging()) {
+        RequestStopReminderAlarm("toggle");
         return;
     }
 #endif
@@ -333,12 +332,6 @@ void Application::ToggleChatState() {
 #if CONFIG_USE_REMINDER_POLL
     if (session_kind_ == SessionKind::ProactiveReminder) {
         ESP_LOGW(TAG, "Ignore toggle during proactive reminder");
-        return;
-    }
-#endif
-#if CONFIG_USE_ALARM
-    if (IsAlarmRinging() && device_state_ != kDeviceStateAlarm) {
-        ESP_LOGW(TAG, "Ignore toggle, alarm pending");
         return;
     }
 #endif
@@ -381,14 +374,12 @@ void Application::StartListening() {
     }
 
 #if CONFIG_USE_REMINDER_POLL
-    if (session_kind_ == SessionKind::ProactiveReminder) {
-        ESP_LOGW(TAG, "Ignore start listening during proactive reminder");
+    if (IsReminderAlarmRinging()) {
+        RequestStopReminderAlarm("start_listening");
         return;
     }
-#endif
-#if CONFIG_USE_ALARM
-    if (device_state_ == kDeviceStateAlarm || IsAlarmRinging()) {
-        ESP_LOGW(TAG, "Ignore start listening during alarm");
+    if (session_kind_ == SessionKind::ProactiveReminder) {
+        ESP_LOGW(TAG, "Ignore start listening during proactive reminder");
         return;
     }
 #endif
@@ -540,6 +531,7 @@ void Application::Start() {
         } else if (session_kind_ == SessionKind::ProactiveReminder || audio_service_.IsSpeakerPlaybackHeld() ||
                    audio_service_.GetAudioRoute() == AudioRoute::Playback) {
             if (session_kind_ == SessionKind::ProactiveReminder &&
+                !IsReminderAlarmRinging() &&
                 device_state_ != kDeviceStateSpeaking) {
                 audio_service_.PrepareSpeakerPlayback();
                 Schedule([this]() {
@@ -580,11 +572,26 @@ void Application::Start() {
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveMode(true);
         Schedule([this]() {
+            bool keep_reminder_alarm = false;
 #if CONFIG_USE_REMINDER_POLL
             if (session_kind_ == SessionKind::ProactiveReminder) {
-                if (!pending_reminder_ack_id_.empty() && proactive_reminder_tts_started_) {
-                    StopProactiveFeedbackTimer();
-                    FinishProactiveReminder();
+                audio_service_.ReleasePlaybackPrebuffer();
+                if (IsReminderAlarmRinging() && proactive_alarm_tts_playing_) {
+                    proactive_alarm_tts_playing_ = false;
+                    QueueProactiveAlarmAfterSpeech();
+                }
+                if (IsReminderAlarmRinging() || proactive_alarm_pending_start_) {
+                    keep_reminder_alarm = true;
+                    ReminderTraceLog("channel_closed_alarm_continues");
+                } else if (!pending_reminder_ack_id_.empty() &&
+                           proactive_reminder_tts_started_ && proactive_audio_packets_ > 0) {
+                    if (proactive_alarm_mode_ == ReminderAlarmMode::kRingRepeat) {
+                        QueueProactiveAlarmAfterSpeech();
+                        keep_reminder_alarm = true;
+                    } else {
+                        ReminderTraceLog("proactive_no_alarm_complete", pending_reminder_ack_id_.c_str());
+                        CompletePendingReminderAck(true);
+                    }
                 } else if (!pending_reminder_ack_id_.empty()) {
                     ReminderLcMark(ReminderLcOwner::Proactive, ReminderLcPhase::ChannelClose, 0, "early_close");
                     CancelPendingReminderAck();
@@ -599,12 +606,14 @@ void Application::Start() {
 #endif
             ReminderTraceLog("channel_closed");
             auto display = Board::GetInstance().GetDisplay();
-            if (!suppress_display_clear_on_channel_close_) {
+            if (!keep_reminder_alarm && !suppress_display_clear_on_channel_close_) {
                 display->SetChatMessage("system", "");
             }
             suppress_display_clear_on_channel_close_ = false;
 #if CONFIG_USE_REMINDER_POLL
-            if (pending_reminder_after_channel_close_) {
+            if (keep_reminder_alarm) {
+                // The cloud speech channel is no longer needed; the local alarm owns the reminder now.
+            } else if (pending_reminder_after_channel_close_) {
                 pending_reminder_after_channel_close_ = false;
                 ReminderDeliverPayload payload = pending_reminder_payload_;
                 Schedule([this, payload]() { RunReminderDelivery(payload); });
@@ -622,11 +631,11 @@ void Application::Start() {
                 }
             }
 #endif
-            if (device_state_ != kDeviceStateIdle) {
+            if (!keep_reminder_alarm && device_state_ != kDeviceStateIdle) {
                 SetDeviceState(kDeviceStateIdle);
             }
 #if CONFIG_USE_REMINDER_POLL
-            else if (session_kind_ == SessionKind::None) {
+            else if (!keep_reminder_alarm && session_kind_ == SessionKind::None) {
                 RunReminderDiagnostics("channel_closed_idle", true);
             }
 #endif
@@ -642,6 +651,10 @@ void Application::Start() {
                     aborted_ = false;
 #if CONFIG_USE_REMINDER_POLL
                     if (session_kind_ == SessionKind::ProactiveReminder) {
+                        proactive_alarm_tts_playing_ = true;
+                        if (IsReminderAlarmRinging()) {
+                            proactive_alarm_pending_since_us_ = 0;
+                        }
                         audio_service_.PrepareSpeakerPlayback();
                     }
                     if (!pending_reminder_ack_id_.empty()) {
@@ -667,12 +680,14 @@ void Application::Start() {
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
+                    bool keep_proactive_alarm = false;
 #if CONFIG_USE_REMINDER_POLL
                     const bool proactive = session_kind_ == SessionKind::ProactiveReminder;
                     if (proactive) {
-                        audio_service_.EndSpeakerPlayback();
-                    }
-                    if (proactive) {
+                        // A short final sentence may contain fewer than the target
+                        // number of frames. Release it before drain/ACK handling.
+                        audio_service_.ReleasePlaybackPrebuffer();
+                        proactive_alarm_tts_playing_ = false;
                         ReminderTraceLog("proactive_tts_stop", pending_reminder_ack_id_.c_str());
                         ESP_LOGI(TAG, "Proactive TTS stop id=%s audio_packets=%d",
                                  pending_reminder_ack_id_.c_str(), proactive_audio_packets_);
@@ -682,27 +697,40 @@ void Application::Start() {
                         ReminderUiTraceTts("json_stop",
                                            proactive_audio_packets_ > 0 ? "ok" : "no_audio", 1);
                         if (proactive_audio_packets_ == 0) {
+                            if (IsReminderAlarmRinging()) {
+                                QueueProactiveAlarmAfterSpeech();
+                                keep_proactive_alarm = true;
+                            } else {
                             ESP_LOGW(TAG, "Proactive reminder %s: TTS stop with 0 audio packets",
                                      pending_reminder_ack_id_.c_str());
                             ReminderTraceLog("proactive_tts_no_audio", pending_reminder_ack_id_.c_str());
                             proactive_reminder_tts_started_ = false;
                             CancelPendingReminderAck();
-                        } else
-#if defined(CONFIG_REMINDER_FEEDBACK_SEC) && CONFIG_REMINDER_FEEDBACK_SEC > 0
-                        {
-                            StartProactiveFeedbackWindow();
+                            }
+                        } else if (proactive_alarm_mode_ == ReminderAlarmMode::kRingRepeat) {
+                            QueueProactiveAlarmAfterSpeech();
+                            keep_proactive_alarm = true;
+                        } else {
+                            ReminderTraceLog("proactive_no_alarm_complete",
+                                             pending_reminder_ack_id_.c_str());
+                            CompletePendingReminderAck(true);
                         }
-#else
-                        {
-                            FinishProactiveReminder();
-                        }
-#endif
                     } else if (session_kind_ == SessionKind::User) {
                         ReminderLcMark(ReminderLcOwner::User, ReminderLcPhase::TtsJsonStop, 1, nullptr);
                         ReminderUiTraceTts("json_stop", "user", 1);
                     }
 #endif
-                    if (device_state_ == kDeviceStateSpeaking) {
+#if CONFIG_USE_REMINDER_POLL
+                    if (!keep_proactive_alarm && proactive &&
+                        device_state_ == kDeviceStateSpeaking) {
+                        // UDP audio is queued independently from MQTT tts:stop.
+                        // Keep the speaker route until CompletePendingReminderAck()
+                        // observes an empty local queue; switching to Listening here
+                        // would ResetDecoder() and cut the buffered tail.
+                        ReminderTraceLog("proactive_wait_local_audio_drain");
+                    } else
+#endif
+                    if (!keep_proactive_alarm && device_state_ == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
@@ -804,9 +832,6 @@ void Application::Start() {
     bool protocol_started = protocol_->Start();
 
     SystemInfo::PrintHeapStats();
-    #if CONFIG_USE_ALARM
-    general_timer_ = new GeneralTimer();
-#endif
 #if CONFIG_USE_REMINDER_POLL
     reminder_poller_ = new ReminderPoller();
 #if CONFIG_REMINDER_MQTT_WAKE
@@ -847,9 +872,6 @@ void Application::MainEventLoop() {
             MAIN_EVENT_WAKE_WORD_DETECTED |
             MAIN_EVENT_VAD_CHANGE |
             MAIN_EVENT_CLOCK_TICK |
-            #if CONFIG_USE_ALARM
-            MAIN_EVENT_ALARM |
-#endif
             MAIN_EVENT_ERROR, pdTRUE, pdFALSE, portMAX_DELAY);
 
         if (bits & MAIN_EVENT_ERROR) {
@@ -891,6 +913,7 @@ void Application::MainEventLoop() {
             display->UpdateStatusBar();
 #if CONFIG_USE_REMINDER_POLL
             TryStartDeferredReminderNet();
+            ServiceProactiveAlarm();
 #endif
         
             // Print the debug info every 10 seconds
@@ -906,69 +929,16 @@ void Application::MainEventLoop() {
             }
 #endif
         }
-        #if CONFIG_USE_ALARM
-        if(bits & MAIN_EVENT_ALARM){
-            // 闹钟来了
-            
-            static bool to_clear_alarm_event = false;
-            if(general_timer_->isRinging()){
-                
-                if(device_state_ != kDeviceStateAlarm){
-#if CONFIG_USE_REMINDER_POLL
-                    ReminderLcBegin(ReminderLcOwner::Alarm, general_timer_->GetAlarmMessage().c_str());
-                    if (session_kind_ == SessionKind::ProactiveReminder) {
-                        ESP_LOGI(TAG, "Alarm preempts proactive reminder");
-                        ReminderLcMark(ReminderLcOwner::Alarm, ReminderLcPhase::Preempt, 1, "proactive");
-                        CancelPendingReminderAck();
-                    }
-                    ReminderLcMark(ReminderLcOwner::Alarm, ReminderLcPhase::RingStart, 1, nullptr);
-#endif
-                    if (device_state_ == kDeviceStateActivating) {
-                        Reboot();
-                        return;
-                    } else if (device_state_ == kDeviceStateSpeaking) {
-                        ESP_LOGI(TAG, "Alarm ring, abort speaking");
-                        AbortSpeaking(kAbortReasonNone);
-                        protocol_->CloseAudioChannel();
-                        aborted_ = false; // 不停止本地的播放
-                    } else if (device_state_ == kDeviceStateListening) {
-                        ESP_LOGI(TAG, "Alarm ring, close audio channel");
-                        if (protocol_) {
-                            protocol_->CloseAudioChannel();
-                        }
-                    }
-                    ESP_LOGI(TAG, "Alarm ring, begging status %d", device_state_);
-                    SetDeviceState(kDeviceStateAlarm); //强制设置为播放模式
-                    auto display = Board::GetInstance().GetDisplay();
-                    display->SetChatMessage("system", general_timer_->GetAlarmMessage().c_str());
-                    display->SetEmotion("neutral");
-#if CONFIG_USE_REMINDER_POLL
-                    ReminderLcDisplay(ReminderLcOwner::Alarm, "system",
-                                      general_timer_->GetAlarmMessage().c_str(), 1);
-                    ReminderLcEmotion(ReminderLcOwner::Alarm, "neutral", 1);
-#endif
-                }
-                if(audio_service_.IsIdle()){
-                    PlaySound(Lang::Sounds::OGG_ALARM_RING);
-                }
-                SetAlarmEvent();
-                to_clear_alarm_event = true;
-            }else{
-                if(to_clear_alarm_event){
-#if CONFIG_USE_REMINDER_POLL
-                    ReminderLcMark(ReminderLcOwner::Alarm, ReminderLcPhase::RingStop, 1, nullptr);
-                    ReminderLcSummary(ReminderLcOwner::Alarm);
-#endif
-                    ClearAlarmEvent();
-                    to_clear_alarm_event = false;
-                }
-            }
-        }
-#endif
     }
 }
 
 void Application::OnWakeWordDetected() {
+#if CONFIG_USE_REMINDER_POLL
+    if (IsReminderAlarmRinging()) {
+        StopProactiveAlarm("wake_word");
+        return;
+    }
+#endif
     if (!protocol_) {
         return;
     }
@@ -1026,52 +996,6 @@ void Application::OnWakeWordDetected() {
     } else if (device_state_ == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
     }
-    #if CONFIG_USE_ALARM
-    else if (device_state_ == kDeviceStateAlarm) {
-        general_timer_->ClearRinging();
-        ESP_LOGI(TAG, "Alarm detected, start listening");
-#if CONFIG_USE_REMINDER_POLL
-        SetSessionKind(SessionKind::User, "wake_word_alarm");
-        ReminderLcBegin(ReminderLcOwner::User, "wake_word_alarm");
-#endif
-        //SetDeviceState(kDeviceStateAlarm);
-        audio_service_.EncodeWakeWord();
-
-        if (!protocol_->IsAudioChannelOpened()) {
-            SetDeviceState(kDeviceStateConnecting);
-            if (!protocol_->OpenAudioChannel()) {
-                audio_service_.EnsureIdleCapture();
-                audio_service_.EnableWakeWordDetection(true);
-#if CONFIG_USE_REMINDER_POLL
-                ReminderLcMark(ReminderLcOwner::User, ReminderLcPhase::ChannelOpen, 0, "alarm_open_failed");
-                ReminderLcSummary(ReminderLcOwner::User);
-                SetSessionKind(SessionKind::None, "alarm_open_channel_failed");
-#endif
-                return;
-            }
-        }
-
-        auto wake_word = audio_service_.GetLastWakeWord();
-        ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
-#if CONFIG_USE_REMINDER_POLL
-        ReminderTraceLog("wake_word_detected_alarm", wake_word.c_str());
-        ReminderLcMark(ReminderLcOwner::User, ReminderLcPhase::WakeDetect, 1, wake_word.c_str());
-#endif
-#if CONFIG_SEND_WAKE_WORD_DATA
-        // Encode and send the wake word data to the server
-        while (auto packet = audio_service_.PopWakeWordPacket()) {
-            protocol_->SendAudio(std::move(packet));
-        }
-        // Set the chat state to wake word detected
-        protocol_->SendWakeWordDetected(wake_word);
-        SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
-#else
-        SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
-        // Play the pop up sound to indicate the wake word is detected
-        audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
-#endif
-    }
-#endif
 #if CONFIG_USE_REMINDER_POLL
     else {
         ReminderTraceLog("wake_word_blocked", STATE_STRINGS[device_state_]);
@@ -1105,7 +1029,7 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
     switch (state) {
         case kDeviceStateIdle:
             audio.EnableVoiceProcessing(false);
-#if CONFIG_USE_ALARM
+#if CONFIG_USE_REMINDER_POLL
             if (previous_state == kDeviceStateAlarm) {
                 audio.EndSpeakerPlayback();
             }
@@ -1170,12 +1094,14 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
             audio.ResetDecoder();
             break;
 
-#if CONFIG_USE_ALARM
+#if CONFIG_USE_REMINDER_POLL
         case kDeviceStateAlarm:
             audio.ResetDecoder();
             audio.EnableVoiceProcessing(false);
+            audio.SetAudioRoute(AudioRoute::Duplex, true);
+            // Switch the route first; StartProactiveAlarm() enables the detector
+            // after the transition so a wake word can stop the active ring.
             audio.EnableWakeWordDetection(false);
-            audio.SetAudioRoute(AudioRoute::Playback);
             break;
 #endif
 
@@ -1245,11 +1171,7 @@ ReminderDiagSnapshot Application::BuildReminderDiagSnapshot() {
     auto* codec = Board::GetInstance().GetAudioCodec();
     snap.codec_in = codec != nullptr && codec->input_enabled();
     snap.codec_out = codec != nullptr && codec->output_enabled();
-#if CONFIG_USE_ALARM
-    snap.alarm_ringing = IsAlarmRinging();
-#else
-    snap.alarm_ringing = false;
-#endif
+    snap.alarm_ringing = IsReminderAlarmRinging();
     snap.can_deliver = CanDeliverReminder();
     snap.audio_idle = audio_service_.IsIdle();
     auto audio_diag = audio_service_.GetDiagnosticState();
@@ -1364,7 +1286,7 @@ void Application::UpdateCapturePowerHold() {
                       device_state_ == kDeviceStateListening ||
                       device_state_ == kDeviceStateSpeaking;
 #endif
-#if CONFIG_USE_ALARM
+#if CONFIG_USE_REMINDER_POLL
     if (device_state_ == kDeviceStateAlarm) {
         audio_service_.SetCapturePowerHold(true);
         return;
@@ -1380,6 +1302,9 @@ void Application::EnterIdleStandby(bool show_wake_hint) {
     if (device_state_ == kDeviceStateIdle && session_kind_ == SessionKind::None &&
         (now_us - last_idle_standby_us_) < kIdleStandbyDebounceUs) {
         ReminderTraceLog("enter_idle_standby_skip", "debounce");
+        if (reminder_poller_ != nullptr) {
+            reminder_poller_->NotifyIdleReady();
+        }
         if (show_wake_hint) {
             Board::GetInstance().GetDisplay()->SetChatMessage("system", "请说：你好，小易！唤醒我吧！");
         }
@@ -1388,7 +1313,17 @@ void Application::EnterIdleStandby(bool show_wake_hint) {
     last_idle_standby_us_ = now_us;
     idle_rearm_in_progress_ = true;
     UpdateCapturePowerHold();
-    StopProactiveFeedbackTimer();
+    proactive_alarm_active_.store(false);
+    proactive_alarm_pending_start_ = false;
+    proactive_alarm_tts_playing_ = false;
+    proactive_alarm_ring_playing_ = false;
+    proactive_alarm_repeat_speech_enabled_ = false;
+    proactive_alarm_delivered_ = false;
+    proactive_alarm_mode_ = ReminderAlarmMode::kNone;
+    proactive_alarm_pending_since_us_ = 0;
+    proactive_alarm_ring_until_us_ = 0;
+    proactive_alarm_repeat_detect_text_.clear();
+    StopProactiveAlarmTimeout();
     StopProactiveReminderTimeout();
     ReminderTraceLog("enter_idle_standby", show_wake_hint ? "wake_hint" : "silent");
     ReminderLcBegin(ReminderLcOwner::Standby, show_wake_hint ? "wake_hint" : "silent");
@@ -1440,6 +1375,9 @@ void Application::EnterIdleStandby(bool show_wake_hint) {
     ReminderLcSummary(ReminderLcOwner::Standby);
     ReminderHwTraceSnapshot("enter_idle_standby");
     RunReminderDiagnostics("enter_idle_standby", false);
+    if (reminder_poller_ != nullptr) {
+        reminder_poller_->NotifyIdleReady();
+    }
 #endif
 }
 
@@ -1467,7 +1405,6 @@ void Application::EndSessionAndRestoreIdle(bool force_capture) {
 #if CONFIG_USE_REMINDER_POLL
     EnterIdleStandby(true);
 #else
-    StopProactiveFeedbackTimer();
     if (protocol_) {
         audio_service_.EnableVoiceProcessing(false);
         if (protocol_->IsAudioChannelOpened()) {
@@ -1494,11 +1431,6 @@ bool Application::IsUserConversationActive() const {
 }
 
 bool Application::CanDeliverReminder() const {
-#if CONFIG_USE_ALARM
-    if (device_state_ == kDeviceStateAlarm || IsAlarmRinging()) {
-        return false;
-    }
-#endif
     if (session_kind_ != SessionKind::None) {
         return false;
     }
@@ -1557,7 +1489,7 @@ void Application::SetDeviceState(DeviceState state) {
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
             break;
-#if CONFIG_USE_ALARM
+#if CONFIG_USE_REMINDER_POLL
         case kDeviceStateAlarm:
             display->SetStatus(Lang::Strings::ALARM);
             break;
@@ -1572,6 +1504,10 @@ void Application::SetDeviceState(DeviceState state) {
     if (state == kDeviceStateIdle) {
         TryStartDeferredReminderNet();
         RunReminderDiagnostics("enter_idle", false);
+        if (session_kind_ == SessionKind::None && !idle_rearm_in_progress_ &&
+            reminder_poller_ != nullptr) {
+            reminder_poller_->NotifyIdleReady();
+        }
     }
 #endif
 }
@@ -1648,14 +1584,12 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     }
 
 #if CONFIG_USE_REMINDER_POLL
-    if (session_kind_ == SessionKind::ProactiveReminder) {
-        ESP_LOGW(TAG, "Ignore wake invoke during proactive reminder");
+    if (IsReminderAlarmRinging()) {
+        RequestStopReminderAlarm("wake_invoke");
         return;
     }
-#endif
-#if CONFIG_USE_ALARM
-    if (device_state_ == kDeviceStateAlarm || IsAlarmRinging()) {
-        ESP_LOGW(TAG, "Ignore wake invoke during alarm");
+    if (session_kind_ == SessionKind::ProactiveReminder) {
+        ESP_LOGW(TAG, "Ignore wake invoke during proactive reminder");
         return;
     }
 #endif
@@ -1712,8 +1646,8 @@ bool Application::CanEnterSleepMode() {
         return false;
     }
 
-#if CONFIG_USE_ALARM
-    if (IsAlarmRinging()) {
+#if CONFIG_USE_REMINDER_POLL
+    if (IsReminderAlarmRinging() || proactive_alarm_pending_start_) {
         return false;
     }
 #endif
@@ -1813,52 +1747,203 @@ void Application::StopProactiveReminderTimeout() {
     }
 }
 
-void Application::StopProactiveFeedbackTimer() {
-    if (proactive_feedback_timer_handle_ != nullptr) {
-        esp_timer_stop(proactive_feedback_timer_handle_);
+void Application::StartProactiveAlarmTimeout() {
+    if (proactive_alarm_timer_handle_ == nullptr) {
+        return;
+    }
+    esp_timer_stop(proactive_alarm_timer_handle_);
+    esp_timer_start_once(proactive_alarm_timer_handle_,
+                         (int64_t)CONFIG_REMINDER_ALARM_DURATION_SEC * 1000000LL);
+}
+
+void Application::StopProactiveAlarmTimeout() {
+    if (proactive_alarm_timer_handle_ != nullptr) {
+        esp_timer_stop(proactive_alarm_timer_handle_);
     }
 }
 
-void Application::StartProactiveFeedbackWindow() {
-    if (session_kind_ != SessionKind::ProactiveReminder) {
+void Application::RequestStopReminderAlarm(const char* reason) {
+    const std::string stop_reason = reason != nullptr ? reason : "api";
+    Schedule([this, stop_reason]() { StopProactiveAlarm(stop_reason.c_str()); });
+}
+
+void Application::QueueProactiveAlarmAfterSpeech() {
+    if (proactive_alarm_mode_ != ReminderAlarmMode::kRingRepeat ||
+        session_kind_ != SessionKind::ProactiveReminder || proactive_alarm_pending_start_) {
         return;
     }
-#ifdef CONFIG_REMINDER_FEEDBACK_SEC
-    const int feedback_sec = CONFIG_REMINDER_FEEDBACK_SEC;
-#else
-    const int feedback_sec = 5;
-#endif
-    if (feedback_sec <= 0) {
-        FinishProactiveReminder();
-        return;
-    }
-    StopProactiveFeedbackTimer();
+    proactive_alarm_pending_start_ = true;
+    proactive_alarm_pending_since_us_ = esp_timer_get_time();
+    proactive_alarm_tts_playing_ = false;
+    proactive_alarm_delivered_ = true;
     StopProactiveReminderTimeout();
-    ESP_LOGI(TAG, "Proactive feedback window %ds [scheme-D]", feedback_sec);
-    ReminderTraceLog("feedback_window_start");
-    ReminderLcMark(ReminderLcOwner::Proactive, ReminderLcPhase::FeedbackStart, 1, nullptr);
-    listening_mode_ = kListeningModeAutoStop;
-    SetListeningMode(kListeningModeAutoStop);
-    if (proactive_feedback_timer_handle_ != nullptr) {
-        esp_timer_start_once(proactive_feedback_timer_handle_, (int64_t)feedback_sec * 1000000LL);
-    }
+    ReminderTraceLog("alarm_wait_audio_drain", pending_reminder_ack_id_.c_str());
 }
 
-void Application::FinishProactiveReminder() {
-    StopProactiveFeedbackTimer();
-    ReminderTraceLog("feedback_window_end");
-    ReminderLcMark(ReminderLcOwner::Proactive, ReminderLcPhase::FeedbackEnd, 1, nullptr);
-    audio_service_.EnableVoiceProcessing(false);
-    if (protocol_ && protocol_->IsAudioChannelOpened()) {
-        protocol_->SendStopListening();
-    }
-    if (!pending_reminder_ack_id_.empty()) {
-        CompletePendingReminderAck();
+void Application::ServiceProactiveAlarm() {
+    const int64_t now_us = esp_timer_get_time();
+    if (proactive_alarm_pending_start_) {
+        if (session_kind_ != SessionKind::ProactiveReminder) {
+            proactive_alarm_pending_start_ = false;
+            proactive_alarm_pending_since_us_ = 0;
+            return;
+        }
+        constexpr int64_t kDrainLimitUs = 10 * 1000000LL;
+        if (audio_service_.IsIdle()) {
+            StartProactiveAlarm();
+        } else if (now_us - proactive_alarm_pending_since_us_ >= kDrainLimitUs) {
+            ESP_LOGW(TAG, "Reminder speech drain exceeded 10s; clearing stale audio before alarm");
+            audio_service_.ResetDecoder();
+            StartProactiveAlarm();
+        }
         return;
     }
-    if (session_kind_ == SessionKind::ProactiveReminder) {
-        EnterIdleStandby(true);
+
+    if (!IsReminderAlarmRinging()) {
+        return;
     }
+
+    if (proactive_alarm_tts_playing_) {
+        constexpr int64_t kRepeatTtsStartLimitUs = 8 * 1000000LL;
+        if (proactive_alarm_pending_since_us_ > 0 &&
+            now_us - proactive_alarm_pending_since_us_ >= kRepeatTtsStartLimitUs) {
+            proactive_alarm_tts_playing_ = false;
+            proactive_alarm_pending_start_ = true;
+            proactive_alarm_pending_since_us_ = now_us;
+            audio_service_.ResetDecoder();
+        }
+        return;
+    }
+
+    if (!proactive_alarm_ring_playing_ || proactive_alarm_ring_until_us_ == 0) {
+        return;
+    }
+
+    if (now_us < proactive_alarm_ring_until_us_) {
+        // The bundled alarm sound is only about two seconds long. Replay it as
+        // soon as the local playback queue drains so the configured repeat
+        // interval is an audible ring window instead of a silent delay.
+        if (audio_service_.IsIdle()) {
+            PlaySound(Lang::Sounds::OGG_ALARM_RING);
+        }
+        return;
+    }
+
+    proactive_alarm_ring_playing_ = false;
+    proactive_alarm_ring_until_us_ = 0;
+    ESP_LOGI(TAG, "Repeat proactive alarm after %ds", CONFIG_REMINDER_ALARM_REPEAT_SEC);
+    ReminderTraceLog("alarm_ring_repeat", pending_reminder_ack_id_.c_str());
+    audio_service_.EnableWakeWordDetection(false);
+    if (!audio_service_.IsIdle()) {
+        audio_service_.ResetDecoder();
+    }
+    if (proactive_alarm_repeat_speech_enabled_ && protocol_ != nullptr &&
+        !proactive_alarm_repeat_detect_text_.empty()) {
+        proactive_alarm_tts_playing_ = true;
+        proactive_alarm_pending_since_us_ = now_us;
+        proactive_audio_packets_ = 0;
+        audio_service_.BeginPlaybackPrebuffer();
+        audio_service_.PrepareSpeakerPlayback();
+        if (device_state_ != kDeviceStateSpeaking) {
+            SetDeviceState(kDeviceStateSpeaking);
+        }
+        if (protocol_->IsAudioChannelOpened() || protocol_->OpenAudioChannel()) {
+            protocol_->SendWakeWordDetected(proactive_alarm_repeat_detect_text_);
+            return;
+        }
+        proactive_alarm_tts_playing_ = false;
+    }
+
+    proactive_alarm_pending_start_ = true;
+    proactive_alarm_pending_since_us_ = now_us;
+    StartProactiveAlarm();
+}
+
+void Application::StartProactiveAlarm() {
+    if (!proactive_alarm_pending_start_ || session_kind_ != SessionKind::ProactiveReminder) {
+        return;
+    }
+
+    if (IsReminderAlarmRinging()) {
+        proactive_alarm_pending_start_ = false;
+        proactive_alarm_pending_since_us_ = 0;
+        proactive_alarm_tts_playing_ = false;
+        SetDeviceState(kDeviceStateAlarm);
+        audio_service_.EnableWakeWordDetection(true);
+        PlaySound(Lang::Sounds::OGG_ALARM_RING);
+        proactive_alarm_ring_playing_ = true;
+        proactive_alarm_ring_until_us_ = esp_timer_get_time() +
+            (int64_t)CONFIG_REMINDER_ALARM_REPEAT_SEC * 1000000LL;
+        return;
+    }
+
+    proactive_alarm_pending_start_ = false;
+    proactive_alarm_pending_since_us_ = 0;
+    proactive_alarm_tts_playing_ = false;
+    proactive_alarm_delivered_ = true;
+    proactive_alarm_active_.store(true);
+    StopProactiveReminderTimeout();
+
+    ReminderLcBegin(ReminderLcOwner::Alarm, pending_reminder_ack_id_.c_str());
+    ReminderLcMark(ReminderLcOwner::Alarm, ReminderLcPhase::RingStart, 1, "after_tts");
+    ReminderTraceLog("alarm_ring_start", pending_reminder_ack_id_.c_str());
+    ESP_LOGI(TAG, "Proactive alarm started: repeat=%ds duration=%ds; wake word stops it",
+             CONFIG_REMINDER_ALARM_REPEAT_SEC, CONFIG_REMINDER_ALARM_DURATION_SEC);
+
+    SetDeviceState(kDeviceStateAlarm);
+    auto display = Board::GetInstance().GetDisplay();
+    if (!last_reminder_display_text_.empty()) {
+        display->SetChatMessage("system", last_reminder_display_text_.c_str());
+        ReminderLcDisplay(ReminderLcOwner::Alarm, "system", last_reminder_display_text_.c_str(), 1);
+    }
+    if (!last_reminder_emotion_.empty()) {
+        display->SetEmotion(last_reminder_emotion_.c_str());
+    }
+
+    // Alarm uses the duplex route. Keep wake-word detection active so the user
+    // can stop the alarm by voice even while the local ring sound is playing.
+    audio_service_.EnableWakeWordDetection(true);
+    PlaySound(Lang::Sounds::OGG_ALARM_RING);
+    proactive_alarm_ring_playing_ = true;
+    proactive_alarm_ring_until_us_ = esp_timer_get_time() +
+        (int64_t)CONFIG_REMINDER_ALARM_REPEAT_SEC * 1000000LL;
+    StartProactiveAlarmTimeout();
+}
+
+void Application::StopProactiveAlarm(const char* reason, bool acknowledge) {
+    const bool was_ringing = proactive_alarm_active_.exchange(false);
+    const bool was_pending = proactive_alarm_pending_start_;
+    if (!was_ringing && !was_pending) {
+        return;
+    }
+
+    const std::string stop_reason = reason != nullptr ? reason : "unknown";
+    proactive_alarm_pending_start_ = false;
+    proactive_alarm_pending_since_us_ = 0;
+    proactive_alarm_ring_until_us_ = 0;
+    proactive_alarm_tts_playing_ = false;
+    proactive_alarm_ring_playing_ = false;
+    StopProactiveAlarmTimeout();
+    StopProactiveReminderTimeout();
+
+    ESP_LOGI(TAG, "Stop proactive alarm: %s", stop_reason.c_str());
+    ReminderTraceLog("alarm_ring_stop", stop_reason.c_str());
+    ReminderLcMark(ReminderLcOwner::Alarm, ReminderLcPhase::RingStop, 1, stop_reason.c_str());
+    ReminderLcSummary(ReminderLcOwner::Alarm);
+
+    audio_service_.EnableWakeWordDetection(false);
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.ResetDecoder();
+
+    if (acknowledge && !pending_reminder_ack_id_.empty()) {
+        CompletePendingReminderAck(false);
+    } else if (!acknowledge) {
+        pending_reminder_ack_id_.clear();
+        pending_reminder_ack_url_.clear();
+        proactive_reminder_tts_started_ = false;
+        proactive_alarm_delivered_ = false;
+    }
+    EnterIdleStandby(true);
 }
 
 void Application::CancelPendingReminderAck() {
@@ -1871,22 +1956,35 @@ void Application::CancelPendingReminderAck() {
     ReminderLcMark(ReminderLcOwner::Proactive, ReminderLcPhase::Ack, 0, "cancelled");
     ReminderLcSummary(ReminderLcOwner::Proactive);
     StopProactiveReminderTimeout();
-    const bool had_tts = proactive_reminder_tts_started_;
+    StopProactiveAlarmTimeout();
+    const bool had_delivery = proactive_reminder_tts_started_ || proactive_alarm_delivered_ ||
+        IsReminderAlarmRinging() || proactive_alarm_pending_start_;
+    proactive_alarm_active_.store(false);
+    proactive_alarm_pending_start_ = false;
+    proactive_alarm_tts_playing_ = false;
+    proactive_alarm_ring_playing_ = false;
+    proactive_alarm_repeat_speech_enabled_ = false;
+    proactive_alarm_mode_ = ReminderAlarmMode::kNone;
+    proactive_alarm_pending_since_us_ = 0;
+    proactive_alarm_ring_until_us_ = 0;
+    proactive_alarm_repeat_detect_text_.clear();
     pending_reminder_ack_id_.clear();
     pending_reminder_ack_url_.clear();
     proactive_reminder_tts_started_ = false;
+    proactive_alarm_delivered_ = false;
     last_reminder_display_text_.clear();
     last_reminder_emotion_.clear();
-    EnterIdleStandby(had_tts);
+    audio_service_.ResetDecoder();
+    EnterIdleStandby(had_delivery);
 }
 
-void Application::CompletePendingReminderAck() {
+void Application::CompletePendingReminderAck(bool return_to_idle, bool show_wake_hint) {
     if (pending_reminder_ack_id_.empty()) {
         return;
     }
-    if (!proactive_reminder_tts_started_) {
-        ESP_LOGW(TAG, "Proactive reminder %s ended without TTS", pending_reminder_ack_id_.c_str());
-        ReminderTraceLog("proactive_no_tts", pending_reminder_ack_id_.c_str());
+    if (!proactive_reminder_tts_started_ && !proactive_alarm_delivered_) {
+        ESP_LOGW(TAG, "Proactive reminder %s ended before delivery", pending_reminder_ack_id_.c_str());
+        ReminderTraceLog("proactive_not_delivered", pending_reminder_ack_id_.c_str());
         CancelPendingReminderAck();
         return;
     }
@@ -1898,10 +1996,14 @@ void Application::CompletePendingReminderAck() {
     pending_reminder_ack_id_.clear();
     pending_reminder_ack_url_.clear();
     proactive_reminder_tts_started_ = false;
+    proactive_alarm_delivered_ = false;
 
     auto finalize = std::make_shared<std::function<void(int)>>();
-    *finalize = [this, ack_id, ack_url, finalize](int attempt) {
-        if ((!audio_service_.IsIdle() || audio_service_.IsAudioProcessorRunning()) && attempt < 60) {
+    *finalize = [this, ack_id, ack_url, return_to_idle, show_wake_hint, finalize](int attempt) {
+        const bool wait_for_audio_drain =
+            return_to_idle &&
+            (!audio_service_.IsIdle() || audio_service_.IsAudioProcessorRunning());
+        if (wait_for_audio_drain && attempt < 60) {
             if (attempt == 0 || attempt % 10 == 0) {
                 ReminderTraceLog("proactive_drain_wait", ack_id.c_str());
             }
@@ -1920,17 +2022,22 @@ void Application::CompletePendingReminderAck() {
             ReminderLcMark(ReminderLcOwner::Proactive, ReminderLcPhase::Ack, 0, ack_id.c_str());
         }
         ReminderLcSummary(ReminderLcOwner::Proactive);
-        EnterIdleStandby(true);
-        ReminderTraceLog("proactive_finalized", ack_id.c_str());
+        if (return_to_idle) {
+            EnterIdleStandby(show_wake_hint);
+            ReminderTraceLog("proactive_finalized", ack_id.c_str());
+        } else {
+            ReminderTraceLog("proactive_ack_handoff", ack_id.c_str());
+        }
     };
     Schedule([finalize]() { (*finalize)(0); });
 }
 #endif
 
 #if CONFIG_USE_REMINDER_POLL
-void Application::DeliverReminder(ReminderDeliveryMode mode, const std::string& id,
-                                  const std::string& prompt, const std::string& wake_text,
-                                  const char* emotion, const std::string& ack_url) {
+void Application::DeliverReminder(ReminderDeliveryMode mode, ReminderAlarmMode alarm_mode,
+                                  const std::string& id, const std::string& prompt,
+                                  const std::string& wake_text, const char* emotion,
+                                  const std::string& ack_url) {
     if (!protocol_) {
         ESP_LOGE(TAG, "Protocol not initialized");
         return;
@@ -1968,7 +2075,7 @@ void Application::DeliverReminder(ReminderDeliveryMode mode, const std::string& 
     }
 
     Schedule([this, payload = ReminderDeliverPayload{
-                  effective_mode, id, display_text, detect_text,
+                  effective_mode, alarm_mode, id, display_text, detect_text,
                   std::string(emotion ? emotion : "neutral"), ack_url}]() {
         RunReminderDelivery(payload);
     });
@@ -1976,29 +2083,27 @@ void Application::DeliverReminder(ReminderDeliveryMode mode, const std::string& 
 
 void Application::RunReminderDelivery(const ReminderDeliverPayload& payload) {
     const auto& effective_mode = payload.effective_mode;
+    const auto& alarm_mode = payload.alarm_mode;
     const auto& id = payload.id;
     const auto& display_text = payload.display_text;
     const auto& detect_text = payload.detect_text;
     const auto& emotion_str = payload.emotion_str;
     const auto& ack_url = payload.ack_url;
 
-#if CONFIG_USE_ALARM
-    if (device_state_ == kDeviceStateAlarm || IsAlarmRinging()) {
-        ESP_LOGW(TAG, "Skip reminder, alarm ringing");
-        return;
-    }
-#endif
     if (!CanDeliverReminder()) {
         ReminderTraceLog("deliver_skip", id.c_str());
         ESP_LOGW(TAG, "Skip reminder %s, higher priority activity (session=%d state=%s)",
                  id.c_str(), (int)session_kind_, STATE_STRINGS[device_state_]);
+        if (!id.empty() && reminder_poller_ != nullptr) {
+            reminder_poller_->DeferPoll("run_deliver_busy");
+        }
         return;
     }
 
     ReminderLcBegin(ReminderLcOwner::Proactive, id.c_str());
     ReminderLcMark(ReminderLcOwner::Proactive, ReminderLcPhase::DeliverSchedule, 1, nullptr);
 
-    if (effective_mode == ReminderDeliveryMode::kMcpWake &&
+    if (effective_mode != ReminderDeliveryMode::kAlertOnly &&
         session_kind_ == SessionKind::None &&
         protocol_->IsAudioChannelOpened()) {
         ReminderTraceLog("deliver_close_stale_channel", id.c_str());
@@ -2023,34 +2128,50 @@ void Application::RunReminderDelivery(const ReminderDeliverPayload& payload) {
         ReminderTraceLog("deliver_ui_deferred", id.c_str());
     }
 
-    if (effective_mode == ReminderDeliveryMode::kMcpWake) {
-        SetSessionKind(SessionKind::ProactiveReminder, "deliver_mcp_wake");
-        listening_mode_ = kListeningModeAutoStop;
-        pending_reminder_ack_id_ = id;
-        pending_reminder_ack_url_ = ack_url;
-        proactive_reminder_tts_started_ = false;
-        proactive_audio_packets_ = 0;
+    SetSessionKind(SessionKind::ProactiveReminder,
+                   effective_mode == ReminderDeliveryMode::kMcpWake ? "deliver_mcp_wake" :
+                   effective_mode == ReminderDeliveryMode::kDirectWake ? "deliver_direct_wake" :
+                   "deliver_alert_only");
+    listening_mode_ = kListeningModeAutoStop;
+    pending_reminder_ack_id_ = id;
+    pending_reminder_ack_url_ = ack_url;
+    proactive_reminder_tts_started_ = false;
+    proactive_alarm_active_.store(false);
+    proactive_alarm_pending_start_ = false;
+    proactive_alarm_tts_playing_ = false;
+    proactive_alarm_ring_playing_ = false;
+    proactive_alarm_mode_ = alarm_mode;
+    proactive_alarm_repeat_speech_enabled_ =
+        alarm_mode == ReminderAlarmMode::kRingRepeat &&
+        effective_mode != ReminderDeliveryMode::kAlertOnly && !detect_text.empty();
+    proactive_alarm_repeat_detect_text_ = detect_text;
+    proactive_alarm_delivered_ = false;
+    proactive_alarm_pending_since_us_ = 0;
+    proactive_alarm_ring_until_us_ = 0;
+    proactive_audio_packets_ = 0;
+
+    if (effective_mode != ReminderDeliveryMode::kAlertOnly) {
+        audio_service_.BeginPlaybackPrebuffer();
         audio_service_.PrepareSpeakerPlayback();
-    } else if (effective_mode == ReminderDeliveryMode::kDirectWake) {
-        SetSessionKind(SessionKind::ProactiveReminder, "deliver_direct_wake");
-        audio_service_.PrepareSpeakerPlayback();
+    } else {
+        proactive_alarm_delivered_ = true;
+        if (alarm_mode == ReminderAlarmMode::kRingRepeat) {
+            QueueProactiveAlarmAfterSpeech();
+            ServiceProactiveAlarm();
+        } else {
+            ReminderTraceLog("alert_only_complete", id.c_str());
+            CompletePendingReminderAck(true, false);
+        }
+        return;
     }
 
     if (!protocol_->IsAudioChannelOpened()) {
         SetDeviceState(kDeviceStateConnecting);
         if (!protocol_->OpenAudioChannel()) {
             ESP_LOGE(TAG, "Failed to open channel for reminder");
-            if (effective_mode == ReminderDeliveryMode::kMcpWake) {
-                pending_reminder_ack_id_.clear();
-                pending_reminder_ack_url_.clear();
-            }
-            SetSessionKind(SessionKind::None, "deliver_open_channel_failed");
             ReminderTraceLog("deliver_channel_fail", id.c_str());
             ReminderLcMark(ReminderLcOwner::Proactive, ReminderLcPhase::ChannelOpen, 0, "open_failed");
-            ReminderLcSummary(ReminderLcOwner::Proactive);
-            last_reminder_display_text_.clear();
-            last_reminder_emotion_.clear();
-            Board::GetInstance().GetDisplay()->SetChatMessage("system", "请说：你好，小易！唤醒我吧！");
+            CancelPendingReminderAck();
             Alert(Lang::Strings::ERROR, Lang::Strings::SERVER_NOT_CONNECTED, "circle_xmark",
                   Lang::Sounds::OGG_EXCLAMATION);
             return;
@@ -2091,6 +2212,7 @@ void Application::RunReminderDelivery(const ReminderDeliverPayload& payload) {
         if (device_state_ == kDeviceStateConnecting) {
             SetDeviceState(kDeviceStateIdle);
         }
+        StartProactiveReminderTimeout();
         ESP_LOGI(TAG, "Direct wake reminder %s dispatched [session-v12]", id.c_str());
         return;
     }
@@ -2107,7 +2229,8 @@ void Application::RunReminderDelivery(const ReminderDeliverPayload& payload) {
 
 void Application::DeliverReminderSpeech(const std::string& message, const char* emotion) {
 #if CONFIG_USE_REMINDER_POLL
-    DeliverReminder(ReminderDeliveryMode::kMcpWake, "", message, "", emotion, "");
+    DeliverReminder(ReminderDeliveryMode::kMcpWake, ReminderAlarmMode::kNone,
+                    "", message, "", emotion, "");
 #else
     if (!protocol_) {
         ESP_LOGE(TAG, "Protocol not initialized");
@@ -2146,11 +2269,7 @@ void Application::DeliverReminderSpeech(const std::string& message, const char* 
 #endif
 }
 
-#if CONFIG_USE_ALARM
-
-bool Application::IsAlarmRinging() const {
-    return general_timer_ != nullptr && general_timer_->isRinging();
-}
+#if 0  // Legacy local-timer message helper removed from the firmware build.
 
 void Application::SendMessage(std::string& message) {
     ESP_LOGI(TAG, "Send message: %s", message.c_str());
@@ -2182,11 +2301,4 @@ void Application::SendMessage(std::string& message) {
 
 }
 
-void Application::SetAlarmEvent(){
-    xEventGroupSetBits(event_group_, MAIN_EVENT_ALARM);
-}
-
-void Application::ClearAlarmEvent(){
-    xEventGroupClearBits(event_group_, MAIN_EVENT_ALARM);
-}
 #endif

@@ -59,6 +59,10 @@ static const uint32_t g_hw_decoder_cc = ESP_VIDEO_DEC_HW_MJPEG_TAG;
 #define PLAYER_EVENT_SWITCH     BIT0
 #define PLAYER_EVENT_EXIT       BIT1
 
+// Hardware MJPEG decode and the LVGL frame callback share this task's stack.
+// 5 KiB is not enough once an interrupt frame is added at the deepest point.
+#define EMOTION_DECODE_TASK_STACK_SIZE  (12 * 1024)
+
 // 表情定义和映射
 #define BASE_EMOTIONS_COUNT     6
 #define TOTAL_EMOTIONS_COUNT    6
@@ -371,13 +375,14 @@ esp_err_t emotion_video_player_init(const emotion_video_config_t *config, emotio
         goto cleanup_and_fail;
     }
 
-    // 🚀 关键优化：提高任务优先级到6，确保视频解码优先执行
+    // AFE 检测任务固定在 core 0。动画也固定在 core 0，并保持较低优先级，
+    // 避免两个 CPU 同时进行大块 PSRAM 访问触发 P4 rev 1.x 总线异常。
     BaseType_t task_ret = xTaskCreatePinnedToCore(
         decode_task, "emotion_decode", 
-        5120, player,
+        EMOTION_DECODE_TASK_STACK_SIZE, player,
         2,
         &player->decode_task_handle,
-        1
+        0
     );
     if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create decode task");
@@ -386,17 +391,18 @@ esp_err_t emotion_video_player_init(const emotion_video_config_t *config, emotio
         goto cleanup_and_fail;
     }
     
-    ESP_LOGI(TAG, "✅ Emotion decode task started (priority: 2, stack: 5120, core: 1)");
+    ESP_LOGI(TAG, "✅ Emotion decode task started (priority: 2, stack: %u, core: 0)",
+             (unsigned)EMOTION_DECODE_TASK_STACK_SIZE);
 
     *handle = player;
 
-    // 初始化时立即加载并播放standby表情，避免黑屏
+    // 🔥 修复1：初始化时立即加载并播放standby表情，避免黑屏
     ESP_LOGI(TAG, "🎬 初始化：加载并播放standby表情...");
-
+    
     const emotion_def_t *standby_def = find_emotion_def(DEFAULT_STANDBY_EMOTION);
     if (standby_def) {
         int standby_index = standby_def->cache_index;
-
+        
         esp_err_t ret = load_video_to_cache(player, standby_index);
         if (ret == ESP_OK) {
             ret = build_frame_index(player, standby_index);
@@ -820,6 +826,7 @@ static void decode_task(void *arg)
 {
     emotion_video_player_t *player = (emotion_video_player_t *)arg;
     EventBits_t event_bits;
+    bool stack_watermark_reported = false;
     
     ESP_LOGI(TAG, "🎬 解码任务启动");
     
@@ -917,6 +924,13 @@ static void decode_task(void *arg)
                     player->current_frame++;
                     player->frame_deadline_us += player->frame_interval_us;
                     player->decode_error_count = 0;
+
+                    if (!stack_watermark_reported || (player->current_frame % 200) == 0) {
+                        const UBaseType_t free_stack_min = uxTaskGetStackHighWaterMark(NULL);
+                        ESP_LOGI(TAG, "emotion_decode minimum free stack: %u bytes",
+                                 (unsigned)free_stack_min);
+                        stack_watermark_reported = true;
+                    }
                     
                     int64_t drift = current_time - player->frame_deadline_us;
                     if (drift > (int64_t)(player->frame_interval_us * 2)) {
@@ -1162,57 +1176,15 @@ static void preload_emotions_task(void *arg)
 {
     emotion_video_player_t *player = (emotion_video_player_t *)arg;
 
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    
-    ESP_LOGI(TAG, "🚀 开始后台预加载基础表情...");
-    
-    // 预加载顺序：按使用频率排序
-    const char *preload_order[] = {"happy", "sad", "angry", "loving", "neutral"};
-    int preload_count = sizeof(preload_order) / sizeof(preload_order[0]);
-    
-    for (int i = 0; i < preload_count; i++) {
-        const emotion_def_t *def = find_emotion_def(preload_order[i]);
-        if (!def) continue;
-        
-        int cache_index = def->cache_index;
-        
-        // 检查是否已加载
-        xSemaphoreTake(player->cache_mutex, portMAX_DELAY);
-        bool already_loaded = player->video_caches[cache_index].ready && 
-                             player->video_caches[cache_index].index_built;
-        xSemaphoreGive(player->cache_mutex);
-        
-        if (already_loaded) {
-            ESP_LOGI(TAG, "⏭️ 跳过已加载: %s", preload_order[i]);
-            continue;
-        }
-        
-        ESP_LOGI(TAG, "📂 预加载表情: %s", preload_order[i]);
-        
-        // 加载表情
-        esp_err_t ret = load_video_to_cache(player, cache_index);
-        if (ret == ESP_OK) {
-            // 建立索引
-            ret = build_frame_index(player, cache_index);
-            if (ret == ESP_OK) {
-                ESP_LOGI(TAG, "✅ 预加载成功: %s", preload_order[i]);
-            } else {
-                ESP_LOGW(TAG, "⚠️ 索引建立失败: %s", preload_order[i]);
-            }
-        } else {
-            ESP_LOGW(TAG, "⚠️ 加载失败: %s", preload_order[i]);
-        }
-        
-        // 让出CPU，避免影响主任务
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    
-    player->base_emotions_loaded = true;
-    ESP_LOGI(TAG, "🎉 基础表情预加载完成");
-    
+    // standby 已在初始化阶段加载。其余动画文件较大，同时预加载会与
+    // LVGL 全屏绘制及启动联网争用 PSRAM/总线，可能触发 HP WDT。
+    // 保留此短任务用于兼容现有初始化流程，其他表情由切换路径按需加载。
+    vTaskDelay(pdMS_TO_TICKS(100));
+    player->base_emotions_loaded = false;
+    ESP_LOGI(TAG, "✅ 启动预加载已关闭，其他表情将按需加载");
+
     vTaskDelete(NULL);
 }
-
 static void async_load_task(void *arg)
 {
     async_load_params_t *params = (async_load_params_t *)arg;
@@ -1348,7 +1320,36 @@ static esp_err_t load_video_to_cache(emotion_video_player_t *player, int cache_i
         return ESP_ERR_NO_MEM;
     }
 
-    size_t bytes_read = fread(cache->buffer, 1, file_size, file);
+    size_t bytes_read = 0;
+    const size_t read_chunk_size = 16 * 1024;
+    uint8_t *sd_read_buffer = heap_caps_aligned_alloc(
+        64, read_chunk_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!sd_read_buffer) {
+        ESP_LOGE(TAG, "❌ 片内SD读取缓冲区分配失败");
+        fclose(file);
+        heap_caps_free(cache->buffer);
+        cache->buffer = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    while (bytes_read < file_size) {
+        size_t remaining = file_size - bytes_read;
+        size_t chunk_size = remaining < read_chunk_size ? remaining : read_chunk_size;
+        size_t chunk_read = fread(sd_read_buffer, 1, chunk_size, file);
+        if (chunk_read > 0) {
+            memcpy(cache->buffer + bytes_read, sd_read_buffer, chunk_read);
+        }
+        bytes_read += chunk_read;
+
+        if (chunk_read != chunk_size) {
+            break;
+        }
+
+        // ESP32-P4 rev 1.x 上避免让 SDMMC DMA 直接写入 PSRAM；
+        // 片内缓冲同时把每次 PSRAM 写入限制为较短的 CPU 复制。
+        vTaskDelay(1);
+    }
+    heap_caps_free(sd_read_buffer);
     fclose(file);
 
     if (bytes_read != file_size) {
@@ -1553,9 +1554,27 @@ static esp_err_t switch_to_emotion(emotion_video_player_t *player, const char *e
     
     // 🔥 快速切换（最小化锁持有时间）
     xSemaphoreTake(player->cache_mutex, portMAX_DELAY);
+    int previous_cache_index = player->current_cache_index;
     player->current_cache_index = cache_index;
     player->current_frame_index = 0;
     xSemaphoreGive(player->cache_mutex);
+
+    // standby 常驻；其他动画只保留当前一个，避免多份大文件长期占用
+    // PSRAM。此时播放器处于 SWITCHING，解码任务不会访问旧缓存。
+    if (previous_cache_index > 0 && previous_cache_index != cache_index) {
+        xSemaphoreTake(player->cache_mutex, portMAX_DELAY);
+        video_cache_t *previous_cache = &player->video_caches[previous_cache_index];
+        if (previous_cache->buffer) {
+            heap_caps_free(previous_cache->buffer);
+            previous_cache->buffer = NULL;
+            previous_cache->size = 0;
+            previous_cache->ready = false;
+            previous_cache->frame_count = 0;
+            previous_cache->index_built = false;
+            ESP_LOGI(TAG, "🧹 已释放旧表情缓存: %s", previous_cache->file_name);
+        }
+        xSemaphoreGive(player->cache_mutex);
+    }
     
     strncpy(player->current_emotion, def->name, sizeof(player->current_emotion) - 1);
     player->current_emotion[sizeof(player->current_emotion) - 1] = '\0';
@@ -1571,8 +1590,9 @@ static esp_err_t switch_to_emotion(emotion_video_player_t *player, const char *e
     // 🔥 立即恢复 PLAYING 状态
     change_state(player, EMOTION_VIDEO_STATE_PLAYING);
     
-    uint64_t switch_time = (esp_timer_get_time() - switch_start_time) / 1000;
-    ESP_LOGI(TAG, "✅ 切换完成: %s (耗时: %llu ms)", def->name, switch_time);
+    unsigned switch_time =
+        (unsigned)((esp_timer_get_time() - switch_start_time) / 1000);
+    ESP_LOGI(TAG, "✅ 切换完成: %s (耗时: %u ms)", def->name, switch_time);
     
     return ESP_OK;
 }
