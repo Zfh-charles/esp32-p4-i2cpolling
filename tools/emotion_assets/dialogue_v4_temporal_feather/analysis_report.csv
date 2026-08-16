@@ -1,0 +1,7 @@
+﻿emotion,frames,mode,layered_safe,source_seam_delta,composite_edge_delta,global_delta
+standby,78,layered,True,16.523,0.211,11.097
+neutral,107,layered,True,25.464,0.189,11.545
+happy,90,layered,True,21.739,0.244,14.385
+sad,91,layered,True,21.55,0.198,10.087
+angry,104,layered,True,14.304,0.102,9.431
+loving,74,layered,True,11.958,0.083,7.021

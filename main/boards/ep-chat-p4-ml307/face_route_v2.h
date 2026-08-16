@@ -48,6 +48,9 @@ extern "C" {
 #ifndef S1CP_G_ENTER_ARC
 #define S1CP_G_ENTER_ARC 1
 #endif
+#ifndef S1EF_I_LIFE_LAYER
+#define S1EF_I_LIFE_LAYER 1
+#endif
 
 bool FaceRouteV2_WorkerEnabled(void);
 bool FaceRouteV2_Emotion3Enabled(void);
@@ -56,6 +59,7 @@ bool FaceRouteV2_QuietLogEnabled(void);
 bool FaceRouteV2_StaticDialogueEnabled(void);
 bool FaceRouteV2_FullStillEnabled(void);
 bool FaceRouteV2_EnterArcEnabled(void);
+bool FaceRouteV2_LifeLayerEnabled(void);
 
 void FaceRouteV2_SetWorker(bool on);
 void FaceRouteV2_SetEmotion3(bool on);
@@ -64,6 +68,7 @@ void FaceRouteV2_SetQuietLog(bool on);
 void FaceRouteV2_SetStaticDialogue(bool on);
 void FaceRouteV2_SetFullStill(bool on);
 void FaceRouteV2_SetEnterArc(bool on);
+void FaceRouteV2_SetLifeLayer(bool on);
 
 /** Boot banner: FW sub-markers s1cn-a..d on/off. */
 void FaceRouteV2_BootLog(void);

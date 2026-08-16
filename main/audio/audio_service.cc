@@ -824,10 +824,20 @@ void AudioService::ResetDecoder() {
 }
 
 void AudioService::PrepareSpeakerPlayback() {
-    /* force: each reminder/TTS round must re-init TX path (2nd/3rd poll). */
 #if CONFIG_USE_REMINDER_POLL
     ReminderHwTraceSpeakerOp("prepare", ReminderTraceAudioRoute(audio_route_), speaker_playback_hold_ ? 1 : 0);
 #endif
+    if (codec_ != nullptr && audio_route_ == AudioRoute::Playback &&
+        speaker_playback_hold_ && codec_->output_enabled()) {
+        // One proactive round may prepare at delivery, tts:start and first UDP.
+        // Preserve the ready route instead of rebuilding I2S each time.
+        last_output_time_ = std::chrono::steady_clock::now();
+#if CONFIG_USE_REMINDER_POLL
+        REMINDER_TRACE_LOG("speaker_prepare_noop | route=Playback hold=1 out=1");
+#endif
+        return;
+    }
+    /* A new reminder/TTS round still force-initializes TX once. */
     SetAudioRoute(AudioRoute::Playback, true);
 }
 

@@ -229,6 +229,7 @@ private:
     void StopMouthFollow(const char* why);
     void MouthFollowTick();
     esp_err_t PresentMouthPatch(uint8_t level);
+    esp_err_t PresentLifeBand(uint8_t track, uint8_t frame);
     esp_err_t PresentEyePatch(uint8_t level);
     esp_err_t PresentPoseBase(uint8_t pose);
     /** s1as: idle standby ROI breathe — budgeted cycle, rest back to seed bookmark. */
@@ -275,10 +276,15 @@ private:
     /** s1cr-h: speaking mouth patch follow (independent of enter/MID). */
     bool mouth_follow_ = false;
     uint8_t mouth_pose_ = 0;
+    /** Displayed mouth pose. Target PCM level is rate-limited to avoid hard jumps. */
+    uint8_t mouth_visual_level_ = 0;
     uint8_t pose_blink_stage_ = 0;
     bool pose_blink_will_swap_ = false;
     int64_t eye_blink_due_us_ = 0;
     int64_t pose_switch_due_us_ = 0;
+    uint8_t life_target_pose_ = 0;
+    uint8_t life_blend_stage_ = 0;
+    int64_t life_due_us_ = 0;
     /** s1bl: frames advanced per MID tick after prime (1 = consecutive). */
     uint32_t face_anim_arc_step_ = 1;
     /** s1cb/E: absolute MJPEG frame index for MID decode_at (O(1) per tick). */

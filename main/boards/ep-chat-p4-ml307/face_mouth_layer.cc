@@ -9,6 +9,8 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_rom_sys.h>
+#include <esp_timer.h>
+#include <mbedtls/sha256.h>
 
 #define TAG "FaceMouth"
 
@@ -18,6 +20,8 @@ constexpr const char* kPackRoot = "/sdcard/dialogue_v2";
 constexpr size_t kLevelCount = 4;
 constexpr const char* kLevelName[kLevelCount] = {"closed", "small", "medium", "large"};
 constexpr size_t kEyeCount = 3;
+constexpr size_t kLifeFrameMax = 9;
+constexpr size_t kLifeTrackMax = 2;
 constexpr const char* kEyeName[kEyeCount] = {"open", "half", "closed"};
 
 std::atomic<bool> g_enabled{S1CR_H_MOUTH != 0};
@@ -25,6 +29,11 @@ std::atomic<bool> g_pack_present{false};
 std::atomic<uint8_t> g_level{0};
 std::atomic<uint8_t> g_level_drawn{0xff};
 std::atomic<uint32_t> g_gen{0};
+std::atomic<int64_t> g_last_pcm_us{0};
+
+// If output PCM stops, a retained last sample must not freeze the mouth open.
+// The face worker will ease this zero target through the available mouth poses.
+constexpr int64_t kPcmSilenceTimeoutUs = 140 * 1000;
 
 struct Patch {
     uint8_t* rgb = nullptr;
@@ -37,6 +46,13 @@ Patch g_hold_base;
 Patch g_pose1_patches[kLevelCount];
 Patch g_eye_patches[2][kEyeCount];
 Patch g_pose1_base;
+struct LifeFrame { Patch rgb; uint8_t* mask = nullptr; };
+LifeFrame g_life[kLifeTrackMax][kLifeFrameMax];
+uint8_t g_life_count[kLifeTrackMax] = {};
+int g_life_x[kLifeTrackMax] = {}, g_life_y[kLifeTrackMax] = {};
+uint8_t g_life_track_count = 0;
+bool g_mouth_precomposited = false;
+bool g_life_precomposited = false;
 uint8_t g_pose_count = 1;
 int g_roi_x = 0, g_roi_y = 0, g_roi_w = 0, g_roi_h = 0;
 int g_eye_x = 0, g_eye_y = 0, g_eye_w = 0, g_eye_h = 0;
@@ -74,6 +90,17 @@ void FreePatches() {
         heap_caps_free(g_pose1_base.rgb);
         g_pose1_base = {};
     }
+    for (size_t track = 0; track < kLifeTrackMax; ++track) {
+        for (size_t i = 0; i < kLifeFrameMax; ++i) {
+            if (g_life[track][i].rgb.rgb) heap_caps_free(g_life[track][i].rgb.rgb);
+            if (g_life[track][i].mask) heap_caps_free(g_life[track][i].mask);
+            g_life[track][i] = {};
+        }
+        g_life_count[track] = 0;
+    }
+    g_life_track_count = 0;
+    g_mouth_precomposited = false;
+    g_life_precomposited = false;
     g_pose_count = 1;
     g_ready = false;
     g_bound_emo[0] = '\0';
@@ -128,6 +155,29 @@ bool LoadSizedPatch(const char* path, uint16_t w, uint16_t h, Patch* out) {
     out->w = w;
     out->h = h;
     return true;
+}
+
+bool LoadMaskFile(const char* path, size_t expected, uint8_t** out) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    uint8_t* p = static_cast<uint8_t*>(heap_caps_malloc(expected, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!p) p = static_cast<uint8_t*>(heap_caps_malloc(expected, MALLOC_CAP_8BIT));
+    const bool ok = p && fread(p, 1, expected, f) == expected && fgetc(f) == EOF;
+    fclose(f);
+    if (!ok) { if (p) heap_caps_free(p); return false; }
+    *out = p;
+    return true;
+}
+
+void Sha256Hex(const uint8_t* data, size_t len, char out[65]) {
+    uint8_t digest[32];
+    mbedtls_sha256(data, len, digest, 0);
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < 32; ++i) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 15];
+    }
+    out[64] = '\0';
 }
 
 /** Load mouth closed/small/medium/large under dir (flexible height if stride matches roi_w). */
@@ -323,6 +373,60 @@ bool FaceMouth_BindEmotion(const char* emotion_name) {
         cJSON_Delete(root);
         return false;
     }
+    cJSON* mouth_composite = cJSON_GetObjectItem(render, "mouth_composite");
+    cJSON* mouth_method = mouth_composite ? cJSON_GetObjectItem(mouth_composite, "method") : nullptr;
+    g_mouth_precomposited = cJSON_IsString(mouth_method) &&
+                            strcmp(mouth_method->valuestring, "canonical_base_feather_v1") == 0;
+
+    if (strcasecmp(dir, "neutral") == 0 || strcasecmp(dir, "happy") == 0) {
+        cJSON* life = cJSON_GetObjectItem(render, "life_layer");
+        cJSON* composite_mode = life ? cJSON_GetObjectItem(life, "composite_mode") : nullptr;
+        g_life_precomposited = cJSON_IsString(composite_mode) &&
+                               strcmp(composite_mode->valuestring, "canonical_base_precomposited_v1") == 0;
+        cJSON* base_hash = life ? cJSON_GetObjectItem(life, "base_rgb565_sha256") : nullptr;
+        cJSON* tracks = life ? cJSON_GetObjectItem(life, "tracks") : nullptr;
+        char actual[65]; Sha256Hex(g_hold_base.rgb, hold_bytes, actual);
+        const bool hash_ok = cJSON_IsString(base_hash) && strcasecmp(base_hash->valuestring, actual) == 0;
+        for (size_t track = 0; hash_ok && track < kLifeTrackMax; ++track) {
+            cJSON* track_json = cJSON_IsArray(tracks) ? cJSON_GetArrayItem(tracks, (int)track) : nullptr;
+            cJSON* lr = track_json ? cJSON_GetObjectItem(track_json, "roi") : nullptr;
+            cJSON* lf = track_json ? cJSON_GetObjectItem(track_json, "frames") : nullptr;
+            const int lw = cJSON_IsObject(lr) && cJSON_GetObjectItem(lr, "width") ? cJSON_GetObjectItem(lr, "width")->valueint : 0;
+            const int lh = cJSON_IsObject(lr) && cJSON_GetObjectItem(lr, "height") ? cJSON_GetObjectItem(lr, "height")->valueint : 0;
+            g_life_x[track] = cJSON_IsObject(lr) && cJSON_GetObjectItem(lr, "x") ? cJSON_GetObjectItem(lr, "x")->valueint : 0;
+            g_life_y[track] = cJSON_IsObject(lr) && cJSON_GetObjectItem(lr, "y") ? cJSON_GetObjectItem(lr, "y")->valueint : 0;
+            const int count = cJSON_IsArray(lf) ? cJSON_GetArraySize(lf) : 0;
+            bool ok = lw >= 8 && lh > 0 && lh <= 48 && count > 1 && count <= (int)kLifeFrameMax;
+            for (int i = 0; ok && i < count; ++i) {
+                cJSON* item = cJSON_GetArrayItem(lf, i);
+                cJSON* rf = item ? cJSON_GetObjectItem(item, "rgb565") : nullptr;
+                cJSON* mf = item ? cJSON_GetObjectItem(item, "mask_a8") : nullptr;
+                if (!cJSON_IsString(rf) || !cJSON_IsString(mf)) { ok = false; break; }
+                char rp[224], mp[224];
+                snprintf(rp, sizeof(rp), "%s/%s/%s", kPackRoot, dir, rf->valuestring);
+                snprintf(mp, sizeof(mp), "%s/%s/%s", kPackRoot, dir, mf->valuestring);
+                ok = LoadSizedPatch(rp, (uint16_t)lw, (uint16_t)lh, &g_life[track][i].rgb) &&
+                     LoadMaskFile(mp, (size_t)lw * (size_t)lh, &g_life[track][i].mask);
+            }
+            if (!ok) {
+                for (size_t i = 0; i < kLifeFrameMax; ++i) {
+                    if (g_life[track][i].rgb.rgb) heap_caps_free(g_life[track][i].rgb.rgb);
+                    if (g_life[track][i].mask) heap_caps_free(g_life[track][i].mask);
+                    g_life[track][i] = {};
+                }
+                ESP_LOGW(TAG, "s1ej life_track_reject emo=%s track=%u count=%d", dir,
+                         (unsigned)track, count);
+                break;
+            }
+            g_life_count[track] = (uint8_t)count;
+            g_life_track_count = (uint8_t)(track + 1);
+            ESP_LOGW(TAG, "s1ej life_track_bind emo=%s track=%u frames=%u roi=%d,%d %dx%d hash=ok", dir,
+                     (unsigned)track, (unsigned)g_life_count[track], g_life_x[track], g_life_y[track], lw, lh);
+        }
+        if (!hash_ok) {
+            ESP_LOGW(TAG, "s1ej life_reject emo=%s hash=0", dir);
+        }
+    }
 
     cJSON* pose_bank = cJSON_GetObjectItem(render, "pose_bank");
     cJSON* pose_count = pose_bank ? cJSON_GetObjectItem(pose_bank, "count") : nullptr;
@@ -356,6 +460,7 @@ bool FaceMouth_BindEmotion(const char* emotion_name) {
     strncpy(g_bound_emo, dir, sizeof(g_bound_emo) - 1);
     g_ready = true;
     g_level.store(0, std::memory_order_relaxed);
+    g_last_pcm_us.store(0, std::memory_order_relaxed);
     g_level_drawn.store(0xff, std::memory_order_relaxed);
     g_gen.fetch_add(1, std::memory_order_relaxed);
     ESP_LOGW(TAG, "s1cy bind_ok emo=%s roi=%d,%d %dx%d poses=%u", dir, g_roi_x, g_roi_y,
@@ -397,9 +502,14 @@ void FaceMouth_PublishFromPcm(const int16_t* pcm, size_t samples) {
     }
     s_prev = level;
     g_level.store(level, std::memory_order_relaxed);
+    g_last_pcm_us.store(esp_timer_get_time(), std::memory_order_relaxed);
 }
 
 uint8_t FaceMouth_Level(void) {
+    const int64_t last_pcm_us = g_last_pcm_us.load(std::memory_order_relaxed);
+    if (last_pcm_us == 0 || esp_timer_get_time() - last_pcm_us > kPcmSilenceTimeoutUs) {
+        return 0;
+    }
     return g_level.load(std::memory_order_relaxed);
 }
 
@@ -490,4 +600,31 @@ void FaceMouth_Roi(int* x, int* y, int* w, int* h) {
     if (h) {
         *h = g_roi_h;
     }
+}
+
+bool FaceMouth_LifeReady(void) { return g_ready && g_life_track_count > 0; }
+bool FaceMouth_MouthPrecomposited(void) { return g_ready && g_mouth_precomposited; }
+bool FaceMouth_LifePrecomposited(void) { return FaceMouth_LifeReady() && g_life_precomposited; }
+uint8_t FaceMouth_LifeTrackCount(void) { return FaceMouth_LifeReady() ? g_life_track_count : 0; }
+uint8_t FaceMouth_LifeFrameCount(uint8_t track) {
+    return FaceMouth_LifeReady() && track < g_life_track_count ? g_life_count[track] : 0;
+}
+bool FaceMouth_LifeOverlapsMouth(uint8_t track) {
+    if (!FaceMouth_LifeReady() || track >= g_life_track_count || g_life_count[track] == 0) return true;
+    const int life_w = g_life[track][0].rgb.w;
+    const int life_h = g_life[track][0].rgb.h;
+    return g_life_x[track] < g_roi_x + g_roi_w && g_life_x[track] + life_w > g_roi_x &&
+           g_life_y[track] < g_roi_y + g_roi_h && g_life_y[track] + life_h > g_roi_y;
+}
+bool FaceMouth_LifeFrame(uint8_t track, uint8_t index, const uint8_t** rgb565, const uint8_t** mask_a8,
+                         uint16_t* w, uint16_t* h, int* x, int* y) {
+    if (!FaceMouth_LifeReady() || track >= g_life_track_count || index >= g_life_count[track] ||
+        !g_life[track][index].rgb.rgb || !g_life[track][index].mask) return false;
+    if (rgb565) *rgb565 = g_life[track][index].rgb.rgb;
+    if (mask_a8) *mask_a8 = g_life[track][index].mask;
+    if (w) *w = g_life[track][index].rgb.w;
+    if (h) *h = g_life[track][index].rgb.h;
+    if (x) *x = g_life_x[track];
+    if (y) *y = g_life_y[track];
+    return true;
 }

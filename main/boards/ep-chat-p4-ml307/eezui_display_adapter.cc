@@ -63,6 +63,10 @@ static constexpr int kEnterCadenceMs = 180;
 static constexpr int64_t kSpeakSettleUs = 700 * 1000;
 /** s1cr-h: mouth follow tick interval. */
 static constexpr int64_t kMouthFollowTickUs = 80 * 1000;
+/** s1ef: low-frequency life pose; deliberately slower than speech articulation. */
+static constexpr int64_t kLifeFirstDueUs = 2400 * 1000LL;
+static constexpr int64_t kLifeHoldUs = 4200 * 1000LL;
+static constexpr int64_t kLifeBlendStepUs = 360 * 1000LL;
 /** Display fence wait under AFE / fullscreen gate. */
 static constexpr uint32_t kFlushFenceWaitMs = 100;
 /** Common SafeLVGLLock budgets (values unchanged; names for readability). */
@@ -72,6 +76,15 @@ static constexpr int kLvglLockPresentMs = 80;
 static constexpr int kLvglLockMouthMs = 40;
 
 namespace {
+
+bool IsLifeLayerEmotion(const std::string& emotion) {
+    return strcasecmp(emotion.c_str(), "happy") == 0 ||
+           strcasecmp(emotion.c_str(), "neutral") == 0 ||
+           strcasecmp(emotion.c_str(), "standby") == 0 ||
+           strcasecmp(emotion.c_str(), "relaxed") == 0 ||
+           strcasecmp(emotion.c_str(), "laughing") == 0 ||
+           strcasecmp(emotion.c_str(), "funny") == 0;
+}
 
 struct BandRoiResult {
     int dirty_first = -1;
@@ -2388,9 +2401,13 @@ void EezuiDisplayAdapter::StopMouthFollow(const char* why) {
         return;
     }
     mouth_follow_ = false;
+    mouth_visual_level_ = 0;
     pose_blink_stage_ = 0;
     pose_blink_will_swap_ = false;
     mouth_pose_ = 0;
+    life_target_pose_ = 0;
+    life_blend_stage_ = 0;
+    life_due_us_ = 0;
     ESP_LOGW(TAG, "s1cr-h mouth_stop why=%s", why ? why : "-");
     esp_rom_printf("!!FACE_S1CR mouth_stop\n");
 }
@@ -2415,11 +2432,27 @@ void EezuiDisplayAdapter::ArmMouthFollow(const char* emotion_name) {
     const esp_err_t base_err = PresentFaceFrameToLvgl(
         base, (uint32_t)base_w * (uint32_t)base_h * 2U, base_w, base_h, true, false);
     if (base_err != ESP_OK) {
-        ESP_LOGW(TAG, "s1cx mouth_skip emo=%s base_present=%s", emotion_name, esp_err_to_name(base_err));
-        return;
+        // Speaking is intentionally allowed to reject a second fullscreen base
+        // transaction. Keep the already-present emotion hold and still arm the
+        // small mouth layer; dropping the whole layer freezes long TTS replies.
+        ESP_LOGW(TAG, "s1ee mouth_base_defer emo=%s base_present=%s (arm_on_hold)",
+                 emotion_name, esp_err_to_name(base_err));
+        // Strong-emotion animation tails are not geometrically identical to
+        // the layered pack's canonical base. Pasting its mouth onto that tail
+        // creates an obvious split face. Neutral/happy-like holds are the only
+        // measured-compatible fallback until manifest v2 carries a base hash.
+        if (!IsLifeLayerEmotion(emotion_name)) {
+            ESP_LOGW(TAG, "s1eg mouth_gen_reject emo=%s base_present=%s", emotion_name,
+                     esp_err_to_name(base_err));
+            return;
+        }
     }
     mouth_follow_ = true;
     mouth_pose_ = 0;
+    mouth_visual_level_ = 0;
+    life_target_pose_ = 0;
+    life_blend_stage_ = 0;
+    life_due_us_ = esp_timer_get_time() + kLifeFirstDueUs;
     pose_blink_stage_ = 0;
     pose_blink_will_swap_ = false;
     eye_blink_due_us_ = esp_timer_get_time() + 1800 * 1000LL;
@@ -2445,12 +2478,57 @@ void EezuiDisplayAdapter::MouthFollowTick() {
         StopMouthFollow("not_ready");
         return;
     }
-    uint8_t level = FaceMouth_Level();
-    if (FaceMouth_ConsumeLevelIfChanged(&level)) {
-        PresentMouthPatch(level);
+    const int64_t now = esp_timer_get_time();
+    const uint8_t target_level = FaceMouth_Level();
+    bool mouth_blit_this_tick = false;
+    if (target_level != mouth_visual_level_) {
+        // Attack is deliberately soft (one pose/tick). Release may close two
+        // poses/tick so silence does not leave an open mouth hanging onscreen.
+        if (target_level > mouth_visual_level_) {
+            mouth_visual_level_++;
+        } else {
+            const uint8_t delta = mouth_visual_level_ - target_level;
+            mouth_visual_level_ -= delta > 1 ? 2 : 1;
+        }
+        mouth_blit_this_tick = PresentMouthPatch(mouth_visual_level_) == ESP_OK;
+    }
+    const uint8_t level = mouth_visual_level_;
+    const bool life_eligible = FaceRouteV2_LifeLayerEnabled() &&
+                               st == kDeviceStateSpeaking &&
+                               FaceMouth_LifeReady() &&
+                               IsLifeLayerEmotion(face_anim_emo_);
+    if (life_eligible && now >= life_due_us_) {
+        // One flush band per worker tick.  A non-overlapping life track may use
+        // the next free tick even while speech keeps the mouth open; overlapping
+        // tracks still wait for a closed/small mouth to avoid facial tearing.
+        const bool overlaps_mouth = FaceMouth_LifeOverlapsMouth(life_target_pose_);
+        if (mouth_blit_this_tick) {
+            life_due_us_ = now + kMouthFollowTickUs;
+        } else if (overlaps_mouth && level > 1) {
+            life_due_us_ = now + 240 * 1000LL;
+        } else {
+            const uint8_t count = FaceMouth_LifeFrameCount(life_target_pose_);
+            const esp_err_t life_err = PresentLifeBand(life_target_pose_, life_blend_stage_);
+            if (life_err == ESP_OK) {
+                life_blend_stage_++;
+                if (life_blend_stage_ >= count) {
+                    life_blend_stage_ = 0;
+                    if (FaceMouth_LifeTrackCount() > 1) {
+                        life_target_pose_ = (uint8_t)((life_target_pose_ + 1) % FaceMouth_LifeTrackCount());
+                    }
+                    life_due_us_ = now + kLifeHoldUs;
+                } else {
+                    life_due_us_ = now + 160 * 1000LL;
+                }
+            } else {
+                life_due_us_ = now + 600 * 1000LL;
+            }
+        }
+    } else if (!life_eligible) {
+        life_blend_stage_ = 0;
+        life_target_pose_ = 0;
     }
     if (kBlinkPoseChoreographyEnabled && FaceMouth_PoseCount() > 1) {
-        const int64_t now = esp_timer_get_time();
         const bool pose_due = st == kDeviceStateSpeaking && level == 0 && now >= pose_switch_due_us_;
         const bool blink_due = now >= eye_blink_due_us_;
         if (pose_blink_stage_ == 0 && (pose_due || blink_due)) {
@@ -2479,7 +2557,7 @@ void EezuiDisplayAdapter::MouthFollowTick() {
             pose_blink_stage_ = 4;
         } else if (pose_blink_stage_ == 4) {
             PresentEyePatch(0);
-            PresentMouthPatch(FaceMouth_Level());
+            PresentMouthPatch(mouth_visual_level_);
             pose_blink_stage_ = 0;
             eye_blink_due_us_ = now + (2400 + mouth_pose_ * 700) * 1000LL;
             if (pose_blink_will_swap_) {
@@ -2491,6 +2569,68 @@ void EezuiDisplayAdapter::MouthFollowTick() {
     if (mouth_follow_ && face_anim_timer_ != nullptr) {
         esp_timer_start_once(face_anim_timer_, kMouthFollowTickUs);
     }
+}
+
+esp_err_t EezuiDisplayAdapter::PresentLifeBand(uint8_t track, uint8_t frame) {
+    const uint8_t* patch = nullptr;
+    const uint8_t* mask = nullptr;
+    uint16_t pw = 0, ph = 0;
+    int rx = 0, ry = 0;
+    if (!FaceMouth_LifeFrame(track, frame, &patch, &mask, &pw, &ph, &rx, &ry) ||
+        video_canvas_ == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!SafeLVGLLock(kLvglLockMouthMs)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    const lv_image_dsc_t* img = lv_canvas_get_image(video_canvas_);
+    if (img == nullptr || img->data == nullptr) {
+        SafeLVGLUnlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    auto* canvas = const_cast<uint8_t*>(static_cast<const uint8_t*>(img->data));
+    const uint32_t cw = (uint32_t)lv_obj_get_width(video_canvas_);
+    const uint32_t ch = (uint32_t)lv_obj_get_height(video_canvas_);
+    if (rx < 0 || ry < 0 || rx + pw > cw || ry + ph > ch || ph > 48) {
+        SafeLVGLUnlock();
+        return ESP_ERR_INVALID_SIZE;
+    }
+    auto blend565 = [](uint16_t dst, uint16_t src, uint16_t alpha) {
+        const uint32_t inv = 256U - alpha;
+        const uint32_t r = (((dst >> 11) & 0x1fU) * inv + ((src >> 11) & 0x1fU) * alpha) >> 8;
+        const uint32_t g = (((dst >> 5) & 0x3fU) * inv + ((src >> 5) & 0x3fU) * alpha) >> 8;
+        const uint32_t b = ((dst & 0x1fU) * inv + (src & 0x1fU) * alpha) >> 8;
+        return (uint16_t)((r << 11) | (g << 5) | b);
+    };
+    for (uint32_t y = 0; y < ph; ++y) {
+        auto* dst = reinterpret_cast<uint16_t*>(canvas + ((size_t)(ry + y) * cw + rx) * 2U);
+        const auto* src = reinterpret_cast<const uint16_t*>(patch + (size_t)y * pw * 2U);
+        if (FaceMouth_LifePrecomposited()) {
+            memcpy(dst, src, (size_t)pw * 2U);
+        } else {
+            const auto* a = mask + (size_t)y * pw;
+            for (uint32_t x = 0; x < pw; ++x) {
+                dst[x] = blend565(dst[x], src[x], (uint16_t)a[x] + (a[x] == 255 ? 1 : 0));
+            }
+        }
+    }
+    if (dialogue_box_ != nullptr) {
+        lv_obj_move_foreground(dialogue_box_);
+    }
+    lv_area_t coords;
+    lv_obj_get_coords(video_canvas_, &coords);
+    lv_area_t area{coords.x1, coords.y1 + ry,
+                   coords.x1 + (int32_t)cw - 1, coords.y1 + ry + ph - 1};
+    lv_obj_invalidate_area(video_canvas_, &area);
+    if (presenter_ != nullptr) {
+        presenter_->FlushCaptionIfDirty();
+    }
+    SafeLVGLUnlock();
+    ESP_LOGW(TAG, "s1el life_blit track=%u frame=%u roi=%d,%d %ux%u compose=%s overlap_mouth=%d", (unsigned)track,
+             (unsigned)frame, rx, ry, (unsigned)pw, (unsigned)ph,
+             FaceMouth_LifePrecomposited() ? "canonical" : "legacy_alpha",
+             FaceMouth_LifeOverlapsMouth(track) ? 1 : 0);
+    return ESP_OK;
 }
 
 esp_err_t EezuiDisplayAdapter::PresentMouthPatch(uint8_t level) {
@@ -2524,11 +2664,32 @@ esp_err_t EezuiDisplayAdapter::PresentMouthPatch(uint8_t level) {
     if (ry + (int)ph > (int)ch) {
         ph = (uint16_t)(ch - (uint32_t)ry);
     }
-    // Flush quantum is full-width × rows: copy mouth rows across full width from base
-    // only where patch sits; invalidate full-width band covering mouth height.
+    // The current PC pack already composites each mouth pose against the same
+    // canonical hold base.  Copying it is both deterministic and cheaper than
+    // blending against the previous (possibly different) mouth pose.  Keep the
+    // legacy four-row blend only for older packs without that manifest contract.
+    constexpr uint16_t kFeatherRows = 4;
+    auto blend565 = [](uint16_t dst, uint16_t src, uint16_t alpha256) {
+        const uint32_t inv = 256U - alpha256;
+        const uint32_t r = (((dst >> 11) & 0x1fU) * inv + ((src >> 11) & 0x1fU) * alpha256) >> 8;
+        const uint32_t g = (((dst >> 5) & 0x3fU) * inv + ((src >> 5) & 0x3fU) * alpha256) >> 8;
+        const uint32_t b = ((dst & 0x1fU) * inv + (src & 0x1fU) * alpha256) >> 8;
+        return (uint16_t)((r << 11) | (g << 5) | b);
+    };
     for (uint16_t y = 0; y < ph; y++) {
-        memcpy(canvas_buf + ((size_t)(ry + y) * cw + (size_t)rx) * 2,
-               patch + ((size_t)y * pw) * 2, (size_t)pw * 2);
+        auto* dst = reinterpret_cast<uint16_t*>(
+            canvas_buf + ((size_t)(ry + y) * cw + (size_t)rx) * 2);
+        const auto* src = reinterpret_cast<const uint16_t*>(patch + ((size_t)y * pw) * 2);
+        const uint16_t edge = std::min<uint16_t>(y, (uint16_t)(ph - 1U - y));
+        if (FaceMouth_MouthPrecomposited() || edge >= kFeatherRows) {
+            memcpy(dst, src, (size_t)pw * 2);
+        } else {
+            // Row 0 stays on the current hold; rows 1..3 progressively merge.
+            const uint16_t alpha256 = (uint16_t)((uint32_t)edge * 256U / kFeatherRows);
+            for (uint16_t x = 0; x < pw; x++) {
+                dst[x] = blend565(dst[x], src[x], alpha256);
+            }
+        }
     }
     if (dialogue_box_ != nullptr) {
         lv_obj_move_foreground(dialogue_box_);
@@ -2546,8 +2707,9 @@ esp_err_t EezuiDisplayAdapter::PresentMouthPatch(uint8_t level) {
     }
     SafeLVGLUnlock();
     if (FaceRouteV2_ShouldLogFrame()) {
-        ESP_LOGW(TAG, "s1cr-h mouth_blit level=%u roi=%d,%d %ux%u", (unsigned)level, rx, ry,
-                 (unsigned)pw, (unsigned)ph);
+        ESP_LOGW(TAG, "s1el mouth_blit level=%u roi=%d,%d %ux%u compose=%s", (unsigned)level, rx, ry,
+                 (unsigned)pw, (unsigned)ph,
+                 FaceMouth_MouthPrecomposited() ? "canonical" : "legacy_feather");
     }
     return ESP_OK;
 }

@@ -15,7 +15,7 @@
 
 #define TAG "BootTrace"
 // s1db: behavior-preserving extract (ShowFaceCanvasLayers / band ROI helpers); paths = s1da.
-#define FW_MARKER "boot_trace_v10_s1db_clean_extract"
+#define FW_MARKER "boot_trace_v10_s1eo_reminder_defer_spk_noop"
 
 namespace {
 

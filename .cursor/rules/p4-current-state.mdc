@@ -1,0 +1,141 @@
+---
+description: P4 当前战役状态 — 唯一常改文件（阶段/known-good/marker/主矛盾方面/下一刀）
+alwaysApply: false
+---
+
+# P4 当前状态（唯一常改）
+
+> 只放**会过期的**内容：阶段、known-good、当前 marker、主矛盾方面、下一刀、冻结项。
+> 长期原则不写这里（写 core / hard-constraints）。每批次**同回合**更新本文件 + 账本。
+> 更新日期：2026-08-16。
+
+## 一、你在这
+
+| 项 | 值 |
+|----|----|
+| **战争阶段** | 战略**防御**（P4 v1.0 MSPI-751 硅片病，v3.1 才修；软件只降触发窗口） |
+| **主矛盾方面** | PSRAM 总线突发 ∩ 硅片 errata；保 200M 合比值，禁降 20M，禁业务刀修硅片 |
+| **known-good（寿命）** | `s1cm`（`reboot_audit.py` mean≈2054s / min≈324s / n=14）；`elf_snapshots/xiaozhi_s1cm.elf` + `fw_archive/xiaozhi_s1cm.bin` |
+| **known-good（结构清洁）** | `s1db_clean_extract`（行为守恒抽取，已上 GitHub `tools/` 同批） |
+| **当前上板 marker** | `boot_trace_v10_s1eo_reminder_defer_spk_noop`：2026-08-16 已写 bootloader/partition/otadata/双 OTA/assets，各分区写入校验通过；限时串口启动确认 marker、`reason=USB`、`PANIC_LAST none`。SD 与业务验收仍须物理冷启。s1el仍是当前体验回退基线。 |
+| **当前源码 marker** | `boot_trace_v10_s1eo_reminder_defer_spk_noop`：以s1en（行为锚定s1el）为底，只吸收远端提醒分支的忙时MQTT合并延后与扬声器幂等准备；不改会话/LVGL/UDP/ACK主流程。`CONFIG_REMINDER_DEFER_BUSY_WAKE=y` 已确认进入BIN/ELF；完整构建成功、归档并上板，尚未完成冷启业务验收。 |
+| **综合进度** | **60%（体验集成/工程可复现门）**：M0完成；M1的StaticHold、独立小嘴层、latest-value、单tick单条带、canonical合成、双轨life与ROI仲裁已集成；s1el短时体验通过，s1en源码根据地可复现。此数字不代表M1寿命门通过，per-marker仍需n≥4且mean不低于s1cm。 |
+| **PC life 素材** | `mjpeg_ai_dialogue_v4_temporal_feather` 已生成并校验 6/6：双48行轨迹、空间A8羽化、固定9帧时间包络；12条轨迹首尾ROI均逐像素等于canonical base。旧固件 assets+原始 MJPEG+v2 posebank 已备份到 `xiaozhi-p4-epdainaozhong/backups/expression_assets_pre_life_20260816/` |
+| **face 阶段** | **M1体验集成到60%，今天冻结**：板上s1el为用户验收基线；源码s1en恢复同等行为并移除失败实验。M2五档VisualBudget与通用M3 manifest尚未进入；最大嘴形空间接缝和节拍器限速留待下一工作日分批处理。稳定硬约束（AFE栈、PSRAM 200M、AFE↔face互斥、最终DMA fence、BootTrace）保持。 |
+
+## 二、face 演进（存活门阶梯，取代旧「视觉门」L1m/L3b）
+
+> **组织原则不是 React 隐喻，而是「每 tick PSRAM 突发预算账」**：每个渲染器声明自己每秒的 PSRAM 写后读字节数（量子＝全宽×50 行≈24KB/条带），阶段对**总突发**设上限，实测卡门。
+> **每一级的门都是「per-marker 平均寿命不回退」**（视觉指标次要）；**每个视觉特性挂 R0 flag**（回归=一次重启，不是项目停摆）。
+
+| 级 | 内容 | 门（存活优先） |
+|----|------|----------------|
+| **M0 防御·现在** | 静态优先·零稳态突发：对话 **StaticHold**（情绪 seed 静帧，无 per-tick 行带）；idle 低频 BAND breathe 或小图眨眼（≥900ms、AFE busy 时 mutex 让路）；全屏底图仅安全窗单例 | mean ≥ s1cm(≈2054s) 不回退；否则 R0 关回退 |
+| **M1 防御→相持** | **仅 Speaking** 嘴部 6–8Hz，**每 tick 硬上限 1 行带**，latest-value 队列；预算简化为 **2 态**（MouthOK/Frozen），单信号驱动（播放队列深度/近期欠载） | 需 SD 有 `dialogue_v2` layered 包（`mouth_arm`/`mouth_blit`）；嘴部延迟<120ms、静音~150ms 闭嘴，**且 mean 不回退**；回退则冻回 M0 |
+| **M2 相持** | 情绪 enter/hold/exit（enter 短·全帧·安全窗·单例）+ 眨眼小图；此时才上 **5 档 VisualBudget** | mean 不回退 |
+| **M3 反攻** | manifest v2 工具链 + 能力渲染；绞杀对话期 ≥400 行兼容路径；可选 L4 硬件 ROI（默认关） | 需 v3.1 硅片**或** v1.0 已证大余量 |
+
+**诚实结论**：v1.0 硅片上，「静态优先」不是兜底，是**正确稳态**；丝滑嘴部是 M1 起、随时可被寿命门否决冻回 M0 的**条件收益**。
+
+## 三、下一临界路径
+
+> **2026-08-16 s1ej 当前刀**：先烧录并冷启，确认 `life_track_bind track=0/1`；长 TTS 中应看到两轨逐轮交替而非并发。验收第二轮唤醒、字幕、音频连续性与接缝；若复位或体验回退，R0 直接烧回已归档 s1eh，不改会话/AFE。
+
+> **2026-08-16 s1ek 下一验收**：先把 `mjpeg_ai_dialogue_v4_temporal_feather` 整包替换到 SD `/sdcard/dialogue_v2/`，再烧录并物理断电冷启。日志应显示 `compose=canonical`；观察嘴层水平线、life结束残影和双轨衔接，同时复验第二轮唤醒/字幕/音频。任何功能回退直接回烧 s1ej 并恢复v3包。
+
+> **2026-08-16 s1el 下一验收**：天气/happy 长TTS应出现 `s1el life_blit ... overlap_mouth=0`，且同一worker tick不与mouth blit并发；neutral相交轨迹保持闭嘴门。angry不新增life，只观察原有强情绪底图+嘴层是否仍感到资源紧张。若音频或会话回退，直接回烧s1ek。
+
+> **2026-08-16 s1em 当前验收**：先构建并归档匹配ELF，再写bootloader/partition/otadata/双OTA/assets。冷启须见 `FW_MARKER ...s1em...`、`SD_MOUNT_OK`、`seed_stills done ok=6/6`。长TTS中正常态应以 `budget=MouthOK` 为主；只在真实短欠载边沿出现有限 `budget=Frozen→MouthOK`，期间不能停在张嘴末帧。复验字幕、音频连续性、退出及3秒内第二轮唤醒；任何功能回退R0关 `S1EM_J_VISUAL_BUDGET2` 或R1回烧已归档s1el。寿命n<4只记样本，不判稳。
+
+> **2026-08-16 s1em 裁决/下一刀**：s1em 已触发 M−并回烧s1el，用户确认回退版整体体感可接受。下一版禁止继续调 Frozen 时长：先把源码重锚到s1el行为，再将预算改为“节拍器限速 + generation/session重置 + 不补跳”；嘴部空间接缝另由PC素材同generation扩大软过渡区处理。时间问题与空间问题分批验收。
+
+> **2026-08-16 s1en 收口**：源码已重锚s1el并编译归档，不烧录、不改变当前已验收设备。综合进度记60%，今天停止出刀。下一工作日先做PC侧最大嘴形边界差报告/软过渡素材（不改固件），再单独设计非追赶式刷新节拍；两者禁止同批上板。
+> **2026-08-16 s1eo 提醒灰度批次**：远端 `agent/com4-proactive-reminder-stability` 是431990增/1308删的混合提交，禁止整包合入。仅吸收：(1) MQTT唤醒忙时合并为一个pending，空闲后约1秒重试；(2)播放路由已ready时`PrepareSpeakerPlayback()`幂等返回。R0=`CONFIG_REMINDER_DEFER_BUSY_WAKE`；M+=`poll_deferred_set -> poll_deferred_begin`、`speaker_prepare_noop`；M-=普通对话状态机/表情/UDP路径变化。TTS预缓冲、远程重复响铃、UDP重排、vendor ML307与EEZ UI暂缓，分别独立marker验证。
+> **2026-08-16 s1eo 上板记录**：完整镜像与 assets 已写入并通过 esptool hash 校验；启动捕获到 `FW_MARKER boot_trace_v10_s1eo_reminder_defer_spk_noop`、`PANIC_LAST none`。本次是 USB reset，不能替代 SD 冷启门；下一步物理断电冷启后验 `SD_MOUNT_OK`、`seed_stills done ok=6/6`，再验普通对话、退出及 3 秒内第二轮唤醒，最后验忙时提醒延后闭环。n<4 不判稳定。
+
+1. 不主动打开会触发 USB reset 的旧串口监控。直接验 GitHub exact `s1db_clean_extract`：说“你休息吧”应退出；另测云端自然结束；两者都须在 3 秒内可开启第二轮。
+2. 先验字幕：中文必须正常，不得出现白色块；再验首轮唤醒→STT→TTS。
+3. 连续完成至少三轮对话；每轮退出后 3 秒内重新唤醒，不能停最后一帧，不能持续 FEED full。
+4. 基线门通过后，按顺序灰度合回：MQTT UDP熔断 → 主动提醒speaker ready/ACK → TTS预缓冲；每项独立 marker/判据。动画体验只在基线音频门通过后继续。
+
+## 四、冻结项（未获用户再裁定禁出刀）
+
+`A` cap 400→450/480 · `B` 回退固定 240×300 · `F` MID 18→24/30 · `G` MID 160→120ms · `H` breathe 更密 · `I/P0` 200M→20M（已证方向错）。
+
+## 五、提醒
+
+- 不得因再次复位就关 idle 动态或整个表情系统（投降式假稳定，违 B3/F6）。
+- 无有效 layered pack 不开 VisualBudget；不得从 480² 全帧实时抠嘴冒充分层。
+- 采集健康先于判稳（`serial_monitor.log` 在长、`pos` 在动，才算在收）。
+
+## 六、两周稳定性审计（2026-08-16，`reboot_audit.py`，`prev_t` 单位 ms→下表已换算秒）
+
+> **与三/四节的「功能基线重锚定」是并行矛盾，分刀处理**（B4）。本节只管硅片稳定性，不碰第二轮唤醒/字幕功能。
+
+**per-marker 寿命（近两周主线，mean 秒 / n）**：s1cm 2054(n14,基线) → s1ct 2816(8) → s1cu 2334(5) → **s1dc 16878(4,min2861)** → **s1dd 39465(10,min606)** → **s1de 29088(4,min3157)** → ⚠**s1di 118(4)** / ⚠**s1dq 63(1)** 明显回归；s1ed 无样本（太新）。
+
+**规模坐实（356 次 REBOOT）**：
+- **崩点 66%=`FACE_PRESENT`**（234/356）＝**最大 PSRAM 消费者=暴露面**，非脸有罪。
+- **mtval 直方图 ~90% MSPI-751 指纹**：65 合法 PSRAM 读失败 + ~40 nibble 互换/移位（`0x84../0x04../0x8e..`）+ 18 null + 8 `0xF...`。硅片病，软件不可根治。
+- **少数可修类**：26 内部 SRAM mtval，含 `mtval≈sp`（如 s1dc `mtval=0x4ff55624 sp=0x4ff55610` Δ20B）＝**栈/ISR 溢出**，与硅片分流单独修。
+
+**结论 → 战略转向韧性/冗余存活**（架构见 `xiaozhi-p4-core.mdc` 原则 **H**、落地约束见 `p4-hard-constraints.mdc` §8）：预防已触硅片地板，s1dc/s1dd/s1de 已把量级推到 4–11 小时；下一量级靠**廉价存活 + 冗余**，不靠再降暴露。
+
+## 七、韧性下一刀（R 系列，独立于功能重锚定；均 R0/独占按注）
+
+| 序 | 刀 | 内容 | 四问速记 |
+|----|----|------|---------|
+| **R0-triage** | 崩因自动分流 | audit/BootTrace 自动标 `mtval≈sp`(栈,可修) vs nibble-swap(硅片,只降暴露)，先修栈类 | S1/D0/R0/V1 |
+| **R1-guard** | PSRAM 读前校验 | 热路径 PSRAM 读出的指针/索引 deref 前范围+对齐校验，越界走安全默认不 deref | S2/D1/R0/V2 |
+| **R2-sram** | 关键控制态迁 SRAM | face/情绪/会话/提醒队列的**控制结构**放 `MALLOC_CAP_INTERNAL`，PSRAM 只留像素 | S3/D2/**独占+先 known-good**/V3 |
+| **R3-warm** | 暖启动恢复 | 崩溃复位区分 power-on，快贴 last-good seed（RTC/NVS 最小态），把黑屏冷启降为秒级闪回 | S2/D2/**独占**/V2 |
+| **R4-bisect** | s1di/s1dq 回归二分 | 定位 reminder_gray_v1 / face_window_local_end 为何从 8h 掉到 ~100s | S2/D0/R0/V3 |
+
+- 先出 **R0-triage + R1-guard + R4-bisect**（R0/低损失，可与功能重锚定并行批次，独立标记）；R2/R3 改内存布局/启动，须独占 + 先建 known-good。
+
+## 八、存档点 + 分支可吸收 backlog（2026-08-16 s1eo）
+
+> GitHub 存档：`Zfh-charles/esp32-p4-i2cpolling`，marker=`boot_trace_v10_s1eo_reminder_defer_spk_noop`。
+> 远端混合提交 `agent/com4-proactive-reminder-stability`（+431990/−1308）**禁止整包合入**。下列按坏味道拆成独立可关断项，过门再吸。
+
+### 已吸收（本存档包含）
+
+- route-v2 防御批：worker / emotion3 / fs_gate / StaticHold / full_still / enter_arc
+- M1 体验 60%：独立嘴层 + latest-value + 单 tick 单条带 + canonical 预合成 + 双轨 life（每 tick 一轨）+ ROI 仲裁
+- s1eo：忙时 MQTT 合并为一个 pending、空闲约 1s 重试；`PrepareSpeakerPlayback()` 已 ready 时幂等返回。R0=`CONFIG_REMINDER_DEFER_BUSY_WAKE`
+
+### 下一工作日优先（空间/时间分批，禁同板上板）
+
+| 序 | 项 | 来源/教训 | 做法 | 禁 |
+|----|----|-----------|------|-----|
+| **P-seam** | 最大嘴形空间接缝 | s1en 收口 | **只改 PC 素材**：同 generation 扩大软过渡区；出边界差报告。不改固件 | 禁为接缝重编码原始 MJPEG；禁固件再做 alpha 累计 |
+| **F-metro** | 节拍器限速 | s1em Frozen 时长 M− | generation/session 重置 + **不补跳**；禁再调 Frozen 时长 | 禁与 P-seam 同批上板 |
+| **R4** | s1di/s1dq 寿命回归 | 审计 8h→~100s | 开关二分 reminder_gray / face_window | 禁用砍脸修回归 |
+
+### 灰度可吸（各独立 marker + R0 + 独立 M+/M−）
+
+| 序 | 项 | 说明 |
+|----|----|------|
+| **G-udp-fuse** | MQTT UDP 熔断 | s1dz 基线门通过后第一项；不夹带媒体路径大改 |
+| **G-ack** | 提醒 speaker-ready / TTS-ACK | s1eo 只吸了幂等 prepare；ACK 仍须「真收到音频再 ack」 |
+| **G-tts-prebuf** | TTS 预缓冲 | 曾引发体验回退，须单独 marker；禁与会话状态机同批 |
+| **G-repeat-ring** | 远程重复响铃 | 混合提交里的，未验证 |
+| **G-udp-reorder** | UDP 重排 | 混合提交里的；动媒体路径＝独占 + 先 known-good |
+
+### 明确不吸 / 已证伪
+
+- **整包**合入 `com4-proactive-reminder-stability` 或 vendor ML307 / EEZ UI 大 diff
+- 继续加长/缩短 **Frozen 时长**（s1em M−）
+- posebank 眨眼作为正式包（已回退；仅 `tools/experimental/`）
+- 对话期 ≥400 行 MID、全帧抠嘴、200M→20M、关 AFE/表情保命
+
+### 韧性系列（与体验分刀，见第七节）
+
+`R0-triage` → `R1-guard` → `R4-bisect` 可与灰度并行；`R2-sram` / `R3-warm` 独占。
+
+### 代码味道债（存档后整理，不在本批改热路径）
+
+- `eezui_display_adapter.cc` 仍是上帝类（Present/Tick/字幕/life）；只允许**行为守恒抽取**，禁顺手改时序
+- `dialogue_emotion_builder.py` 单文件兼索引/ROI/life/校验：PC 侧可按「扫描 / 生成 / 校验」拆模块
+- 根目录 `tools/emotion_roi_builder` 仅剩 `__pycache__`＝死代码，以 `emotion_tool_dev` 为准
+- 串口脚本三份（`read-com` / `read_serial` / `serial_boot_capture`）职责重叠，归档后收敛到 `tools/stability/`

@@ -47,6 +47,14 @@ const uint8_t* FaceMouth_EyePatchRgb565(uint8_t pose, uint8_t level,
                                        uint16_t* out_w, uint16_t* out_h);
 void FaceMouth_EyeRoi(int* x, int* y, int* w, int* h);
 void FaceMouth_Roi(int* x, int* y, int* w, int* h);
+bool FaceMouth_MouthPrecomposited(void);
+bool FaceMouth_LifeReady(void);
+bool FaceMouth_LifePrecomposited(void);
+uint8_t FaceMouth_LifeTrackCount(void);
+uint8_t FaceMouth_LifeFrameCount(uint8_t track);
+bool FaceMouth_LifeOverlapsMouth(uint8_t track);
+bool FaceMouth_LifeFrame(uint8_t track, uint8_t index, const uint8_t** rgb565, const uint8_t** mask_a8,
+                         uint16_t* w, uint16_t* h, int* x, int* y);
 
 #ifdef __cplusplus
 }

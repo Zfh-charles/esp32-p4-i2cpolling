@@ -12,6 +12,7 @@
 #include "http.h"
 
 #include <esp_log.h>
+#include <cstdio>
 #include <cstring>
 #include <cJSON.h>
 #include <esp_timer.h>
@@ -216,32 +217,85 @@ void ReminderPoller::Stop() {
 }
 
 void ReminderPoller::TriggerPoll() {
+#if CONFIG_REMINDER_DEFER_BUSY_WAKE
+    DeferPoll("mqtt");
+#else
     if (poll_task_handle_ != nullptr) {
         ESP_LOGI(TAG, "MQTT wake -> trigger HTTP poll");
         xTaskNotifyGive(poll_task_handle_);
     }
+#endif
 }
+
+#if CONFIG_REMINDER_DEFER_BUSY_WAKE
+void ReminderPoller::DeferPoll(const char* reason) {
+    const bool was_pending = deferred_poll_pending_.exchange(true);
+    if (!was_pending) {
+        deferred_wait_logged_.store(false);
+        REMINDER_TRACE_LOG("poll_deferred_set | reason=%s", reason ? reason : "unknown");
+    }
+    if (poll_task_handle_ != nullptr) {
+        xTaskNotifyGive(poll_task_handle_);
+    }
+}
+
+void ReminderPoller::TracePollBlocked(const char* reason) {
+    if (deferred_poll_pending_.load()) {
+        if (!deferred_wait_logged_.exchange(true)) {
+            REMINDER_TRACE_LOG("poll_deferred_wait | reason=%s", reason ? reason : "unknown");
+        }
+    } else {
+        REMINDER_TRACE_LOG("poll_skip | reason=%s", reason ? reason : "unknown");
+    }
+}
+#endif
 
 void ReminderPoller::DoPollOnce() {
     auto& app = Application::GetInstance();
 #if CONFIG_USE_ALARM
     if (app.GetDeviceState() == kDeviceStateAlarm || app.IsAlarmRinging()) {
+#if CONFIG_REMINDER_DEFER_BUSY_WAKE
+        TracePollBlocked("alarm");
+#else
         REMINDER_TRACE_LOG("poll_skip | reason=alarm");
+#endif
         ESP_LOGD(TAG, "Skip poll, local alarm ringing");
         return;
     }
 #endif
     if (app.GetDeviceState() != kDeviceStateIdle) {
+#if CONFIG_REMINDER_DEFER_BUSY_WAKE
+        char reason[48];
+        snprintf(reason, sizeof(reason), "state_%s",
+                 ReminderTraceDeviceStateName(app.GetDeviceState()));
+        TracePollBlocked(reason);
+#else
         REMINDER_TRACE_LOG("poll_skip | reason=state_%s", ReminderTraceDeviceStateName(app.GetDeviceState()));
+#endif
         ESP_LOGD(TAG, "Skip poll, device state not idle");
         return;
     }
     if (app.GetSessionKind() != SessionKind::None) {
+#if CONFIG_REMINDER_DEFER_BUSY_WAKE
+        char reason[48];
+        snprintf(reason, sizeof(reason), "session_%s",
+                 ReminderTraceSessionKindName(static_cast<int>(app.GetSessionKind())));
+        TracePollBlocked(reason);
+#else
         REMINDER_TRACE_LOG("poll_skip | reason=session_%s",
                            ReminderTraceSessionKindName(static_cast<int>(app.GetSessionKind())));
+#endif
         ESP_LOGI(TAG, "Skip poll, session active (kind=%d)", (int)app.GetSessionKind());
         return;
     }
+
+#if CONFIG_REMINDER_DEFER_BUSY_WAKE
+    const bool was_deferred = deferred_poll_pending_.exchange(false);
+    deferred_wait_logged_.store(false);
+    if (was_deferred) {
+        REMINDER_TRACE_LOG("poll_deferred_begin");
+    }
+#endif
 
     Settings settings("reminder_poll", false);
     std::string poll_url = ExpandDeviceIdInUrl(settings.GetString("poll_url"));
@@ -329,12 +383,15 @@ void ReminderPoller::DoPollOnce() {
         ack_url = ExpandDeviceIdInUrl(ack_url);
     }
 
-    app.Schedule([id, prompt, emotion, wake_text, mode, ack_url]() {
+    app.Schedule([this, id, prompt, emotion, wake_text, mode, ack_url]() {
         auto& application = Application::GetInstance();
 #if CONFIG_USE_ALARM
         if (application.GetDeviceState() == kDeviceStateAlarm || application.IsAlarmRinging()) {
             REMINDER_TRACE_LOG("deliver_skip | reason=alarm id=%s", id.c_str());
             ESP_LOGW(TAG, "Skip delivery for %s, local alarm ringing", id.c_str());
+#if CONFIG_REMINDER_DEFER_BUSY_WAKE
+            DeferPoll("deliver_alarm");
+#endif
             return;
         }
 #endif
@@ -342,11 +399,17 @@ void ReminderPoller::DoPollOnce() {
             REMINDER_TRACE_LOG("deliver_skip | reason=state_%s id=%s",
                                ReminderTraceDeviceStateName(application.GetDeviceState()), id.c_str());
             ESP_LOGW(TAG, "Skip delivery for %s, device no longer idle", id.c_str());
+#if CONFIG_REMINDER_DEFER_BUSY_WAKE
+            DeferPoll("deliver_state");
+#endif
             return;
         }
         if (application.IsProactiveReminderPending()) {
             REMINDER_TRACE_LOG("deliver_skip | reason=proactive_pending id=%s", id.c_str());
             ESP_LOGW(TAG, "Skip delivery for %s, proactive reminder in flight", id.c_str());
+#if CONFIG_REMINDER_DEFER_BUSY_WAKE
+            DeferPoll("deliver_proactive_pending");
+#endif
             return;
         }
         if (application.GetSessionKind() != SessionKind::None) {
@@ -354,6 +417,9 @@ void ReminderPoller::DoPollOnce() {
                                ReminderTraceSessionKindName(static_cast<int>(application.GetSessionKind())),
                                id.c_str());
             ESP_LOGW(TAG, "Skip delivery for %s, session active", id.c_str());
+#if CONFIG_REMINDER_DEFER_BUSY_WAKE
+            DeferPoll("deliver_session");
+#endif
             return;
         }
 
@@ -392,7 +458,12 @@ void ReminderPoller::PollTask() {
     while (running_) {
         DoPollOnce();
         const uint32_t interval_ms = CONFIG_REMINDER_POLL_INTERVAL_SEC * 1000U;
+#if CONFIG_REMINDER_DEFER_BUSY_WAKE
+        const uint32_t wait_ms = deferred_poll_pending_.load() ? 1000U : interval_ms;
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms));
+#else
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(interval_ms));
+#endif
     }
     poll_task_handle_ = nullptr;
     vTaskDelete(nullptr);

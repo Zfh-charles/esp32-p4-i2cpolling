@@ -1,0 +1,38 @@
+# xiaozhi-p4-epdainaozhong — 产品地图（历史/索引）
+
+> 本文件已**降为产品地图 + 分层索引**。可执行规则见分层文件（下表）。冲突时以 `AGENTS.md` 与用户当前要求为准。
+
+## 分层规则索引（读哪份）
+
+| 需要 | 文件 |
+|------|------|
+| 每回合唯一必读（四问/批次/预算） | `.cursor/rules/p4-session-preflight.mdc` |
+| 改 `main/**` 前的冻结事实（SD/AFE/Opus/硅片/烧录/显示） | `.cursor/rules/p4-hard-constraints.mdc` |
+| 崩溃归因序 + 表情战史账本 + 演进阶梯 | `.cursor/rules/face-emotion-sd.mdc` |
+| 跨阶段原则 A–G + 阶段定义 | `.cursor/rules/xiaozhi-p4-core.mdc` |
+| 世界观/方法论/第一性原理 | `.cursor/rules/p4-strategy-philosophy.mdc` |
+| 当前阶段/known-good/marker/下一刀（唯一常改） | `.cursor/rules/p4-current-state.mdc` |
+| 长期工程契约 | `AGENTS.md` |
+
+## 项目是什么
+
+- 工程根：`xiaozhi-p4-epdainaozhong/`（ESP-IDF 5.4，ESP32-P4）；板级：`main/boards/ep-chat-p4-ml307/`。
+- 产品：语音对话机器人；待机/对话 UI 走 LVGL + EEZ；表情来自 **SD 卡 MJPEG**（`/sdcard/...`）。
+- 串口默认 **COM7**；监控：`serial_monitor.py`→`serial_monitor.log`；`stability_watch.py`→`stability_alerts.log`。
+
+## 关键代码地图
+
+| 模块 | 路径 | 职责 |
+|------|------|------|
+| 显示适配 | `eezui_display_adapter.cc/.h` | LVGL canvas、SetEmotion、FACE_STILL/ROI、字幕样式 |
+| Presenter | `screen_presenter.*` | 对话态提交、情绪通知 |
+| 表情解码 | `emotion_video_player.c/.h` | SD MJPEG、seed_stills、decode_one/at |
+| 嘴部/眼部分层 | `face_mouth_layer.c/.h` | layered 小图（M1 起） |
+| route-v2 开关 | `face_route_v2.h` | 运行期 flag（s1cn–s1cr） |
+| SD | `sd_scanner.c` | 挂载 `/sdcard`；**已挂载禁拆卡重挂** |
+| 应用 | `application.cc` | 状态机、P2 preload、STT hint、MJPEG pause、上行 Opus |
+| MQTT+UDP | `mqtt_protocol.cc` | 控制 JSON（MQTT）；语音 Opus 在 UDP（`SendAudio`） |
+
+## 核心抽象（一句话）
+
+React 式 LVGL：一次 seed → 状态增量 Commit → 局部刷新；「局部」由**素材能力**定义（`full_frame_clip`/`fixed_roi_clip`/`layered`/`static`），不由固定行数定义。对话＝静态情绪底图 + 音频驱动嘴部小层；全画幅动画只在安全窗一次性播。细节与阶段见 `face-emotion-sd.mdc` 与 `p4-current-state.mdc`。

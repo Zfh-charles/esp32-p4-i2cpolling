@@ -21,6 +21,7 @@ std::atomic<bool> g_d_quiet{S1CN_D_QUIET_LOG != 0};
 std::atomic<bool> g_e_static_dialogue{S1CO_E_STATIC_DIALOGUE != 0};
 std::atomic<bool> g_f_full_still{S1CP_F_FULL_STILL != 0};
 std::atomic<bool> g_g_enter_arc{S1CP_G_ENTER_ARC != 0};
+std::atomic<bool> g_i_life_layer{S1EF_I_LIFE_LAYER != 0};
 
 std::atomic<bool> g_fs_busy{false};
 std::atomic<bool> g_fs_holds_afe{false};
@@ -71,6 +72,9 @@ bool FaceRouteV2_FullStillEnabled(void) {
 bool FaceRouteV2_EnterArcEnabled(void) {
     return g_g_enter_arc.load(std::memory_order_relaxed);
 }
+bool FaceRouteV2_LifeLayerEnabled(void) {
+    return g_i_life_layer.load(std::memory_order_relaxed);
+}
 
 void FaceRouteV2_SetWorker(bool on) {
     g_a_worker.store(on, std::memory_order_relaxed);
@@ -93,19 +97,22 @@ void FaceRouteV2_SetFullStill(bool on) {
 void FaceRouteV2_SetEnterArc(bool on) {
     g_g_enter_arc.store(on, std::memory_order_relaxed);
 }
-
+void FaceRouteV2_SetLifeLayer(bool on) {
+    g_i_life_layer.store(on, std::memory_order_relaxed);
+}
 void FaceRouteV2_BootLog(void) {
     ESP_LOGW(TAG,
-             "s1cp flags a=%d b=%d c=%d d=%d e_static=%d f_fullstill=%d g_enter=%d",
+             "s1en flags a=%d b=%d c=%d d=%d e_static=%d f_fullstill=%d g_enter=%d i_life=%d",
              FaceRouteV2_WorkerEnabled() ? 1 : 0, FaceRouteV2_Emotion3Enabled() ? 1 : 0,
              FaceRouteV2_FsGateEnabled() ? 1 : 0, FaceRouteV2_QuietLogEnabled() ? 1 : 0,
              FaceRouteV2_StaticDialogueEnabled() ? 1 : 0, FaceRouteV2_FullStillEnabled() ? 1 : 0,
-             FaceRouteV2_EnterArcEnabled() ? 1 : 0);
-    esp_rom_printf("!!FACE_S1CP a=%d b=%d c=%d d=%d e=%d f=%d g=%d\n",
+             FaceRouteV2_EnterArcEnabled() ? 1 : 0, FaceRouteV2_LifeLayerEnabled() ? 1 : 0);
+    esp_rom_printf("!!FACE_S1EN a=%d b=%d c=%d d=%d e=%d f=%d g=%d i=%d\n",
                    FaceRouteV2_WorkerEnabled() ? 1 : 0, FaceRouteV2_Emotion3Enabled() ? 1 : 0,
                    FaceRouteV2_FsGateEnabled() ? 1 : 0, FaceRouteV2_QuietLogEnabled() ? 1 : 0,
                    FaceRouteV2_StaticDialogueEnabled() ? 1 : 0,
-                   FaceRouteV2_FullStillEnabled() ? 1 : 0, FaceRouteV2_EnterArcEnabled() ? 1 : 0);
+                   FaceRouteV2_FullStillEnabled() ? 1 : 0, FaceRouteV2_EnterArcEnabled() ? 1 : 0,
+                   FaceRouteV2_LifeLayerEnabled() ? 1 : 0);
 }
 
 void FaceRouteV2_EnsureWorker(FaceRouteV2TickFn tick_fn, void* ctx) {

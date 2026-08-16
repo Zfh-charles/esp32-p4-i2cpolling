@@ -826,6 +826,14 @@ menu "XVSENFENG_ALARM"
             推理服务在 push 后向设备订阅主题发布唤醒消息，固件立即 GET /pending。
             与 HTTP 周期轮询并存（轮询作兜底）。ML307 4G 需 broker 公网可达。
 
+    config REMINDER_DEFER_BUSY_WAKE
+        bool "设备忙时合并并延后 MQTT 提醒拉取（R0）"
+        default y
+        depends on REMINDER_MQTT_WAKE
+        help
+            MQTT 唤醒到达但设备正在对话、响铃或投递其他提醒时，不丢弃事件；
+            仅保留一个待处理标志，空闲后最多约 1 秒重试。关闭可恢复旧的忙时跳过行为。
+
     config REMINDER_BOOT_TRACE
         bool "开机阶段 BootTrace 诊断（串口过滤 BootTrace）"
         default n

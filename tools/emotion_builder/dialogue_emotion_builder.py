@@ -14,12 +14,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 
 EMOTIONS = ("standby", "neutral", "happy", "sad", "angry", "loving")
 MOUTH_LEVELS = ("closed", "small", "medium", "large")
 EYE_LEVELS = ("open", "half", "closed")
+LIFE_TRACK_ROWS = 48
+LIFE_SEQUENCE_OFFSETS = (0, 1, 2, 3, 4, 3, 2, 1, 0)
 
 
 @dataclass(frozen=True)
@@ -236,6 +238,109 @@ def save_rgb565_array(patch: np.ndarray, target: Path) -> None:
     target.write_bytes(pix.tobytes())
 
 
+def _aligned_span(active: np.ndarray, limit: int, alignment: int = 8) -> tuple[int, int]:
+    ids = np.flatnonzero(active)
+    if ids.size == 0:
+        return 0, limit
+    start = max(0, (int(ids[0]) // alignment) * alignment)
+    end = min(limit, ((int(ids[-1]) + 1 + alignment - 1) // alignment) * alignment)
+    if end - start < 64:
+        center = (start + end) // 2
+        start = max(0, center - 32)
+        end = min(limit, start + 64)
+        start = max(0, end - 64)
+    return start, end
+
+
+def build_life_layer(frames: list[Frame], hold: dict, base_frame: int, base: np.ndarray,
+                     mouth_rect: dict, eye_rect: dict, out: Path, emotion: str) -> dict:
+    """Generate same-generation, pre-cropped RGB565+alpha life tracks."""
+    height, width = base.shape[:2]
+    direction = 1 if base_frame + 4 <= hold["end"] else -1
+    ids = [max(hold["start"], min(hold["end"], base_frame + direction * n))
+           for n in LIFE_SEQUENCE_OFFSETS]
+    arrays = [rgb(frames[i]) for i in ids]
+    delta_stack = np.stack([
+        np.mean(np.abs(a.astype(np.float32) - base.astype(np.float32)), axis=2)
+        for a in arrays
+    ])
+    motion = np.mean(delta_stack, axis=0)
+    for rect in (mouth_rect, eye_rect):
+        x, y, w, h = rect["x"], rect["y"], rect["width"], rect["height"]
+        motion[y:y+h, x:x+w] = 0.0
+
+    track_ranges = ((max(8, height // 12), min(height, height // 2)),
+                    (max(0, height // 2), min(height, height - height // 10)))
+    life_root = out / "life"
+    life_root.mkdir(exist_ok=True)
+    previews = [base.copy() for _ in arrays]
+    tracks = []
+    for track_id, (search_y0, search_y1) in enumerate(track_ranges):
+        if search_y1 - search_y0 < LIFE_TRACK_ROWS:
+            continue
+        row_score = motion.mean(axis=1)
+        best_y, best_score = search_y0, -1.0
+        for y in range(search_y0, search_y1 - LIFE_TRACK_ROWS + 1, 4):
+            score = float(row_score[y:y + LIFE_TRACK_ROWS].mean())
+            if score > best_score:
+                best_y, best_score = y, score
+        band_motion = motion[best_y:best_y + LIFE_TRACK_ROWS]
+        threshold = max(2.5, float(np.quantile(band_motion, 0.70)))
+        x0, x1 = _aligned_span(np.any(band_motion >= threshold, axis=0), width)
+        roi = {"x": x0, "y": best_y, "width": x1 - x0, "height": LIFE_TRACK_ROWS}
+        track_dir = life_root / f"track_{track_id}"
+        track_dir.mkdir(exist_ok=True)
+        entries = []
+        for seq, (frame_id, candidate, delta) in enumerate(zip(ids, arrays, delta_stack)):
+            patch = candidate[best_y:best_y + LIFE_TRACK_ROWS, x0:x1]
+            local_delta = delta[best_y:best_y + LIFE_TRACK_ROWS, x0:x1]
+            alpha = np.clip((local_delta - 2.0) * (255.0 / 14.0), 0, 220).astype(np.uint8)
+            yy, xx = np.mgrid[0:LIFE_TRACK_ROWS, 0:x1-x0]
+            edge = np.minimum.reduce((xx, yy, x1-x0-1-xx, LIFE_TRACK_ROWS-1-yy))
+            alpha = (alpha.astype(np.float32) * np.clip(edge / 8.0, 0.0, 1.0)).astype(np.uint8)
+            alpha = np.array(Image.fromarray(alpha, "L").filter(ImageFilter.GaussianBlur(2.0)),
+                             dtype=np.uint8, copy=True)
+            if seq in (0, len(arrays) - 1):
+                alpha.fill(0)
+            # Precompose every life frame against the canonical hold base.  The
+            # device can then replace the ROI deterministically instead of
+            # accumulating alpha over the previous canvas frame (which leaves
+            # ghosts when the final zero-alpha frame is reached).
+            base_crop = base[best_y:best_y + LIFE_TRACK_ROWS, x0:x1].astype(np.float32)
+            a = alpha.astype(np.float32)[:, :, None] / 255.0
+            composite = np.clip(
+                patch.astype(np.float32) * a + base_crop * (1.0 - a), 0, 255).astype(np.uint8)
+            rgb_path = track_dir / f"{seq:02d}.rgb565"
+            mask_path = track_dir / f"{seq:02d}.a8"
+            save_rgb565_array(composite, rgb_path)
+            mask_path.write_bytes(alpha.tobytes())
+            previews[seq][best_y:best_y + LIFE_TRACK_ROWS, x0:x1] = composite
+            entries.append({"sequence": seq, "source_frame": frame_id,
+                            "rgb565": f"life/track_{track_id}/{seq:02d}.rgb565",
+                            "rgb565_sha256": sha256(rgb_path.read_bytes()),
+                            "mask_a8": f"life/track_{track_id}/{seq:02d}.a8",
+                            "mask_sha256": sha256(mask_path.read_bytes()),
+                            "peak_alpha": int(alpha.max()),
+                            "active_ratio": round(float(np.count_nonzero(alpha)) / alpha.size, 4)})
+        tracks.append({"id": track_id, "roi": roi, "motion_score": round(best_score, 3),
+                       "frames": entries})
+
+    generation_seed = (sha256(base.tobytes()) + emotion + json.dumps(ids) +
+                       json.dumps([t["roi"] for t in tracks], sort_keys=True)).encode("utf-8")
+    generation_id = sha256(generation_seed)[:20]
+    Image.fromarray(base, "RGB").save(life_root / "base_preview.png")
+    preview_images = [Image.fromarray(p, "RGB") for p in previews]
+    preview_images[0].save(life_root / "life_preview.gif", save_all=True,
+                           append_images=preview_images[1:], duration=120, loop=0)
+    return {"schema": "dialogue-life-layer-v1", "generation_id": generation_id,
+            "composite_mode": "canonical_base_precomposited_v1",
+            "base_rgb565_sha256": sha256((out / "hold_base.rgb565").read_bytes()),
+            "enabled_default": emotion in ("standby", "neutral", "happy", "loving"),
+            "sequence_ms": 120, "sequence": ids, "max_tracks_per_tick": 1,
+            "schedule": "interleave_latest_drop_old", "tracks": tracks,
+            "preview": "life/life_preview.gif"}
+
+
 def save_composite_preview(base: np.ndarray, patches: dict[str, np.ndarray], rect: dict,
                            target: Path, label: str) -> None:
     views = []
@@ -418,6 +523,9 @@ def build_one(source: Path, out: Path, profile: dict, duration_ms: int, quality:
     save_composite_preview(pose_bases[1], pose_mouth[1], rect,
                            out / "mouth_roi_preview_pose_1.png", f"{source.stem} pose1")
 
+    life_layer = build_life_layer(frames, seg["hold"], picks["closed"], base,
+                                  rect, eye_rect, out, source.stem)
+
     manifest = {
         "schema": "dialogue-emotion-clip-v2", "emotion": source.stem,
         "source": {"file": "frames.mjpeg", "bytes": len(data), "sha256": sha256(data),
@@ -442,7 +550,8 @@ def build_one(source: Path, out: Path, profile: dict, duration_ms: int, quality:
                                  "poses": [
                                      {"id": 0, "base_frame": picks["closed"], "root": "."},
                                      {"id": 1, "base_frame": pose_1_frame, "root": "pose_1"}
-                                 ]}},
+                                 ]},
+                   "life_layer": life_layer},
         "segments": seg, "frames": frame_index(frames, duration_ms),
         "analysis": {"mouth_detection": detection, "mouth_activity": activity, "risk": risk,
                      "eye_detection": eye_det,
@@ -495,6 +604,22 @@ def validate_clip(folder: Path, manifest: dict) -> list[str]:
         for level in EYE_LEVELS:
             if not (root / "eye" / f"{level}.rgb565").is_file():
                 errors.append(f"missing pose {pose['id']} eye {level}")
+    life = manifest["render"].get("life_layer", {})
+    if life:
+        if life.get("base_rgb565_sha256") != sha256(hold_rgb.read_bytes()):
+            errors.append("life layer base hash mismatch")
+        for track in life.get("tracks", []):
+            roi = track.get("roi", {})
+            expected = int(roi.get("width", 0)) * int(roi.get("height", 0))
+            if int(roi.get("height", 0)) > LIFE_TRACK_ROWS:
+                errors.append(f"life track {track.get('id')} exceeds row budget")
+            for item in track.get("frames", []):
+                rgb_path = folder / item["rgb565"]
+                mask_path = folder / item["mask_a8"]
+                if not rgb_path.is_file() or rgb_path.stat().st_size != expected * 2:
+                    errors.append(f"invalid life RGB565 {rgb_path.name}")
+                if not mask_path.is_file() or mask_path.stat().st_size != expected:
+                    errors.append(f"invalid life mask {mask_path.name}")
     return errors
 
 

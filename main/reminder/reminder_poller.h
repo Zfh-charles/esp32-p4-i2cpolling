@@ -2,6 +2,7 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <atomic>
 #include <string>
 
 enum class ReminderDeliveryMode {
@@ -27,8 +28,16 @@ public:
 private:
     bool running_ = false;
     TaskHandle_t poll_task_handle_ = nullptr;
+#if CONFIG_REMINDER_DEFER_BUSY_WAKE
+    std::atomic<bool> deferred_poll_pending_{false};
+    std::atomic<bool> deferred_wait_logged_{false};
+#endif
     void PollTask();
     void DoPollOnce();
+#if CONFIG_REMINDER_DEFER_BUSY_WAKE
+    void DeferPoll(const char* reason);
+    void TracePollBlocked(const char* reason);
+#endif
     static std::string ExpandDeviceIdInUrl(const std::string& url_template);
     static bool ParsePendingResponse(const std::string& body, std::string& id, std::string& prompt,
                                      std::string& emotion, ReminderDeliveryMode& mode,
