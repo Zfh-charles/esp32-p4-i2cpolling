@@ -5,17 +5,15 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
-import io
 import json
 import shutil
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
+from dialogue_mjpeg_io import Frame, gray_small, rgb, scan_mjpeg, sha256
 from dialogue_pack_contract import validate_pack
 
 
@@ -26,43 +24,6 @@ LIFE_TRACK_ROWS = 48
 LIFE_SEQUENCE_OFFSETS = (0, 1, 2, 3, 4, 3, 2, 1, 0)
 RELEASE_TRACK_ROWS = 48
 RELEASE_EMOTIONS = ("sad", "angry")
-
-
-@dataclass(frozen=True)
-class Frame:
-    offset: int
-    data: bytes
-
-
-def sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def scan_mjpeg(data: bytes) -> list[Frame]:
-    frames: list[Frame] = []
-    cursor = 0
-    while True:
-        soi = data.find(b"\xff\xd8", cursor)
-        if soi < 0:
-            break
-        eoi = data.find(b"\xff\xd9", soi + 2)
-        if eoi < 0:
-            raise ValueError(f"truncated JPEG at byte {soi}")
-        frames.append(Frame(soi, data[soi:eoi + 2]))
-        cursor = eoi + 2
-    if not frames:
-        raise ValueError("no JPEG frames found")
-    return frames
-
-
-def rgb(frame: Frame) -> np.ndarray:
-    with Image.open(io.BytesIO(frame.data)) as im:
-        return np.asarray(im.convert("RGB"), dtype=np.uint8)
-
-
-def gray_small(frame: Frame, size: tuple[int, int]) -> np.ndarray:
-    with Image.open(io.BytesIO(frame.data)) as im:
-        return np.asarray(im.convert("L").resize(size, Image.Resampling.BILINEAR), dtype=np.float32)
 
 
 def load_profile(path: Path | None) -> dict:

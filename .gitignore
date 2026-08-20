@@ -22,10 +22,9 @@ main/mmap_generate_emoji.h
 mmap_generate_*.h
 .clangd
 build/log/
+build_*/
 elf_snapshots/
 fw_archive/
 __pycache__/
 *.log
 serial_monitor.log
-
-build_*/

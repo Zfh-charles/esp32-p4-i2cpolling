@@ -14,8 +14,8 @@
 #include "debug/afe_fetch_gate.h"
 
 #define TAG "BootTrace"
-// s1fp: behavior-preserving smell extract — name LVGL lock budgets (values = s1fo).
-#define FW_MARKER "boot_trace_v10_s1fp_smell_lock_names"
+// s1fo: M2d idle life canary (lock budget names kept as behavior-neutral readability).
+#define FW_MARKER "boot_trace_v10_s1fo_m2d_idle_life_canary"
 
 namespace {
 

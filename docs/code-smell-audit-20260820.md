@@ -44,3 +44,9 @@
 - 不整包合入远端混合 reminder 分支  
 
 下一批可做（不占显示滚动门）：adapter 呈现仪式抽取（对标曾做过的 `ShowFaceCanvasLayers`）、builder 模块拆分、串口脚本收敛。
+
+## 2026-08-20 晚间归档增量（白天 s1fo 基线）
+
+- 固件：`kLvglLock*` 命名常量保留；`FW_MARKER` **回到** `s1fo_m2d_idle_life_canary`（不另开 s1fp 验机批次）。
+- PC：`dialogue_mjpeg_io.py` 抽出 `Frame/scan_mjpeg/rgb/gray_small/sha256`（行为守恒）。
+- 工具：`flash_com7_retry.ps1` 修复「命令行含 COM7 误杀自身」。
