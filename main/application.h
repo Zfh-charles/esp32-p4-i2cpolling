@@ -75,6 +75,7 @@ public:
     void ToggleChatState();
     void StartListening();
     void StopListening();
+    void HandleNetworkDown();
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(Ota& ota, const std::string& url = "");
@@ -150,6 +151,8 @@ private:
     void StartProactiveReminderTimeout();
     void StopProactiveReminderTimeout();
     void StartProactiveFeedbackWindow();
+    void BeginProactiveFeedbackWindow();
+    void HandleProactiveFeedbackTimer();
     void FinishProactiveReminder();
     void StopProactiveFeedbackTimer();
     void SetSessionKind(SessionKind kind, const char* reason);
@@ -170,6 +173,8 @@ private:
     void TryStartDeferredEmotionPreload();
 #endif
     esp_timer_handle_t proactive_feedback_timer_handle_ = nullptr;
+    bool proactive_feedback_waiting_drain_ = false;
+    uint16_t proactive_feedback_drain_checks_ = 0;
     bool deferred_reminder_services_pending_ = false;
     bool deferred_reminder_net_started_ = false;
     int64_t wake_running_since_us_ = 0;
@@ -188,6 +193,9 @@ private:
 #endif
 #if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
     bool deferred_emotion_preload_started_ = false;
+    int visual_budget_shadow_level_ = -1;
+    uint32_t visual_budget_shadow_samples_ = 0;
+    void UpdateVisualBudgetShadow();
     bool mjpeg_wake_coexist_paused_ = false;
     /** Proven stable: do not auto-resume MJPEG while AFE wake is armed (HP_WDT). */
     bool mjpeg_skip_resume_while_wake_ = true;

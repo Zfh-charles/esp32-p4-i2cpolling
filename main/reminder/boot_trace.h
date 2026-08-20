@@ -16,6 +16,7 @@
 #if CONFIG_USE_REMINDER_POLL && CONFIG_REMINDER_BOOT_TRACE
 
 void BootTraceInit();
+void BootTraceMaybeEchoMarker();
 void BootTraceMark(const char* phase, const char* detail);
 void BootTraceMarkHeap(const char* phase);
 void BootTraceDumpSummary(const char* reason);
@@ -27,6 +28,7 @@ void BootTraceClearCrashStreak();
 #else
 
 inline void BootTraceInit() {}
+inline void BootTraceMaybeEchoMarker() {}
 inline void BootTraceMark(const char* phase, const char* detail) {
     (void)phase;
     (void)detail;

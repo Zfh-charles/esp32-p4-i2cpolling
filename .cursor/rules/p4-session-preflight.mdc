@@ -19,14 +19,14 @@ alwaysApply: true
 | 「我在哪、known-good 是谁、下一刀」 | `p4-current-state.mdc`（**唯一常改**） |
 | 产品地图 / 长期契约 | `.cursorrules` · `AGENTS.md` |
 
-**你在这（摘要，详见 current-state）**：战略防御期（P4 v1.0 MSPI-751）；known-good 寿命=`s1cm`；**存档 marker=`s1eo`**；face=M1 体验约 60%；下一刀见 current-state **第八节可吸收 backlog**（禁整包合入混合提交）。
+**你在这（摘要，权威以 `boot_trace.cc` 的 `FW_MARKER` + current-state **§0** 为准）**：硅片地板仍在（P4 v1.0 MSPI-751）+ 相持打法（预算化视觉）。真源 marker=`s1fp_smell_lock_names`（=s1fo 路径）；**KG-Life**=`s1cm`；**KG-Function**=`s1fk`/`s1fm`/`s1fo`；**KG-Archive**=`s1eo`；滚动 V3 占用=`s1fp`。可发布核=会话闭环+分层嘴+预算消费；enter/blink 仍冻结。下一刀见 current-state §0。
 
 ## 二、出刀四问（必答，≤4 行写进回复；答不出 → 只侦察）
 
 1. **收益**：`S3` 解锁阶梯/根因 · `S2` 寿命量级 · `S1` 体验/可观测 · `S0` 仅观感
 2. **损失**：`D3` 伤根据地（不可烧录/不可归因/SD 门/音频链路/分区/素材）· `D2` 功能回退 · `D1` 观感 · `D0` 无感
 3. **回滚**：`R0` 运行期开关 · `R1` 切 known-good 槽 · `R2` git revert+重烧 · `R3` 不可逆
-4. **验证**：`V0` 编译 · `V1` USB 启动可见 · `V2` 必须冷启 · `V3` 长泡 n≥4
+4. **验证**：`V0` 编译 · `V1` USB 启动可见 · `V2` 必须冷启 · `V3` 长泡（完成寿命样本或右删失暴露）
 
 **裁决**：`收益≥S1` 且 `回滚≤R2` 且（`损失≤D2` 或 已有 known-good+用户确认）才出刀。禁 `S0×V3`、禁 `D3×R3`。把握 <90% → 降级为探针（探针=`S1/D0/R0/V1`，最划算）。
 
@@ -43,7 +43,8 @@ alwaysApply: true
 
 - 回合开始声明预算：读几份文件 / 跑几个脚本 / 是否烧录。超预算先问。
 - 验收走**脚本裁决**：`reboot_audit.py`（per-marker 平均寿命）· `stability_evidence_collector.py` · `stability_soak_status.py`。**禁**把原始 `serial_monitor.log` 大段读进上下文。
-- 完成轮 `n<4`：**不判稳，也不反复分析**。
+- 完成失败轮 `n<4`：不宣告精确 MTBF，也不反复分析；但稳定固件不能因“迟迟不失败”被反向阻塞。`V2` 全过且为 `R0/D0~D1` 的单变量，可用限时灰度继续：单 marker 连续 6–12h 零自然复位记阶段正证据，48–72h 累计零自然复位可记强通过；若有失败则回到 per-marker 完成寿命样本比较。用户明确接受风险且 known-good/ELF/回滚齐全时，可提前推进下一项 R0 单变量。
+- **滚动门**：同时最多一项未完成 V3 的视觉热路径变量；任一可重复 panic/WDT、音频失效、正常退出或二次唤醒回归，立即退上一 marker，禁止在失败候选上继续叠刀。
 - 一批次**同回合**记一次账（写回 `face-emotion-sd.mdc` 账本 + 更新 `p4-current-state.mdc`）。
 
 ## 五、避实击虚（一行否证清单）

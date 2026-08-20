@@ -1,5 +1,6 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <algorithm>
 #include <cstring>
 
 #if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
@@ -26,6 +27,8 @@
 #endif
 
 #define TAG "AudioService"
+
+static constexpr uint32_t kAfeAudioInputTaskStackSize = 16 * 1024;
 
 
 AudioService::AudioService() {
@@ -95,7 +98,9 @@ void AudioService::Start() {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioInputTask();
         vTaskDelete(NULL);
-    }, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);
+    }, "audio_input", kAfeAudioInputTaskStackSize, this, 8, &audio_input_task_handle_, 0);
+    ESP_LOGI(TAG, "audio_input task started (stack: %u, core: 0)",
+             static_cast<unsigned>(kAfeAudioInputTaskStackSize));
 
     /* Start the audio output task */
     xTaskCreate([](void* arg) {
@@ -139,6 +144,10 @@ void AudioService::Stop() {
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
     audio_testing_queue_.clear();
+    playback_prebuffer_target_ = 0;
+    playback_prebuffer_filling_ = false;
+    playback_prebuffer_initial_fill_ = false;
+    playback_prebuffer_deadline_started_ = false;
     audio_queue_cv_.notify_all();
 }
 
@@ -276,9 +285,72 @@ void AudioService::AudioInputTask() {
 void AudioService::AudioOutputTask() {
     while (true) {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
-        audio_queue_cv_.wait(lock, [this]() { return !audio_playback_queue_.empty() || service_stopped_; });
+        while (!service_stopped_) {
+            audio_queue_cv_.wait(lock, [this]() {
+                return !audio_playback_queue_.empty() || service_stopped_;
+            });
+            if (service_stopped_ || playback_prebuffer_target_ == 0 ||
+                !playback_prebuffer_filling_) {
+                break;
+            }
+            if (audio_playback_queue_.size() >= playback_prebuffer_target_) {
+#if CONFIG_USE_REMINDER_POLL
+                REMINDER_TRACE_LOG("playback_prebuffer_ready | frames=%u target=%u refill=%u",
+                                   static_cast<unsigned>(audio_playback_queue_.size()),
+                                   static_cast<unsigned>(playback_prebuffer_target_),
+                                   static_cast<unsigned>(playback_rebuffer_count_));
+#endif
+                playback_prebuffer_filling_ = false;
+                playback_prebuffer_initial_fill_ = false;
+                playback_prebuffer_deadline_started_ = false;
+                break;
+            }
+            if (!playback_prebuffer_deadline_started_) {
+                playback_prebuffer_deadline_ = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(PLAYBACK_PREBUFFER_TIMEOUT_MS);
+                playback_prebuffer_deadline_started_ = true;
+                if (!playback_prebuffer_initial_fill_) {
+                    ++playback_rebuffer_count_;
+#if CONFIG_USE_REMINDER_POLL
+                    REMINDER_TRACE_LOG("playback_rebuffer_begin | count=%u queued=%u target=%u",
+                                       static_cast<unsigned>(playback_rebuffer_count_),
+                                       static_cast<unsigned>(audio_playback_queue_.size()),
+                                       static_cast<unsigned>(playback_prebuffer_target_));
+#endif
+                }
+            }
+            const bool ready = audio_queue_cv_.wait_until(
+                lock, playback_prebuffer_deadline_, [this]() {
+                    return service_stopped_ || playback_prebuffer_target_ == 0 ||
+                           audio_playback_queue_.size() >= playback_prebuffer_target_;
+                });
+            if (service_stopped_) {
+                break;
+            }
+            if (playback_prebuffer_target_ == 0) {
+                playback_prebuffer_filling_ = false;
+                playback_prebuffer_initial_fill_ = false;
+                playback_prebuffer_deadline_started_ = false;
+                break;
+            }
+            if (!ready) {
+#if CONFIG_USE_REMINDER_POLL
+                REMINDER_TRACE_LOG("playback_prebuffer_timeout | frames=%u target=%u refill=%u",
+                                   static_cast<unsigned>(audio_playback_queue_.size()),
+                                   static_cast<unsigned>(playback_prebuffer_target_),
+                                   static_cast<unsigned>(playback_rebuffer_count_));
+#endif
+                playback_prebuffer_filling_ = false;
+                playback_prebuffer_initial_fill_ = false;
+                playback_prebuffer_deadline_started_ = false;
+                break;
+            }
+        }
         if (service_stopped_) {
             break;
+        }
+        if (audio_playback_queue_.empty()) {
+            continue;
         }
 
         auto task = std::move(audio_playback_queue_.front());
@@ -310,6 +382,16 @@ void AudioService::AudioOutputTask() {
 #if CONFIG_USE_REMINDER_POLL
         ReminderHwTraceSpeakerPcm((int)task->pcm.size(), "output_task");
 #endif
+
+        {
+            std::lock_guard<std::mutex> qlock(audio_queue_mutex_);
+            if (playback_prebuffer_target_ > 0 && !playback_prebuffer_filling_ &&
+                audio_playback_queue_.empty() && audio_decode_queue_.empty()) {
+                playback_prebuffer_filling_ = true;
+                playback_prebuffer_initial_fill_ = false;
+                playback_prebuffer_deadline_started_ = false;
+            }
+        }
 
         if (restore_capture_after_local_playback_) {
             bool queues_empty = false;
@@ -820,6 +902,10 @@ void AudioService::ResetDecoder() {
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
     audio_testing_queue_.clear();
+    playback_prebuffer_target_ = 0;
+    playback_prebuffer_filling_ = false;
+    playback_prebuffer_initial_fill_ = false;
+    playback_prebuffer_deadline_started_ = false;
     audio_queue_cv_.notify_all();
 }
 
@@ -839,6 +925,44 @@ void AudioService::PrepareSpeakerPlayback() {
     }
     /* A new reminder/TTS round still force-initializes TX once. */
     SetAudioRoute(AudioRoute::Playback, true);
+}
+
+void AudioService::BeginPlaybackPrebuffer(size_t target_frames) {
+    if (target_frames == 0) {
+        ReleasePlaybackPrebuffer();
+        return;
+    }
+    target_frames = std::min(target_frames, static_cast<size_t>(MAX_PLAYBACK_TASKS_IN_QUEUE));
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    playback_prebuffer_target_ = target_frames;
+    playback_prebuffer_filling_ = true;
+    playback_prebuffer_initial_fill_ = true;
+    playback_prebuffer_deadline_started_ = false;
+    playback_rebuffer_count_ = 0;
+    audio_queue_cv_.notify_all();
+#if CONFIG_USE_REMINDER_POLL
+    REMINDER_TRACE_LOG("playback_prebuffer_arm | target=%u max=%u timeout=%ums",
+                       static_cast<unsigned>(playback_prebuffer_target_),
+                       static_cast<unsigned>(MAX_PLAYBACK_TASKS_IN_QUEUE),
+                       static_cast<unsigned>(PLAYBACK_PREBUFFER_TIMEOUT_MS));
+#endif
+}
+
+void AudioService::ReleasePlaybackPrebuffer() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+#if CONFIG_USE_REMINDER_POLL
+    if (playback_prebuffer_target_ > 0) {
+        REMINDER_TRACE_LOG("playback_prebuffer_release | queued=%u decode=%u refills=%u",
+                           static_cast<unsigned>(audio_playback_queue_.size()),
+                           static_cast<unsigned>(audio_decode_queue_.size()),
+                           static_cast<unsigned>(playback_rebuffer_count_));
+    }
+#endif
+    playback_prebuffer_target_ = 0;
+    playback_prebuffer_filling_ = false;
+    playback_prebuffer_initial_fill_ = false;
+    playback_prebuffer_deadline_started_ = false;
+    audio_queue_cv_.notify_all();
 }
 
 void AudioService::RestoreCaptureForWakeWord() {
@@ -861,6 +985,7 @@ void AudioService::SetCapturePowerHold(bool hold) {
 }
 
 void AudioService::EndSpeakerPlayback() {
+    ReleasePlaybackPrebuffer();
 #if CONFIG_USE_REMINDER_POLL
     ReminderHwTraceSpeakerOp("end", ReminderTraceAudioRoute(audio_route_), speaker_playback_hold_ ? 1 : 0);
 #endif

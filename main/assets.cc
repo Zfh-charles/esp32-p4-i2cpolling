@@ -8,6 +8,7 @@
 #include <esp_log.h>
 #include <spi_flash_mmap.h>
 #include <esp_timer.h>
+#include <cstring>
 #if CONFIG_USE_REMINDER_POLL
 #include "reminder/boot_trace.h"
 #endif
@@ -55,31 +56,52 @@ bool Assets::InitializePartition() {
         return false;
     }
 
+    // Validate the small fixed header before reserving flash mmap pages.  A
+    // truncated/corrupt assets image must fail closed instead of leaving table
+    // iteration to walk beyond the mapped payload.
+    uint32_t header[3] = {};
+    esp_err_t err = esp_partition_read(partition_, 0, header, sizeof(header));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read assets header: %s", esp_err_to_name(err));
+        return false;
+    }
+    const uint32_t stored_files = header[0];
+    const uint32_t stored_chksum = header[1];
+    const uint32_t stored_len = header[2];
+    if (stored_len > partition_->size - sizeof(header) ||
+        stored_files > stored_len / sizeof(mmap_assets_table)) {
+        ESP_LOGE(TAG, "Invalid assets header: files=%lu len=0x%lx partition=0x%lx",
+                 stored_files, stored_len, partition_->size);
+        return false;
+    }
+    const size_t table_size = static_cast<size_t>(stored_files) * sizeof(mmap_assets_table);
+    if (table_size > stored_len) {
+        ESP_LOGE(TAG, "Invalid assets table size: files=%lu table=%u len=%lu",
+                 stored_files, static_cast<unsigned>(table_size), stored_len);
+        return false;
+    }
+    const size_t map_size = sizeof(header) + static_cast<size_t>(stored_len);
+
     int free_pages = spi_flash_mmap_get_free_pages(SPI_FLASH_MMAP_DATA);
     uint32_t storage_size = free_pages * 64 * 1024;
     ESP_LOGI(TAG, "The storage free size is %ld KB", storage_size / 1024);
-    ESP_LOGI(TAG, "The partition size is %ld KB", partition_->size / 1024);
-    if (storage_size < partition_->size) {
-        ESP_LOGE(TAG, "The free size %ld KB is less than assets partition required %ld KB", storage_size / 1024, partition_->size / 1024);
+    ESP_LOGI(TAG, "The assets data size is %u KB (partition %ld KB)",
+             static_cast<unsigned>((map_size + 1023) / 1024), partition_->size / 1024);
+    if (storage_size < map_size) {
+        ESP_LOGE(TAG, "The free size %ld KB is less than assets data required %u KB",
+                 storage_size / 1024,
+                 static_cast<unsigned>((map_size + 1023) / 1024));
         return false;
     }
 
-    esp_err_t err = esp_partition_mmap(partition_, 0, partition_->size, ESP_PARTITION_MMAP_DATA, (const void**)&mmap_root_, &mmap_handle_);
+    err = esp_partition_mmap(partition_, 0, map_size, ESP_PARTITION_MMAP_DATA,
+                             (const void**)&mmap_root_, &mmap_handle_);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to mmap assets partition: %s", esp_err_to_name(err));
         return false;
     }
 
     partition_valid_ = true;
-
-    uint32_t stored_files = *(uint32_t*)(mmap_root_ + 0);
-    uint32_t stored_chksum = *(uint32_t*)(mmap_root_ + 4);
-    uint32_t stored_len = *(uint32_t*)(mmap_root_ + 8);
-
-    if (stored_len > partition_->size - 12) {
-        ESP_LOGD(TAG, "The stored_len (0x%lx) is greater than the partition size (0x%lx) - 12", stored_len, partition_->size);
-        return false;
-    }
 
     auto start_time = esp_timer_get_time();
     uint32_t calculated_checksum = CalculateChecksum(mmap_root_ + 12, stored_len);
@@ -93,11 +115,22 @@ bool Assets::InitializePartition() {
 
     checksum_valid_ = true;
 
+    const size_t data_base = sizeof(header) + table_size;
+    const size_t data_size = map_size - data_base;
     for (uint32_t i = 0; i < stored_files; i++) {
         auto item = (const mmap_assets_table*)(mmap_root_ + 12 + i * sizeof(mmap_assets_table));
+        if (memchr(item->asset_name, '\0', sizeof(item->asset_name)) == nullptr ||
+            item->asset_offset > data_size || item->asset_size > data_size - item->asset_offset) {
+            ESP_LOGE(TAG, "Invalid assets entry %lu: offset=%lu size=%lu data=%u",
+                     i, item->asset_offset, item->asset_size,
+                     static_cast<unsigned>(data_size));
+            checksum_valid_ = false;
+            assets_.clear();
+            return false;
+        }
         auto asset = Asset{
             .size = static_cast<size_t>(item->asset_size),
-            .offset = static_cast<size_t>(12 + sizeof(mmap_assets_table) * stored_files + item->asset_offset)
+            .offset = data_base + static_cast<size_t>(item->asset_offset)
         };
         assets_[item->asset_name] = asset;
     }

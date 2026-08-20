@@ -78,6 +78,9 @@ typedef void (*emotion_video_event_cb_t)(emotion_video_event_t event, void *user
 typedef void (*emotion_video_frame_cb_t)(emotion_video_handle_t handle, uint8_t *frame_data, 
                                          uint32_t frame_size, uint32_t width, uint32_t height, void *user_data);
 
+/** Single canonical mapping used by presenter, MJPEG and layered assets. */
+const char* emotion_video_player_canonicalize_emotion(const char *emotion_name);
+
 // ==================== 基础函数声明 ====================
 
 /**

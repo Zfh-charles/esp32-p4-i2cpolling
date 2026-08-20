@@ -110,6 +110,7 @@ BatteryMonitor::BatteryMonitor() : bq27220Handle(nullptr),
 
 BatteryMonitor::~BatteryMonitor()
 {
+    ready_.store(false, std::memory_order_release);
     if (timer) {
         xTimerStop(timer, 0);
         xTimerDelete(timer, 0);
@@ -163,8 +164,18 @@ bool BatteryMonitor::init(i2c_master_bus_handle_t i2c_bus)
         return false;
     }
 
-    getBatteryStatus(this->battery_status);
-    check_shutdown();
+    if (getBatteryStatus(this->battery_status)) {
+        charging_.store(this->battery_status.DSG == 0, std::memory_order_relaxed);
+        discharging_.store(this->battery_status.DSG != 0, std::memory_order_relaxed);
+    }
+    const uint16_t initial_soc = bq27220_get_state_of_charge(bq27220Handle);
+    if (initial_soc <= 100) {
+        battery_soc_.store(static_cast<uint8_t>(initial_soc), std::memory_order_relaxed);
+        check_shutdown();
+    } else {
+        ESP_LOGW(TAG, "Ignore invalid initial battery SOC: %u",
+                 static_cast<unsigned>(initial_soc));
+    }
 
     timer = xTimerCreate("battery_monitor", pdMS_TO_TICKS(1000), pdTRUE, this, monitor_period);
     if (timer == nullptr) {
@@ -174,13 +185,14 @@ bool BatteryMonitor::init(i2c_master_bus_handle_t i2c_bus)
         return false;
     }
     xTimerStart(timer, 0);
+    ready_.store(true, std::memory_order_release);
     ESP_LOGI(TAG, "Battery monitor initialized successfully");
     return true;
 }
 
 uint8_t BatteryMonitor::getBatterySOC() const
 {
-    return bq27220_get_state_of_charge(bq27220Handle);
+    return battery_soc_.load(std::memory_order_relaxed);
 }
 
 uint16_t BatteryMonitor::getCapacity() const
@@ -217,13 +229,25 @@ bool BatteryMonitor::getBatteryStatus(battery_status_t &status)
 void BatteryMonitor::monitor_period(TimerHandle_t xTimer)
 {
     BatteryMonitor &bm = *static_cast<BatteryMonitor *>(pvTimerGetTimerID(xTimer));
-    bm.getBatteryStatus(bm.battery_status);
+    if (!bm.is_ready()) {
+        return;
+    }
+    if (bm.getBatteryStatus(bm.battery_status)) {
+        bm.charging_.store(bm.battery_status.DSG == 0, std::memory_order_relaxed);
+        bm.discharging_.store(bm.battery_status.DSG != 0, std::memory_order_relaxed);
+    }
     if (bm.status_cb) {
         bm.status_cb(bm.battery_status);
     }
 
     static uint32_t count = 0;
     if (count++ % 5 == 0) {
+        const uint16_t soc = bq27220_get_state_of_charge(bm.bq27220Handle);
+        if (soc <= 100) {
+            bm.battery_soc_.store(static_cast<uint8_t>(soc), std::memory_order_relaxed);
+        } else {
+            ESP_LOGW(TAG, "Ignore invalid battery SOC: %u", static_cast<unsigned>(soc));
+        }
         bm.check_shutdown();
         if (bm.period_cb) {
             bm.period_cb();

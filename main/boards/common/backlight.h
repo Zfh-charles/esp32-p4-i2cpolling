@@ -14,6 +14,8 @@ public:
 
     void RestoreBrightness();
     void SetBrightness(uint8_t brightness, bool permanent = false);
+    /** Transient animation step: no NVS write and no per-step log spam. */
+    void SetBrightnessQuiet(uint8_t brightness);
     inline uint8_t brightness() const { return brightness_; }
 
 protected:

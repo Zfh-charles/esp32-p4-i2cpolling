@@ -25,6 +25,7 @@
 #include "emotion_video_player.h"
 #include "wdt_contention_diag.h"
 #include "stack_diag.h"
+#include "face_route_v2.h"
 
 // 优化：定义安全的信号量操作宏，使用更短的超时时间
 #define SAFE_SEMAPHORE_TAKE(sem, timeout_ms) \
@@ -61,6 +62,11 @@ static const uint32_t g_hw_decoder_cc = ESP_VIDEO_DEC_HW_MJPEG_TAG;
 // FreeRTOS事件定义
 #define PLAYER_EVENT_SWITCH     BIT0
 #define PLAYER_EVENT_EXIT       BIT1
+
+// Legacy MJPEG decoding still owns hardware decode plus the frame callback.
+// Keep it above the project 8 KiB deep-work floor; do not move cores as part
+// of this independent stack correction.
+#define EMOTION_DECODE_TASK_STACK_SIZE (12 * 1024)
 
 // 表情定义和映射
 #define BASE_EMOTIONS_COUNT     6
@@ -133,8 +139,8 @@ static const emotion_alias_t g_emotion_aliases[] = {
     {"silly",           "sad"},
     {"confused",        "sad"},
     
-    // 愤怒表情组
-    {"embarrassed",     "angry"},
+    // 语义不确定/自省类：不得误投到强烈负面表情
+    {"embarrassed",     "neutral"},
     
     // 爱意表情组
     {"surprised",       "loving"},
@@ -143,7 +149,7 @@ static const emotion_alias_t g_emotion_aliases[] = {
     {"cool",            "loving"},
     {"relaxed",         "loving"},
     {"kissy",           "loving"},
-    {"sleepy",          "loving"},
+    {"sleepy",          "neutral"},
     
     // 其他别名映射到基础表情
     {"gear",            "neutral"},
@@ -401,7 +407,7 @@ esp_err_t emotion_video_player_init(const emotion_video_config_t *config, emotio
     // 🚀 关键优化：提高任务优先级到6，确保视频解码优先执行
     BaseType_t task_ret = xTaskCreatePinnedToCore(
         decode_task, "emotion_decode", 
-        5120, player,
+        EMOTION_DECODE_TASK_STACK_SIZE, player,
         2,
         &player->decode_task_handle,
         1
@@ -413,7 +419,8 @@ esp_err_t emotion_video_player_init(const emotion_video_config_t *config, emotio
         goto cleanup_and_fail;
     }
     
-    ESP_LOGI(TAG, "✅ Emotion decode task started (priority: 2, stack: 5120, core: 1)");
+    ESP_LOGI(TAG, "✅ Emotion decode task started (priority: 2, stack: %u, core: 1)",
+             (unsigned)EMOTION_DECODE_TASK_STACK_SIZE);
 
     *handle = player;
 
@@ -2149,7 +2156,35 @@ static esp_err_t load_video_to_cache(emotion_video_player_t *player, int cache_i
         return ESP_ERR_NO_MEM;
     }
 
-    size_t bytes_read = fread(cache->buffer, 1, file_size, file);
+    size_t bytes_read = 0;
+    const size_t read_chunk_size = 16 * 1024;
+    uint8_t *sd_read_buffer = heap_caps_aligned_alloc(
+        64, read_chunk_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (sd_read_buffer != NULL) {
+        while (bytes_read < file_size) {
+            const size_t remaining = file_size - bytes_read;
+            const size_t chunk_size = remaining < read_chunk_size ? remaining : read_chunk_size;
+            const size_t chunk_read = fread(sd_read_buffer, 1, chunk_size, file);
+            if (chunk_read > 0) {
+                memcpy(cache->buffer + bytes_read, sd_read_buffer, chunk_read);
+                bytes_read += chunk_read;
+            }
+            if (chunk_read != chunk_size) {
+                break;
+            }
+            // Bound each PSRAM write burst and let audio/network control work run.
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        heap_caps_free(sd_read_buffer);
+        ESP_LOGI(TAG, "SD_STAGE_READ staged=1 chunk=%u file=%s bytes=%u/%u",
+                 (unsigned)read_chunk_size, cache->file_name, (unsigned)bytes_read,
+                 (unsigned)file_size);
+    } else {
+        // Allocation pressure must not turn a valid legacy SD pack into a boot
+        // failure.  The previous direct path remains the bounded fallback.
+        ESP_LOGW(TAG, "SD_STAGE_READ staged=0 fallback=direct file=%s", cache->file_name);
+        bytes_read = fread(cache->buffer, 1, file_size, file);
+    }
     fclose(file);
 
     if (bytes_read != file_size) {
@@ -2305,6 +2340,13 @@ static const char* resolve_emotion_alias(const char *emotion_name)
     }
     
     return emotion_name;
+}
+
+const char* emotion_video_player_canonicalize_emotion(const char *emotion_name)
+{
+    if (!emotion_name || emotion_name[0] == '\0') return "neutral";
+    if (!FaceRouteV2_CanonicalEmotionEnabled()) return emotion_name;
+    return resolve_emotion_alias(emotion_name);
 }
 
 // 🔥 改进版：支持切换时设置循环播放标志，添加性能监控

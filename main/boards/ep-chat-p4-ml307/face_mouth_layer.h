@@ -24,6 +24,10 @@ void FaceMouth_SetEnabled(bool on);
 /** Boot probe: look for /sdcard/dialogue_v2/pack_manifest.json */
 void FaceMouth_BootProbe(void);
 
+/** Serialize patch-bank bind/free with face-worker reads. Recursive by design. */
+bool FaceMouth_Lock(uint32_t timeout_ms);
+void FaceMouth_Unlock(void);
+
 /** Bind emotion folder; loads mouth level rgb565 patches + ROI from manifest.json */
 bool FaceMouth_BindEmotion(const char* emotion_name);
 void FaceMouth_Clear(void);
@@ -55,6 +59,18 @@ uint8_t FaceMouth_LifeFrameCount(uint8_t track);
 bool FaceMouth_LifeOverlapsMouth(uint8_t track);
 bool FaceMouth_LifeFrame(uint8_t track, uint8_t index, const uint8_t** rgb565, const uint8_t** mask_a8,
                          uint16_t* w, uint16_t* h, int* x, int* y);
+/** s1eu: standby-common-hub strong-emotion entry, one <=48-row band per tick. */
+bool FaceMouth_EnterReady(void);
+uint8_t FaceMouth_EnterFrameCount(void);
+uint16_t FaceMouth_EnterIntervalMs(void);
+bool FaceMouth_EnterFrame(uint8_t index, const uint8_t** rgb565,
+                          uint16_t* w, uint16_t* h, int* x, int* y);
+/** s1et: precomposited strong-emotion release, flattened to one <=48-row band per tick. */
+bool FaceMouth_ReleaseReady(void);
+uint8_t FaceMouth_ReleaseFrameCount(void);
+uint16_t FaceMouth_ReleaseIntervalMs(void);
+bool FaceMouth_ReleaseFrame(uint8_t index, const uint8_t** rgb565,
+                            uint16_t* w, uint16_t* h, int* x, int* y);
 
 #ifdef __cplusplus
 }

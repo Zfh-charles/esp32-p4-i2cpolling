@@ -11,17 +11,22 @@ alwaysApply: false
 ## 一、战略终点与非目标
 
 - **终点**：React 式 LVGL——一次 seed、增量 Commit、局部刷新；统一情绪状态机 + 统一视觉预算 + **按素材能力选渲染器**（`full_frame_clip`/`fixed_roi_clip`/`layered`/`static`）；对话与 MQTT 唤醒同源；音画共存；崩溃可归因；烧录门不丢。
-- **非目标**：对话期全屏播满 SD；把任意完整 MJPEG 实时化成对话动画；砍表情/关 AFE/降 PSRAM「保不死」。
+- **可发布核（尽早交付坐标）**：会话闭环（唤醒→听→说→退出→3s 再唤醒 + 掉线可恢复）+ 分层嘴 + VisualBudget 消费。其余能力位（speak-life / idle-life / release / enter / blink / manifest 全量）**各自 R0、各自过门**，不是核的完工条件。
+- **非目标**：对话期全屏播满 SD；把任意完整 MJPEG 实时化成对话动画；砍表情/关 AFE/降 PSRAM「保不死」；把「M2 大包全点亮」当成发布门。
 
 ## 二、三阶段定义（当前处于哪一阶段见 current-state）
 
 | 阶段 | 含义 | 典型动作 |
 |------|------|----------|
 | **防御** | 崩、不可归因、不可烧录、硅片受限 | 保 PANIC/SEED/SAFE_MODE；先活下来能迭代；只降触发窗口 |
-| **相持** | 基本可跑，音画争资源 | 有限 ROI + TTS 错峰；巩固时间片，不扩无限帧 |
-| **反攻** | 主矛盾方面已清除，冲体验 | Presenter 统一、脸+字幕、manifest v2、可选硬件 ROI |
+| **相持** | 基本可跑，音画争资源 | 有限 ROI + TTS 错峰；**预算化视觉（M2a–d）**；巩固时间片，不扩无限帧 |
+| **反攻** | 主矛盾方面已清除，冲体验 | enter/blink/manifest v2、可选硬件 ROI |
+
+**混合现实**：硅片地板未除时，允许「防御地板 + 相持打法」并存；**禁止**把反攻愿景包（全屏 enter、眨眼大包）拿到未空闲的滚动门上做。
 
 **阶段纪律（F1）**：先问在哪一阶段；**禁止**把反攻期动作拿到防御期做。
+
+**face 灰度阶梯（实现已拆，契约承认）**：M2a 影子 → M2b 嘴消费 → M2c speak-life 余量 → M2d idle 令牌金丝雀；M2e/f enter·blink 冻结。细节与当前占用见 `p4-current-state.mdc` §0。
 
 ## 三、可执行原则（A–G）
 
@@ -34,7 +39,7 @@ alwaysApply: false
 - A6 误判降级必撤（进化债必还，逐条按「原始因果是否被证伪」判，不整批回滚）。
 - A7 账本=战史，崩/钉死**同回合**记账。
 - A8 构建必留 `elf_snapshots/xiaozhi_<marker>.elf`。
-- A9 弹药经济：脚本裁决、禁大段读原始 log、`n<4` 不判也不反复分析。
+- A9 弹药经济：脚本裁决、禁大段读原始 log；`n<4` 不宣告精确 MTBF，也不反复分析。零失败右删失时长是有效正证据，稳定候选不得因“收集不到失败”被反向阻塞；R0/D0~D1 可按作战卡滚动门限时升阶。
 
 ### B. 兵力与目标
 - B1 先分类再动手（SD/Opus/llm/栈·HEAP·CACHE/ROI/烧录门/硅片）。
@@ -56,7 +61,7 @@ alwaysApply: false
 - **视觉可丢、音频不可丢**（D9）；容量≠瓶颈（D10）。
 
 ### E. 根据地与后勤
-- E1 USB≠冷启；E2 SD 门未过不验脸；E5 一次 `Write timeout` 即停一切 esptool，只催断电/BOOT；E7 未烧进≠已上板；E8 **无 known-good 不出刀**（细节见 hard-constraints §6）。
+- E1 USB≠冷启；E2 SD 门未过不验脸；E5 一次 `Write timeout` 即停一切 esptool，只催断电/BOOT；E7 未烧进≠已上板；E8 **无 known-good 不出刀**（须明确 KG-Life / KG-Function / KG-Archive 之一可回退；细节见 hard-constraints §6 与 current-state §0）。
 
 ### F. 持久演进
 - F1 阶段意识；F2 战役速决、战争持久；F3 过门升阶（无验收关键字=未过门）；F4 绞杀旧路径；F5 DoD=日志闭环；F6 反速胜、反投降。
@@ -81,6 +86,15 @@ alwaysApply: false
 - **H7 可观测冗余（已强）**：BootTrace RTC 环 + PANIC_LAST（panic 前钩子）+ per-marker 审计；**自动标记 `mtval≈sp`（栈类，可修）与 nibble-swap（硅片类，只降暴露）两条分流**，别混判。
 
 **H 的裁决口径**：韧性刀多为 `R0`、`D0/D1`（不伤根据地）→ 鼓励批量；但**「关键态迁 SRAM」「暖恢复路径」改启动/内存布局＝独占批次 + 先 known-good**。韧性收益仍用 **per-marker 平均寿命 + 崩后恢复耗时**双指标判，不用「最近没崩」。可吸收顺序与明确不吸项见 `p4-current-state.mdc` **第八节**。
+
+**H8 韧性欠账可见 + 鼓励交错（软配额）**：`p4-current-state.mdc` §0 必须列出未清的韧性欠账（如 R0-triage / R1-guard / R2-sram / R3-warm）。**不写死**「每 N 视觉刀必须 1 韧性刀」比例（防误伤紧急视觉修复）；但欠账长期为空口号、视觉热路径连续叠刀而韧性零进展，视为战略漂移——优先插轻量韧性探针（不占或轻占显示滚动门）。
+
+### I. 指挥态与可变层纪律（减熵）
+
+- **I1 单一真源**：`FW_MARKER`（`boot_trace.cc`）> current-state §0 > 作战卡摘要 > 流水旧段。冲突时先改状态再出刀。
+- **I2 三槽 known-good**：KG-Life（寿命锚）/ KG-Function（体验回退）/ KG-Archive（存档）。出刀须写明失败退哪一槽；「无 known-good 不出刀」指至少有可切的 Function 或 Archive。
+- **I3 可变层一页**：`p4-current-state.mdc` **§0 保持一页可读**；日流水、长验收叙事 **append 到本文件后部或 `face-emotion-sd` 账本**，禁止把 §0 撑成战史。并行会话 **只增不删** 他人流水。
+- **I4 唯一下一刀**：§0 同时只允许一条「唯一下一刀」；占滚动 V3 的视觉热路径同时最多一项（见作战卡）。
 
 ## 四、指挥关系与冲突
 

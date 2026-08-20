@@ -120,6 +120,7 @@ void ScreenPresenter::LeaveConversation() {
     }
     mode_ = Mode::kLegacyLvgl;
     legacy_passthrough_ = true;
+    speech_turn_active_ = false;
     const int64_t dur_ms = (esp_timer_get_time() - conversation_since_us_) / 1000;
     ESP_LOGW(TAG, "CTRL PRESENT mode=legacy passthrough=1 soak_ms=%d presents=%u",
              (int)dur_ms, (unsigned)present_count_);
@@ -128,6 +129,30 @@ void ScreenPresenter::LeaveConversation() {
     if (host_ != nullptr) {
         host_->PresenterReleasePanel(false);
     }
+}
+
+uint32_t ScreenPresenter::NotifySpeechState(bool speaking) {
+    if (!speaking) {
+        speech_turn_active_ = false;
+        return 0;
+    }
+    if (speech_turn_active_) {
+        return 0;
+    }
+    speech_turn_active_ = true;
+    ++speech_generation_;
+    if (speech_generation_ == 0) {
+        ++speech_generation_;
+    }
+    ESP_LOGW(TAG, "s1es speech_generation=%u", (unsigned)speech_generation_);
+    esp_rom_printf("!!FACE_S1ES speech_gen=%u\n", (unsigned)speech_generation_);
+    if (!emotion_pending_.empty() && emotion_pending_generation_ != speech_generation_) {
+        ESP_LOGW(TAG, "s1ew pending_migrate emo=%s old_gen=%u new_gen=%u",
+                 emotion_pending_.c_str(), (unsigned)emotion_pending_generation_,
+                 (unsigned)speech_generation_);
+        emotion_pending_generation_ = speech_generation_;
+    }
+    return speech_generation_;
 }
 
 void ScreenPresenter::NotifyEmotion(const char* emotion_name) {
@@ -149,8 +174,11 @@ void ScreenPresenter::NotifyEmotion(const char* emotion_name) {
     // s1cn-b: pending overwrite; commit only at safe points (or immediately if idle).
     if (FaceRouteV2_Emotion3Enabled()) {
         emotion_pending_ = emotion_name;
-        ESP_LOGW(TAG, "s1cn-b requested→pending emo=%s committed=%s", emotion_name,
-                 emotion_committed_.empty() ? "-" : emotion_committed_.c_str());
+        emotion_pending_generation_ = speech_generation_;
+        ESP_LOGW(TAG, "s1es requested→pending emo=%s gen=%u committed=%s cgen=%u",
+                 emotion_name, (unsigned)emotion_pending_generation_,
+                 emotion_committed_.empty() ? "-" : emotion_committed_.c_str(),
+                 (unsigned)emotion_committed_generation_);
         esp_rom_printf("!!FACE_S1CN b=pending emo=%s\n", emotion_name);
         if (!host_->PresenterIsFaceRoiAnimActive()) {
             FlushPendingEmotion("notify_idle");
@@ -175,16 +203,22 @@ void ScreenPresenter::FlushPendingEmotion(const char* why) {
         return;
     }
     if (!emotion_committed_.empty() &&
-        strcasecmp(emotion_pending_.c_str(), emotion_committed_.c_str()) == 0) {
+        strcasecmp(emotion_pending_.c_str(), emotion_committed_.c_str()) == 0 &&
+        emotion_pending_generation_ == emotion_committed_generation_) {
+        ESP_LOGW(TAG, "s1es dedupe_same_generation emo=%s gen=%u",
+                 emotion_pending_.c_str(), (unsigned)emotion_pending_generation_);
         emotion_pending_.clear();
         return;
     }
     const std::string emo = emotion_pending_;
+    const uint32_t generation = emotion_pending_generation_;
     emotion_pending_.clear();
     emotion_committed_ = emo;
+    emotion_committed_generation_ = generation;
     emotion_name_ = emo;
     const int64_t t0 = esp_timer_get_time();
-    ESP_LOGW(TAG, "s1cn-b commit emo=%s why=%s via=presenter", emo.c_str(), why ? why : "-");
+    ESP_LOGW(TAG, "s1es commit emo=%s gen=%u why=%s via=presenter", emo.c_str(),
+             (unsigned)generation, why ? why : "-");
     esp_rom_printf("!!FACE_S1CN b=commit emo=%s\n", emo.c_str());
     host_->PresenterPlayEmotion(emo.c_str());
     ESP_LOGW(TAG, "SAD_DIAG PRESENT play_done emo=%s cost_ms=%d s1cn-b", emo.c_str(),

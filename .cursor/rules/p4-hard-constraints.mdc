@@ -43,6 +43,7 @@ alwaysApply: false
 - 听态序：**pause MJPEG → 关 AFE → 开 voice → present**（禁先开 voice 再关 AFE）。
 - 全屏事务**单例 + 安全窗**：同时刻最多一个全屏底图/transition，避开 AFE fetch 与 TTS 起始边沿。
 - **视觉可丢、音频不可丢**：优先级 音频采集·播放 > 会话·网络控制 > 必显 UI 状态 > 情绪静态切换 > 动画帧。视觉走 latest-value 覆盖式，过期即丢，**禁补播**。
+- **idle 视觉令牌契约（连续 WakeNet fetch 下）**：idle 期 AFE/WakeNet 近连续持门时，**idle 视觉突发预算≈0**。合法策略只能是稀疏、可丢、门空闲才提交的令牌帧（例：s1fo canary 量级 frame≫fetch、rest 秒级）；**禁**为「生命感」加密帧、禁失败后追赶补帧、禁与 fetch 竞抢同一 PSRAM 窗。失败丢帧回退背光/静态，不算功能失败。
 
 ## 6. 烧录 / 后勤（可烧录=根据地）
 

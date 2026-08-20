@@ -22,6 +22,18 @@ std::atomic<bool> g_e_static_dialogue{S1CO_E_STATIC_DIALOGUE != 0};
 std::atomic<bool> g_f_full_still{S1CP_F_FULL_STILL != 0};
 std::atomic<bool> g_g_enter_arc{S1CP_G_ENTER_ARC != 0};
 std::atomic<bool> g_i_life_layer{S1EF_I_LIFE_LAYER != 0};
+std::atomic<bool> g_j_canonical_emotion{S1EP_J_CANONICAL_EMOTION != 0};
+std::atomic<bool> g_k_standby_life{S1EP_K_STANDBY_LIFE != 0};
+std::atomic<bool> g_l_release_hub{S1ET_L_RELEASE_HUB != 0};
+std::atomic<bool> g_m_provisional_mouth{S1EW_M_PROVISIONAL_MOUTH != 0};
+std::atomic<bool> g_n_mouth_gain_soft{S1EX_N_MOUTH_GAIN_SOFT != 0};
+std::atomic<bool> g_o_mouth_large_gain_soft{S1EY_O_MOUTH_LARGE_GAIN_SOFT != 0};
+std::atomic<bool> g_p_life_afe_fence{S1EZ_P_LIFE_AFE_FENCE != 0};
+std::atomic<bool> g_t_idle_backlight_breathe{S1FD_T_IDLE_BACKLIGHT_BREATHE != 0};
+std::atomic<bool> g_u_visual_budget_shadow{S1FL_U_VISUAL_BUDGET_SHADOW != 0};
+std::atomic<bool> g_v_visual_budget_mouth_apply{S1FM_V_VISUAL_BUDGET_MOUTH_APPLY != 0};
+std::atomic<bool> g_w_visual_budget_life_apply{S1FN_W_VISUAL_BUDGET_LIFE_APPLY != 0};
+std::atomic<bool> g_x_idle_life_canary{S1FO_X_IDLE_LIFE_CANARY != 0};
 
 std::atomic<bool> g_fs_busy{false};
 std::atomic<bool> g_fs_holds_afe{false};
@@ -75,6 +87,42 @@ bool FaceRouteV2_EnterArcEnabled(void) {
 bool FaceRouteV2_LifeLayerEnabled(void) {
     return g_i_life_layer.load(std::memory_order_relaxed);
 }
+bool FaceRouteV2_CanonicalEmotionEnabled(void) {
+    return g_j_canonical_emotion.load(std::memory_order_relaxed);
+}
+bool FaceRouteV2_StandbyLifeEnabled(void) {
+    return g_k_standby_life.load(std::memory_order_relaxed);
+}
+bool FaceRouteV2_ReleaseHubEnabled(void) {
+    return g_l_release_hub.load(std::memory_order_relaxed);
+}
+bool FaceRouteV2_ProvisionalMouthEnabled(void) {
+    return g_m_provisional_mouth.load(std::memory_order_relaxed);
+}
+bool FaceRouteV2_MouthGainSoftEnabled(void) {
+    return g_n_mouth_gain_soft.load(std::memory_order_relaxed);
+}
+bool FaceRouteV2_MouthLargeGainSoftEnabled(void) {
+    return g_o_mouth_large_gain_soft.load(std::memory_order_relaxed);
+}
+bool FaceRouteV2_LifeAfeFenceEnabled(void) {
+    return g_p_life_afe_fence.load(std::memory_order_relaxed);
+}
+bool FaceRouteV2_IdleBacklightBreatheEnabled(void) {
+    return g_t_idle_backlight_breathe.load(std::memory_order_relaxed);
+}
+bool FaceRouteV2_VisualBudgetShadowEnabled(void) {
+    return g_u_visual_budget_shadow.load(std::memory_order_relaxed);
+}
+bool FaceRouteV2_VisualBudgetMouthApplyEnabled(void) {
+    return g_v_visual_budget_mouth_apply.load(std::memory_order_relaxed);
+}
+bool FaceRouteV2_VisualBudgetLifeApplyEnabled(void) {
+    return g_w_visual_budget_life_apply.load(std::memory_order_relaxed);
+}
+bool FaceRouteV2_IdleLifeCanaryEnabled(void) {
+    return g_x_idle_life_canary.load(std::memory_order_relaxed);
+}
 
 void FaceRouteV2_SetWorker(bool on) {
     g_a_worker.store(on, std::memory_order_relaxed);
@@ -100,19 +148,85 @@ void FaceRouteV2_SetEnterArc(bool on) {
 void FaceRouteV2_SetLifeLayer(bool on) {
     g_i_life_layer.store(on, std::memory_order_relaxed);
 }
+void FaceRouteV2_SetCanonicalEmotion(bool on) {
+    g_j_canonical_emotion.store(on, std::memory_order_relaxed);
+}
+void FaceRouteV2_SetStandbyLife(bool on) {
+    g_k_standby_life.store(on, std::memory_order_relaxed);
+}
+void FaceRouteV2_SetReleaseHub(bool on) {
+    g_l_release_hub.store(on, std::memory_order_relaxed);
+}
+void FaceRouteV2_SetProvisionalMouth(bool on) {
+    g_m_provisional_mouth.store(on, std::memory_order_relaxed);
+}
+void FaceRouteV2_SetMouthGainSoft(bool on) {
+    g_n_mouth_gain_soft.store(on, std::memory_order_relaxed);
+}
+void FaceRouteV2_SetMouthLargeGainSoft(bool on) {
+    g_o_mouth_large_gain_soft.store(on, std::memory_order_relaxed);
+}
+void FaceRouteV2_SetLifeAfeFence(bool on) {
+    g_p_life_afe_fence.store(on, std::memory_order_relaxed);
+}
+void FaceRouteV2_SetIdleBacklightBreathe(bool on) {
+    g_t_idle_backlight_breathe.store(on, std::memory_order_relaxed);
+}
+void FaceRouteV2_SetVisualBudgetShadow(bool on) {
+    g_u_visual_budget_shadow.store(on, std::memory_order_relaxed);
+}
+void FaceRouteV2_SetVisualBudgetMouthApply(bool on) {
+    g_v_visual_budget_mouth_apply.store(on, std::memory_order_relaxed);
+}
+void FaceRouteV2_SetVisualBudgetLifeApply(bool on) {
+    g_w_visual_budget_life_apply.store(on, std::memory_order_relaxed);
+}
+void FaceRouteV2_SetIdleLifeCanary(bool on) {
+    g_x_idle_life_canary.store(on, std::memory_order_relaxed);
+}
 void FaceRouteV2_BootLog(void) {
     ESP_LOGW(TAG,
-             "s1en flags a=%d b=%d c=%d d=%d e_static=%d f_fullstill=%d g_enter=%d i_life=%d",
+             "s1fo flags a=%d b=%d c=%d d=%d e_static=%d f_fullstill=%d g_enter=%d i_life=%d j_canon=%d k_idlelife=%d l_release=%d m_provisional=%d n_gain=%d o_large=%d p_life_fence=%d q_mqtt_idle_quiet=%d r_afe_dither=%d s_afe_edge=%d t_bl_breathe=%d u_budget_shadow=%d v_mouth_apply=%d w_life_apply=%d x_idle_canary=%d",
              FaceRouteV2_WorkerEnabled() ? 1 : 0, FaceRouteV2_Emotion3Enabled() ? 1 : 0,
              FaceRouteV2_FsGateEnabled() ? 1 : 0, FaceRouteV2_QuietLogEnabled() ? 1 : 0,
              FaceRouteV2_StaticDialogueEnabled() ? 1 : 0, FaceRouteV2_FullStillEnabled() ? 1 : 0,
-             FaceRouteV2_EnterArcEnabled() ? 1 : 0, FaceRouteV2_LifeLayerEnabled() ? 1 : 0);
-    esp_rom_printf("!!FACE_S1EN a=%d b=%d c=%d d=%d e=%d f=%d g=%d i=%d\n",
+             FaceRouteV2_EnterArcEnabled() ? 1 : 0, FaceRouteV2_LifeLayerEnabled() ? 1 : 0,
+             FaceRouteV2_CanonicalEmotionEnabled() ? 1 : 0,
+             FaceRouteV2_StandbyLifeEnabled() ? 1 : 0,
+             FaceRouteV2_ReleaseHubEnabled() ? 1 : 0,
+             FaceRouteV2_ProvisionalMouthEnabled() ? 1 : 0,
+             FaceRouteV2_MouthGainSoftEnabled() ? 1 : 0,
+             FaceRouteV2_MouthLargeGainSoftEnabled() ? 1 : 0,
+             FaceRouteV2_LifeAfeFenceEnabled() ? 1 : 0,
+             S1FA_Q_MQTT_IDLE_QUIET ? 1 : 0,
+             S1FB_R_IDLE_AFE_DITHER ? 1 : 0,
+             S1FC_S_AFE_EDGE_TOKEN ? 1 : 0,
+             FaceRouteV2_IdleBacklightBreatheEnabled() ? 1 : 0,
+             FaceRouteV2_VisualBudgetShadowEnabled() ? 1 : 0,
+             FaceRouteV2_VisualBudgetMouthApplyEnabled() ? 1 : 0,
+             FaceRouteV2_VisualBudgetLifeApplyEnabled() ? 1 : 0,
+             FaceRouteV2_IdleLifeCanaryEnabled() ? 1 : 0);
+    esp_rom_printf("!!FACE_S1FO a=%d b=%d c=%d d=%d e=%d f=%d g=%d i=%d j=%d k=%d l=%d m=%d n=%d o=%d p=%d q=%d r=%d s=%d t=%d u=%d v=%d w=%d x=%d apply=1 idle_life_ms=420 rest_ms=8000\n",
                    FaceRouteV2_WorkerEnabled() ? 1 : 0, FaceRouteV2_Emotion3Enabled() ? 1 : 0,
                    FaceRouteV2_FsGateEnabled() ? 1 : 0, FaceRouteV2_QuietLogEnabled() ? 1 : 0,
                    FaceRouteV2_StaticDialogueEnabled() ? 1 : 0,
                    FaceRouteV2_FullStillEnabled() ? 1 : 0, FaceRouteV2_EnterArcEnabled() ? 1 : 0,
-                   FaceRouteV2_LifeLayerEnabled() ? 1 : 0);
+                   FaceRouteV2_LifeLayerEnabled() ? 1 : 0,
+                   FaceRouteV2_CanonicalEmotionEnabled() ? 1 : 0,
+                   FaceRouteV2_StandbyLifeEnabled() ? 1 : 0,
+                   FaceRouteV2_ReleaseHubEnabled() ? 1 : 0,
+                   FaceRouteV2_ProvisionalMouthEnabled() ? 1 : 0,
+                   FaceRouteV2_MouthGainSoftEnabled() ? 1 : 0,
+                   FaceRouteV2_MouthLargeGainSoftEnabled() ? 1 : 0,
+                   FaceRouteV2_LifeAfeFenceEnabled() ? 1 : 0,
+                   S1FA_Q_MQTT_IDLE_QUIET ? 1 : 0,
+                   S1FB_R_IDLE_AFE_DITHER ? 1 : 0,
+                   S1FC_S_AFE_EDGE_TOKEN ? 1 : 0,
+                   FaceRouteV2_IdleBacklightBreatheEnabled() ? 1 : 0,
+                   FaceRouteV2_VisualBudgetShadowEnabled() ? 1 : 0,
+                   FaceRouteV2_VisualBudgetMouthApplyEnabled() ? 1 : 0,
+                   FaceRouteV2_VisualBudgetLifeApplyEnabled() ? 1 : 0,
+                   FaceRouteV2_IdleLifeCanaryEnabled() ? 1 : 0);
 }
 
 void FaceRouteV2_EnsureWorker(FaceRouteV2TickFn tick_fn, void* ctx) {
@@ -124,16 +238,20 @@ void FaceRouteV2_EnsureWorker(FaceRouteV2TickFn tick_fn, void* ctx) {
     if (g_worker != nullptr || g_tick_q == nullptr || tick_fn == nullptr) {
         return;
     }
-    // Core 1 with LVGL; prio 3 (< LVGL 4); stack 12288 (s1bi/s1bh: no tiny stacks).
+    // s1ez: audio_detection is prio 3.  Visual work must be lower priority so a
+    // waiting AFE fetch wins the cross-core gate at the next release.
+    const UBaseType_t worker_priority = FaceRouteV2_LifeAfeFenceEnabled() ? 2 : 3;
     BaseType_t ok =
-        xTaskCreatePinnedToCore(FaceWorkerTask, "face_worker", 12288, nullptr, 3, &g_worker, 1);
+        xTaskCreatePinnedToCore(FaceWorkerTask, "face_worker", 12288, nullptr, worker_priority,
+                                &g_worker, 1);
     if (ok != pdPASS) {
         g_worker = nullptr;
         ESP_LOGE(TAG, "s1cn-a face_worker create FAIL");
         esp_rom_printf("!!FACE_S1CN a=create_fail\n");
         return;
     }
-    ESP_LOGW(TAG, "s1cn-a face_worker up stack=12288 core=1 prio=3");
+    ESP_LOGW(TAG, "s1ez face_worker up stack=12288 core=1 prio=%u audio_prio=3",
+             (unsigned)worker_priority);
     esp_rom_printf("!!FACE_S1CN a=worker_up\n");
 }
 

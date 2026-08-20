@@ -47,6 +47,9 @@ public:
 
     void EnterConversation();
     void LeaveConversation();
+    /** Mark Listening<->Speaking edges so same-emotion replies are new render generations. */
+    /** Returns the new generation once per Listening->Speaking edge, otherwise zero. */
+    uint32_t NotifySpeechState(bool speaking);
     bool IsConversationMode() const {
         return StageAtLeast(2) && mode_ == Mode::kPresentConversation;
     }
@@ -94,6 +97,10 @@ private:
     /** s1cn-b: requested → pending → committed (overwrite pending; commit at safe points). */
     std::string emotion_pending_;
     std::string emotion_committed_;
+    uint32_t speech_generation_ = 0;
+    uint32_t emotion_pending_generation_ = 0;
+    uint32_t emotion_committed_generation_ = 0;
+    bool speech_turn_active_ = false;
     std::string dialogue_text_;
     std::string caption_role_;
     std::string status_phase_;

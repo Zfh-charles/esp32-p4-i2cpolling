@@ -4,12 +4,21 @@
 #include <freertos/semphr.h>
 #include <esp_attr.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 
 static SemaphoreHandle_t s_mu = NULL;
+static SemaphoreHandle_t s_mspi_budget_mu = NULL;
+static portMUX_TYPE s_mspi_budget_init_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t s_flush_started = 0;
 static volatile uint32_t s_flush_finished = 0;
 static volatile uint32_t s_flush_active = 0;
 static volatile uint32_t s_frame_ready = 0;
+static portMUX_TYPE s_idle_visual_mux = portMUX_INITIALIZER_UNLOCKED;
+static afe_idle_visual_notify_fn_t s_idle_visual_notify = NULL;
+static void* s_idle_visual_ctx = NULL;
+static bool s_idle_visual_pending = false;
+static int64_t s_idle_visual_next_us = 0;
+static uint32_t s_idle_visual_min_interval_ms = 900;
 
 #define AFE_TXN_RTC_MAGIC 0xAFC1D1A6u
 
@@ -76,6 +85,83 @@ void AfeFetchGateEnter(void) {
     s_rtc_txn.afe_ms = DiagMs();
 }
 
+static void MspiBudgetGateEnsure(void) {
+    if (s_mspi_budget_mu != NULL) {
+        return;
+    }
+    SemaphoreHandle_t candidate = xSemaphoreCreateMutex();
+    if (candidate == NULL) {
+        return;
+    }
+    portENTER_CRITICAL(&s_mspi_budget_init_mux);
+    if (s_mspi_budget_mu == NULL) {
+        s_mspi_budget_mu = candidate;
+        candidate = NULL;
+    }
+    portEXIT_CRITICAL(&s_mspi_budget_init_mux);
+    if (candidate != NULL) {
+        vSemaphoreDelete(candidate);
+    }
+}
+
+void AfeFetchGateSetIdleVisualNotify(afe_idle_visual_notify_fn_t notify, void* ctx) {
+#if S1FC_S_AFE_EDGE_TOKEN
+    portENTER_CRITICAL(&s_idle_visual_mux);
+    s_idle_visual_notify = notify;
+    s_idle_visual_ctx = ctx;
+    if (notify == NULL) {
+        s_idle_visual_pending = false;
+    }
+    portEXIT_CRITICAL(&s_idle_visual_mux);
+#else
+    (void)notify;
+    (void)ctx;
+#endif
+}
+
+void AfeFetchGateRequestIdleVisualEdge(uint32_t min_interval_ms) {
+#if S1FC_S_AFE_EDGE_TOKEN
+    if (min_interval_ms < 250) {
+        min_interval_ms = 250;
+    }
+    portENTER_CRITICAL(&s_idle_visual_mux);
+    s_idle_visual_min_interval_ms = min_interval_ms;
+    s_idle_visual_pending = true;
+    portEXIT_CRITICAL(&s_idle_visual_mux);
+#else
+    (void)min_interval_ms;
+#endif
+}
+
+void AfeFetchGateCancelIdleVisualEdge(void) {
+#if S1FC_S_AFE_EDGE_TOKEN
+    portENTER_CRITICAL(&s_idle_visual_mux);
+    s_idle_visual_pending = false;
+    portEXIT_CRITICAL(&s_idle_visual_mux);
+#endif
+}
+
+static void MaybeNotifyIdleVisualEdge(void) {
+#if S1FC_S_AFE_EDGE_TOKEN
+    afe_idle_visual_notify_fn_t notify = NULL;
+    void* ctx = NULL;
+    const int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_idle_visual_mux);
+    if (s_idle_visual_pending && s_idle_visual_notify != NULL &&
+        now_us >= s_idle_visual_next_us) {
+        s_idle_visual_pending = false;
+        s_idle_visual_next_us =
+            now_us + (int64_t)s_idle_visual_min_interval_ms * 1000LL;
+        notify = s_idle_visual_notify;
+        ctx = s_idle_visual_ctx;
+    }
+    portEXIT_CRITICAL(&s_idle_visual_mux);
+    if (notify != NULL) {
+        notify(ctx);
+    }
+#endif
+}
+
 void AfeFetchGateLeave(void) {
     EnsureRtc();
     s_rtc_txn.afe_stage = AFE_DIAG_RETURNED;
@@ -85,6 +171,9 @@ void AfeFetchGateLeave(void) {
     }
     s_rtc_txn.afe_stage = AFE_DIAG_IDLE;
     s_rtc_txn.afe_ms = DiagMs();
+    // s1fc: callback runs only after the AFE mutex is released.  It must never
+    // decode, paint, log, wait, or touch LVGL; it only posts a latest-value tick.
+    MaybeNotifyIdleVisualEdge();
 }
 
 bool AfeFetchGateTryLock(uint32_t timeout_ms) {
@@ -111,6 +200,43 @@ bool AfeFetchGateBusy(void) {
         return false;
     }
     return true;
+}
+
+bool MspiBudgetGateEnterNetwork(void) {
+#if S1FA_Q_MQTT_IDLE_QUIET
+    MspiBudgetGateEnsure();
+    if (s_mspi_budget_mu != NULL) {
+        return xSemaphoreTake(s_mspi_budget_mu, portMAX_DELAY) == pdTRUE;
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
+void MspiBudgetGateLeaveNetwork(void) {
+#if S1FA_Q_MQTT_IDLE_QUIET
+    if (s_mspi_budget_mu != NULL) {
+        xSemaphoreGive(s_mspi_budget_mu);
+    }
+#endif
+}
+
+bool MspiBudgetGateTryEnterIdleVisual(void) {
+#if S1FA_Q_MQTT_IDLE_QUIET
+    MspiBudgetGateEnsure();
+    return s_mspi_budget_mu == NULL || xSemaphoreTake(s_mspi_budget_mu, 0) == pdTRUE;
+#else
+    return true;
+#endif
+}
+
+void MspiBudgetGateLeaveIdleVisual(void) {
+#if S1FA_Q_MQTT_IDLE_QUIET
+    if (s_mspi_budget_mu != NULL) {
+        xSemaphoreGive(s_mspi_budget_mu);
+    }
+#endif
 }
 
 void AfeFetchGatePrepareDisplayFence(afe_display_fence_t* fence) {

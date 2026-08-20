@@ -27,6 +27,8 @@
 
 #if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
 #include "boards/ep-chat-p4-ml307/eezui_display_adapter.h"
+#include "boards/ep-chat-p4-ml307/face_route_v2.h"
+#include "boards/ep-chat-p4-ml307/visual_budget_v2.h"
 #endif
 
 namespace {
@@ -141,7 +143,7 @@ Application::Application() {
     esp_timer_create_args_t proactive_feedback_timer_args = {
         .callback = [](void* arg) {
             auto* app = static_cast<Application*>(arg);
-            app->Schedule([app]() { app->FinishProactiveReminder(); });
+            app->Schedule([app]() { app->HandleProactiveFeedbackTimer(); });
         },
         .arg = this,
         .dispatch_method = ESP_TIMER_TASK,
@@ -640,6 +642,7 @@ void Application::Start() {
         board.SetPowerSaveMode(true);
         Schedule([this]() {
 #if CONFIG_USE_REMINDER_POLL
+            audio_service_.ReleasePlaybackPrebuffer();
             if (session_kind_ == SessionKind::ProactiveReminder) {
                 if (!pending_reminder_ack_id_.empty() && proactive_reminder_tts_started_) {
                     StopProactiveFeedbackTimer();
@@ -741,10 +744,17 @@ void Application::Start() {
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
+                    const bool proactive =
 #if CONFIG_USE_REMINDER_POLL
-                    const bool proactive = session_kind_ == SessionKind::ProactiveReminder;
+                        session_kind_ == SessionKind::ProactiveReminder;
+#else
+                        false;
+#endif
+#if CONFIG_USE_REMINDER_POLL
                     if (proactive) {
-                        audio_service_.EndSpeakerPlayback();
+                        // A short final sentence may contain fewer than the
+                        // target frames. Release it before drain/ACK handling.
+                        audio_service_.ReleasePlaybackPrebuffer();
                     }
                     if (proactive) {
                         ReminderTraceLog("proactive_tts_stop", pending_reminder_ack_id_.c_str());
@@ -776,7 +786,7 @@ void Application::Start() {
                         ReminderUiTraceTts("json_stop", "user", 1);
                     }
 #endif
-                    if (device_state_ == kDeviceStateSpeaking) {
+                    if (!proactive && device_state_ == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
@@ -1040,9 +1050,11 @@ void Application::MainEventLoop() {
 #endif
 #if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
             TryStartDeferredEmotionPreload();
+            UpdateVisualBudgetShadow();
 #endif
             WdtContendMainTick();
             IdleWdtMainHb();
+            BootTraceMaybeEchoMarker();
 
             // Print the debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
@@ -1763,7 +1775,9 @@ void Application::EnterIdleStandby(bool show_wake_hint) {
 #if CONFIG_USE_REMINDER_POLL
     const int64_t now_us = esp_timer_get_time();
     constexpr int64_t kIdleStandbyDebounceUs = 2 * 1000000LL;
+    const bool channel_open = protocol_ != nullptr && protocol_->IsAudioChannelOpened();
     if (device_state_ == kDeviceStateIdle && session_kind_ == SessionKind::None &&
+        !channel_open &&
         (now_us - last_idle_standby_us_) < kIdleStandbyDebounceUs) {
         ReminderTraceLog("enter_idle_standby_skip", "debounce");
         if (show_wake_hint) {
@@ -1914,6 +1928,37 @@ void Application::EndSessionAndRestoreIdle(bool force_capture) {
 #endif
 }
 
+void Application::HandleNetworkDown() {
+    Schedule([this]() {
+        const bool channel_open = protocol_ != nullptr && protocol_->IsAudioChannelOpened();
+        const bool active_state = device_state_ == kDeviceStateConnecting ||
+                                  device_state_ == kDeviceStateListening ||
+                                  device_state_ == kDeviceStateSpeaking;
+#if CONFIG_USE_REMINDER_POLL
+        const bool session_active = session_kind_ != SessionKind::None;
+        ESP_LOGW(TAG, "NET_DOWN_RECOVERY begin state=%s session=%s ch=%d",
+                 STATE_STRINGS[device_state_],
+                 ReminderTraceSessionKindName(static_cast<int>(session_kind_)),
+                 channel_open ? 1 : 0);
+#else
+        const bool session_active = false;
+        ESP_LOGW(TAG, "NET_DOWN_RECOVERY begin state=%s ch=%d",
+                 STATE_STRINGS[device_state_], channel_open ? 1 : 0);
+#endif
+        if (!active_state && !session_active && !channel_open) {
+            ESP_LOGW(TAG, "NET_DOWN_RECOVERY noop already_idle");
+            return;
+        }
+
+        EndSessionAndRestoreIdle(true);
+#if CONFIG_USE_REMINDER_POLL
+        ReminderTraceLog("network_down_recovery", "done");
+#else
+        ESP_LOGW(TAG, "NET_DOWN_RECOVERY done");
+#endif
+    });
+}
+
 #if CONFIG_USE_REMINDER_POLL
 bool Application::IsUserConversationActive() const {
     if (session_kind_ == SessionKind::ProactiveReminder) {
@@ -2010,6 +2055,9 @@ void Application::SetDeviceState(DeviceState state) {
 
     ApplyAudioPolicyForState(state, previous_state);
     UpdateCapturePowerHold();
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+    UpdateVisualBudgetShadow();
+#endif
 #if CONFIG_USE_REMINDER_POLL
     if (state == kDeviceStateIdle) {
         TryStartDeferredReminderNet();
@@ -2020,6 +2068,44 @@ void Application::SetDeviceState(DeviceState state) {
     }
 #endif
 }
+
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+void Application::UpdateVisualBudgetShadow() {
+    if (!FaceRouteV2_VisualBudgetShadowEnabled()) {
+        return;
+    }
+
+    const auto diag = audio_service_.GetDiagnosticState();
+    VisualBudgetSample sample;
+    sample.device_state = device_state_;
+    sample.decode_queue = diag.decode_queue;
+    sample.playback_queue = diag.playback_queue;
+    sample.send_queue = diag.send_queue;
+    sample.output_age_ms = diag.output_age_ms;
+    sample.playback_hold = audio_service_.IsSpeakerPlaybackHeld();
+
+    const auto decision = VisualBudgetV2_ClassifyShadow(sample);
+    VisualBudgetV2_Publish(decision.level);
+    const int level = static_cast<int>(decision.level);
+    const bool changed = level != visual_budget_shadow_level_;
+    const bool heartbeat = (++visual_budget_shadow_samples_ % 60) == 0;
+    if (!changed && !heartbeat) {
+        return;
+    }
+
+    const char* previous = visual_budget_shadow_level_ < 0
+        ? "none"
+        : VisualBudgetV2_LevelName(static_cast<VisualBudgetLevel>(visual_budget_shadow_level_));
+    ESP_LOGI(TAG,
+             "VIS_BUDGET_SHADOW level=%s prev=%s reason=%s state=%s dq=%u pq=%u sq=%u out_age=%ums hold=%d apply=%d s1fo",
+             VisualBudgetV2_LevelName(decision.level), previous, decision.reason,
+             STATE_STRINGS[device_state_], static_cast<unsigned>(sample.decode_queue),
+             static_cast<unsigned>(sample.playback_queue), static_cast<unsigned>(sample.send_queue),
+             static_cast<unsigned>(sample.output_age_ms), sample.playback_hold ? 1 : 0,
+             FaceRouteV2_VisualBudgetMouthApplyEnabled() ? 1 : 0);
+    visual_budget_shadow_level_ = level;
+}
+#endif
 
 void Application::Reboot() {
     ESP_LOGI(TAG, "Rebooting...");
@@ -2279,6 +2365,31 @@ void Application::StartProactiveFeedbackWindow() {
     }
     StopProactiveFeedbackTimer();
     StopProactiveReminderTimeout();
+    audio_service_.ReleasePlaybackPrebuffer();
+    if (!audio_service_.IsIdle()) {
+        proactive_feedback_waiting_drain_ = true;
+        proactive_feedback_drain_checks_ = 0;
+        ReminderTraceLog("proactive_wait_local_audio_drain");
+        if (proactive_feedback_timer_handle_ != nullptr) {
+            esp_timer_start_once(proactive_feedback_timer_handle_, 100 * 1000LL);
+        }
+        return;
+    }
+    BeginProactiveFeedbackWindow();
+}
+
+void Application::BeginProactiveFeedbackWindow() {
+    if (session_kind_ != SessionKind::ProactiveReminder) {
+        return;
+    }
+#ifdef CONFIG_REMINDER_FEEDBACK_SEC
+    const int feedback_sec = CONFIG_REMINDER_FEEDBACK_SEC;
+#else
+    const int feedback_sec = 5;
+#endif
+    proactive_feedback_waiting_drain_ = false;
+    proactive_feedback_drain_checks_ = 0;
+    audio_service_.EndSpeakerPlayback();
     ESP_LOGI(TAG, "Proactive feedback window %ds [scheme-D]", feedback_sec);
     ReminderTraceLog("feedback_window_start");
     ReminderLcMark(ReminderLcOwner::Proactive, ReminderLcPhase::FeedbackStart, 1, nullptr);
@@ -2289,8 +2400,36 @@ void Application::StartProactiveFeedbackWindow() {
     }
 }
 
+void Application::HandleProactiveFeedbackTimer() {
+    if (!proactive_feedback_waiting_drain_) {
+        FinishProactiveReminder();
+        return;
+    }
+    if (session_kind_ != SessionKind::ProactiveReminder) {
+        proactive_feedback_waiting_drain_ = false;
+        proactive_feedback_drain_checks_ = 0;
+        return;
+    }
+    if (!audio_service_.IsIdle() && proactive_feedback_drain_checks_++ < 100) {
+        if ((proactive_feedback_drain_checks_ % 10) == 1) {
+            ReminderTraceLog("proactive_drain_wait", pending_reminder_ack_id_.c_str());
+        }
+        if (proactive_feedback_timer_handle_ != nullptr) {
+            esp_timer_start_once(proactive_feedback_timer_handle_, 100 * 1000LL);
+        }
+        return;
+    }
+    if (!audio_service_.IsIdle()) {
+        ESP_LOGW(TAG, "Proactive audio drain exceeded 10s; enter feedback without clearing queues");
+        ReminderTraceLog("proactive_drain_timeout", pending_reminder_ack_id_.c_str());
+    }
+    BeginProactiveFeedbackWindow();
+}
+
 void Application::FinishProactiveReminder() {
     StopProactiveFeedbackTimer();
+    proactive_feedback_waiting_drain_ = false;
+    proactive_feedback_drain_checks_ = 0;
     ReminderTraceLog("feedback_window_end");
     ReminderLcMark(ReminderLcOwner::Proactive, ReminderLcPhase::FeedbackEnd, 1, nullptr);
     audio_service_.EnableVoiceProcessing(false);
@@ -2316,6 +2455,10 @@ void Application::CancelPendingReminderAck() {
     ReminderLcMark(ReminderLcOwner::Proactive, ReminderLcPhase::Ack, 0, "cancelled");
     ReminderLcSummary(ReminderLcOwner::Proactive);
     StopProactiveReminderTimeout();
+    StopProactiveFeedbackTimer();
+    proactive_feedback_waiting_drain_ = false;
+    proactive_feedback_drain_checks_ = 0;
+    audio_service_.ReleasePlaybackPrebuffer();
     const bool had_tts = proactive_reminder_tts_started_;
     pending_reminder_ack_id_.clear();
     pending_reminder_ack_url_.clear();
@@ -2337,6 +2480,7 @@ void Application::CompletePendingReminderAck() {
     }
 
     ReminderTraceLog("proactive_ack_begin", pending_reminder_ack_id_.c_str());
+    audio_service_.ReleasePlaybackPrebuffer();
     std::string ack_id = pending_reminder_ack_id_;
     std::string ack_url = pending_reminder_ack_url_;
     StopProactiveReminderTimeout();
@@ -2475,9 +2619,11 @@ void Application::RunReminderDelivery(const ReminderDeliverPayload& payload) {
         pending_reminder_ack_url_ = ack_url;
         proactive_reminder_tts_started_ = false;
         proactive_audio_packets_ = 0;
+        audio_service_.BeginPlaybackPrebuffer();
         audio_service_.PrepareSpeakerPlayback();
     } else if (effective_mode == ReminderDeliveryMode::kDirectWake) {
         SetSessionKind(SessionKind::ProactiveReminder, "deliver_direct_wake");
+        audio_service_.BeginPlaybackPrebuffer();
         audio_service_.PrepareSpeakerPlayback();
     }
 
@@ -2485,6 +2631,7 @@ void Application::RunReminderDelivery(const ReminderDeliverPayload& payload) {
         SetDeviceState(kDeviceStateConnecting);
         if (!protocol_->OpenAudioChannel()) {
             ESP_LOGE(TAG, "Failed to open channel for reminder");
+            audio_service_.ReleasePlaybackPrebuffer();
             if (effective_mode == ReminderDeliveryMode::kMcpWake) {
                 pending_reminder_ack_id_.clear();
                 pending_reminder_ack_url_.clear();

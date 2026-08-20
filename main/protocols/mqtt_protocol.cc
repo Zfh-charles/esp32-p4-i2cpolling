@@ -13,6 +13,24 @@
 
 #define TAG "MQTT"
 
+namespace {
+constexpr size_t kUdpAudioHeaderSize = 16;
+constexpr size_t kUdpAudioMaxPayloadSize = UINT16_MAX;
+
+bool IsValidHexString(const char* value, size_t decoded_size) {
+    if (value == nullptr || strlen(value) != decoded_size * 2) {
+        return false;
+    }
+    for (const char* p = value; *p != '\0'; ++p) {
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'A' && *p <= 'F') ||
+              (*p >= 'a' && *p <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+}  // namespace
+
 MqttProtocol::MqttProtocol() {
     event_group_handle_ = xEventGroupCreate();
 
@@ -141,6 +159,14 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
                 });
             }
         } else if (on_incoming_json_ != nullptr) {
+            if (strcmp(type->valuestring, "tts") == 0) {
+                auto state = cJSON_GetObjectItem(root, "state");
+                if (cJSON_IsString(state) && strcmp(state->valuestring, "stop") == 0) {
+                    // MQTT control and UDP media are independent paths.  Release
+                    // a short confirmed gap before application teardown sees stop.
+                    FlushAudioReorderBuffer();
+                }
+            }
             on_incoming_json_(root);
         }
         cJSON_Delete(root);
@@ -192,36 +218,73 @@ bool MqttProtocol::SendText(const std::string& text) {
 }
 
 bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
+    if (packet == nullptr) {
+        ESP_LOGE(TAG, "Cannot send null audio packet");
+        return false;
+    }
+    if (packet->payload.empty()) {
+        ESP_LOGE(TAG, "Cannot send empty application audio packet");
+        return false;
+    }
     std::lock_guard<std::mutex> lock(channel_mutex_);
+    return SendAudioLocked(*packet);
+}
+
+bool MqttProtocol::SendAudioLocked(const AudioStreamPacket& packet) {
     if (udp_ == nullptr) {
+        return false;
+    }
+    if (aes_nonce_.size() != kUdpAudioHeaderSize) {
+        ESP_LOGE(TAG, "Invalid UDP audio nonce size: %u",
+                 static_cast<unsigned>(aes_nonce_.size()));
+        return false;
+    }
+    if (packet.payload.size() > kUdpAudioMaxPayloadSize) {
+        ESP_LOGE(TAG, "UDP audio payload too large: %u",
+                 static_cast<unsigned>(packet.payload.size()));
         return false;
     }
 
     std::string nonce(aes_nonce_);
-    *(uint16_t*)&nonce[2] = htons(packet->payload.size());
-    *(uint32_t*)&nonce[8] = htonl(packet->timestamp);
-    *(uint32_t*)&nonce[12] = htonl(++local_sequence_);
+    const uint16_t payload_size = htons(static_cast<uint16_t>(packet.payload.size()));
+    const uint32_t timestamp = htonl(packet.timestamp);
+    const uint32_t sequence = htonl(++local_sequence_);
+    memcpy(nonce.data() + 2, &payload_size, sizeof(payload_size));
+    memcpy(nonce.data() + 8, &timestamp, sizeof(timestamp));
+    memcpy(nonce.data() + 12, &sequence, sizeof(sequence));
 
     std::string encrypted;
-    encrypted.resize(aes_nonce_.size() + packet->payload.size());
+    encrypted.resize(aes_nonce_.size() + packet.payload.size());
     memcpy(encrypted.data(), nonce.data(), nonce.size());
 
-    size_t nc_off = 0;
-    uint8_t stream_block[16] = {0};
-    if (mbedtls_aes_crypt_ctr(&aes_ctx_, packet->payload.size(), &nc_off, (uint8_t*)nonce.c_str(), stream_block,
-        (uint8_t*)packet->payload.data(), (uint8_t*)&encrypted[nonce.size()]) != 0) {
-        ESP_LOGE(TAG, "Failed to encrypt audio data");
-        return false;
+    if (!packet.payload.empty()) {
+        size_t nc_off = 0;
+        uint8_t stream_block[16] = {0};
+        if (mbedtls_aes_crypt_ctr(&aes_ctx_, packet.payload.size(), &nc_off,
+                reinterpret_cast<uint8_t*>(nonce.data()), stream_block,
+                reinterpret_cast<const uint8_t*>(packet.payload.data()),
+                reinterpret_cast<uint8_t*>(encrypted.data() + nonce.size())) != 0) {
+            ESP_LOGE(TAG, "Failed to encrypt audio data");
+            return false;
+        }
     }
 
     return udp_->Send(encrypted) > 0;
 }
 
 void MqttProtocol::CloseAudioChannel() {
+    bool was_open = false;
     {
         std::lock_guard<std::mutex> lock(channel_mutex_);
+        was_open = udp_ != nullptr;
+        if (!was_open) {
+            ESP_LOGI(TAG, "MEDIA_CHANNEL close skip already_closed");
+            return;
+        }
         udp_.reset();
     }
+    ResetAudioReorderState();
+    ESP_LOGI(TAG, "MEDIA_CHANNEL close commit");
 
     std::string message = "{";
     message += "\"session_id\":\"" + session_id_ + "\",";
@@ -261,36 +324,52 @@ bool MqttProtocol::OpenAudioChannel() {
 
     std::lock_guard<std::mutex> lock(channel_mutex_);
     auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) {
+        ESP_LOGE(TAG, "Network interface is unavailable");
+        return false;
+    }
     udp_ = network->CreateUdp(2);
+    if (udp_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create UDP audio transport");
+        return false;
+    }
     udp_->OnMessage([this](const std::string& data) {
         /*
          * UDP Encrypted OPUS Packet Format:
          * |type 1u|flags 1u|payload_len 2u|ssrc 4u|timestamp 4u|sequence 4u|
          * |payload payload_len|
          */
-        if (data.size() < sizeof(aes_nonce_)) {
-            ESP_LOGE(TAG, "Invalid audio packet size: %u", data.size());
+        if (aes_nonce_.size() != kUdpAudioHeaderSize || data.size() < kUdpAudioHeaderSize) {
+            ESP_LOGE(TAG, "Invalid UDP audio header: nonce=%u packet=%u",
+                     static_cast<unsigned>(aes_nonce_.size()),
+                     static_cast<unsigned>(data.size()));
             return;
         }
-        if (data[0] != 0x01) {
-            ESP_LOGE(TAG, "Invalid audio packet type: %x", data[0]);
+        if (static_cast<uint8_t>(data[0]) != 0x01) {
+            ESP_LOGE(TAG, "Invalid audio packet type: %02x",
+                     static_cast<unsigned>(static_cast<uint8_t>(data[0])));
             return;
         }
-        uint32_t timestamp = ntohl(*(uint32_t*)&data[8]);
-        uint32_t sequence = ntohl(*(uint32_t*)&data[12]);
-        if (sequence < remote_sequence_) {
-            ESP_LOGW(TAG, "Received audio packet with old sequence: %lu, expected: %lu", sequence, remote_sequence_);
+        uint16_t encoded_payload_size = 0;
+        uint32_t encoded_timestamp = 0;
+        uint32_t encoded_sequence = 0;
+        memcpy(&encoded_payload_size, data.data() + 2, sizeof(encoded_payload_size));
+        memcpy(&encoded_timestamp, data.data() + 8, sizeof(encoded_timestamp));
+        memcpy(&encoded_sequence, data.data() + 12, sizeof(encoded_sequence));
+        const size_t payload_size = ntohs(encoded_payload_size);
+        const uint32_t timestamp = ntohl(encoded_timestamp);
+        const uint32_t sequence = ntohl(encoded_sequence);
+        const size_t decrypted_size = data.size() - kUdpAudioHeaderSize;
+        if (payload_size != decrypted_size) {
+            ESP_LOGE(TAG, "Invalid UDP audio payload size: header=%u actual=%u",
+                     static_cast<unsigned>(payload_size),
+                     static_cast<unsigned>(decrypted_size));
             return;
         }
-        if (sequence != remote_sequence_ + 1) {
-            ESP_LOGW(TAG, "Received audio packet with wrong sequence: %lu, expected: %lu", sequence, remote_sequence_ + 1);
-        }
-
-        size_t decrypted_size = data.size() - aes_nonce_.size();
         size_t nc_off = 0;
         uint8_t stream_block[16] = {0};
         auto nonce = (uint8_t*)data.data();
-        auto encrypted = (uint8_t*)data.data() + aes_nonce_.size();
+        auto encrypted = (uint8_t*)data.data() + kUdpAudioHeaderSize;
         auto packet = std::make_unique<AudioStreamPacket>();
         packet->sample_rate = server_sample_rate_;
         packet->frame_duration = server_frame_duration_;
@@ -301,19 +380,28 @@ bool MqttProtocol::OpenAudioChannel() {
             ESP_LOGE(TAG, "Failed to decrypt audio data, ret: %d", ret);
             return;
         }
-        if (on_incoming_audio_ != nullptr) {
-            static uint32_t udp_rx_count = 0;
-            if (++udp_rx_count <= 3 || udp_rx_count % 100 == 0) {
-                ESP_LOGI(TAG, "UDP audio packet #%lu (%u bytes)", (unsigned long)udp_rx_count,
-                         (unsigned)packet->payload.size());
-            }
-            on_incoming_audio_(std::move(packet));
-        }
-        remote_sequence_ = sequence;
-        last_incoming_time_ = std::chrono::steady_clock::now();
+        HandleIncomingAudioPacket(sequence, std::move(packet));
     });
 
-    udp_->Connect(udp_server_, udp_port_);
+    if (!udp_->Connect(udp_server_, udp_port_)) {
+        ESP_LOGE(TAG, "Failed to connect UDP audio transport to %s:%d",
+                 udp_server_.c_str(), udp_port_);
+        udp_.reset();
+        return false;
+    }
+
+    ResetAudioReorderState();
+    // Establish the 4G/CGNAT UDP return mapping before a text-only proactive
+    // wake asks the cloud to send TTS.  This zero-payload frame is private to
+    // the transport; public SendAudio still rejects empty application audio.
+    AudioStreamPacket udp_prime;
+    if (!SendAudioLocked(udp_prime)) {
+        ESP_LOGE(TAG, "Failed to prime UDP audio return path");
+        udp_.reset();
+        return false;
+    }
+    ESP_LOGI(TAG, "UDP audio return path primed, sequence=%u",
+             static_cast<unsigned>(local_sequence_));
 
     if (on_audio_channel_opened_ != nullptr) {
         on_audio_channel_opened_();
@@ -348,8 +436,8 @@ std::string MqttProtocol::GetHelloMessage() {
 
 void MqttProtocol::ParseServerHello(const cJSON* root) {
     auto transport = cJSON_GetObjectItem(root, "transport");
-    if (transport == nullptr || strcmp(transport->valuestring, "udp") != 0) {
-        ESP_LOGE(TAG, "Unsupported transport: %s", transport->valuestring);
+    if (!cJSON_IsString(transport) || strcmp(transport->valuestring, "udp") != 0) {
+        ESP_LOGE(TAG, "Unsupported or missing transport");
         return;
     }
 
@@ -377,16 +465,31 @@ void MqttProtocol::ParseServerHello(const cJSON* root) {
         ESP_LOGE(TAG, "UDP is not specified");
         return;
     }
-    udp_server_ = cJSON_GetObjectItem(udp, "server")->valuestring;
-    udp_port_ = cJSON_GetObjectItem(udp, "port")->valueint;
-    auto key = cJSON_GetObjectItem(udp, "key")->valuestring;
-    auto nonce = cJSON_GetObjectItem(udp, "nonce")->valuestring;
+    auto server = cJSON_GetObjectItem(udp, "server");
+    auto port = cJSON_GetObjectItem(udp, "port");
+    auto key_item = cJSON_GetObjectItem(udp, "key");
+    auto nonce_item = cJSON_GetObjectItem(udp, "nonce");
+    if (!cJSON_IsString(server) || server->valuestring[0] == '\0' ||
+        !cJSON_IsNumber(port) || port->valueint <= 0 || port->valueint > UINT16_MAX ||
+        !cJSON_IsString(key_item) || !IsValidHexString(key_item->valuestring, 16) ||
+        !cJSON_IsString(nonce_item) || !IsValidHexString(nonce_item->valuestring, 16)) {
+        ESP_LOGE(TAG, "Invalid UDP transport parameters in server hello");
+        return;
+    }
+    udp_server_ = server->valuestring;
+    udp_port_ = port->valueint;
 
     // auto encryption = cJSON_GetObjectItem(udp, "encryption")->valuestring;
     // ESP_LOGI(TAG, "UDP server: %s, port: %d, encryption: %s", udp_server_.c_str(), udp_port_, encryption);
-    aes_nonce_ = DecodeHexString(nonce);
+    const std::string key = DecodeHexString(key_item->valuestring);
+    aes_nonce_ = DecodeHexString(nonce_item->valuestring);
     mbedtls_aes_init(&aes_ctx_);
-    mbedtls_aes_setkey_enc(&aes_ctx_, (const unsigned char*)DecodeHexString(key).c_str(), 128);
+    if (mbedtls_aes_setkey_enc(&aes_ctx_,
+            reinterpret_cast<const unsigned char*>(key.data()), 128) != 0) {
+        ESP_LOGE(TAG, "Failed to initialize UDP audio encryption key");
+        aes_nonce_.clear();
+        return;
+    }
     local_sequence_ = 0;
     remote_sequence_ = 0;
     xEventGroupSetBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT);
@@ -404,7 +507,7 @@ static inline uint8_t CharToHex(char c) {
 std::string MqttProtocol::DecodeHexString(const std::string& hex_string) {
     std::string decoded;
     decoded.reserve(hex_string.size() / 2);
-    for (size_t i = 0; i < hex_string.size(); i += 2) {
+    for (size_t i = 0; i + 1 < hex_string.size(); i += 2) {
         char byte = (CharToHex(hex_string[i]) << 4) | CharToHex(hex_string[i + 1]);
         decoded.push_back(byte);
     }
@@ -412,5 +515,110 @@ std::string MqttProtocol::DecodeHexString(const std::string& hex_string) {
 }
 
 bool MqttProtocol::IsAudioChannelOpened() const {
+    std::lock_guard<std::mutex> lock(channel_mutex_);
     return udp_ != nullptr && !error_occurred_ && !IsTimeout();
+}
+
+void MqttProtocol::HandleIncomingAudioPacket(
+        uint32_t sequence, std::unique_ptr<AudioStreamPacket> packet) {
+    std::vector<std::unique_ptr<AudioStreamPacket>> ready;
+    {
+        std::lock_guard<std::mutex> lock(audio_reorder_mutex_);
+        const uint32_t expected = remote_sequence_ + 1;
+        if (sequence <= remote_sequence_) {
+            ++audio_duplicate_packets_;
+            ESP_LOGW(TAG, "UDP audio old/duplicate: got=%u expected=%u",
+                     static_cast<unsigned>(sequence), static_cast<unsigned>(expected));
+            return;
+        }
+        auto inserted = remote_audio_reorder_.emplace(sequence, std::move(packet));
+        if (!inserted.second) {
+            ++audio_duplicate_packets_;
+            ESP_LOGW(TAG, "UDP audio duplicate in reorder buffer: seq=%u",
+                     static_cast<unsigned>(sequence));
+            return;
+        }
+        if (sequence != expected) {
+            ++audio_reordered_packets_;
+            ESP_LOGW(TAG, "UDP audio reorder: got=%u expected=%u buffered=%u",
+                     static_cast<unsigned>(sequence), static_cast<unsigned>(expected),
+                     static_cast<unsigned>(remote_audio_reorder_.size()));
+        }
+        DrainAudioReorderLocked(ready, false);
+    }
+    DeliverIncomingAudioPackets(std::move(ready));
+}
+
+void MqttProtocol::DrainAudioReorderLocked(
+        std::vector<std::unique_ptr<AudioStreamPacket>>& ready, bool force) {
+    while (!remote_audio_reorder_.empty()) {
+        const uint32_t expected = remote_sequence_ + 1;
+        auto next = remote_audio_reorder_.find(expected);
+        if (next != remote_audio_reorder_.end()) {
+            ready.push_back(std::move(next->second));
+            remote_audio_reorder_.erase(next);
+            remote_sequence_ = expected;
+            continue;
+        }
+        if (!force && remote_audio_reorder_.size() < kAudioReorderWindowPackets) {
+            break;
+        }
+        const uint32_t next_sequence = remote_audio_reorder_.begin()->first;
+        const uint32_t skipped = next_sequence - expected;
+        audio_skipped_packets_ += skipped;
+        ESP_LOGW(TAG, "UDP audio gap confirmed: expected=%u next=%u skipped=%u buffered=%u",
+                 static_cast<unsigned>(expected), static_cast<unsigned>(next_sequence),
+                 static_cast<unsigned>(skipped),
+                 static_cast<unsigned>(remote_audio_reorder_.size()));
+        remote_sequence_ = next_sequence - 1;
+    }
+}
+
+void MqttProtocol::FlushAudioReorderBuffer() {
+    std::vector<std::unique_ptr<AudioStreamPacket>> ready;
+    {
+        std::lock_guard<std::mutex> lock(audio_reorder_mutex_);
+        DrainAudioReorderLocked(ready, true);
+    }
+    DeliverIncomingAudioPackets(std::move(ready));
+}
+
+void MqttProtocol::ResetAudioReorderState() {
+    std::scoped_lock lock(audio_reorder_mutex_, audio_delivery_mutex_);
+    if (audio_delivered_packets_ > 0 || audio_reordered_packets_ > 0 ||
+        audio_skipped_packets_ > 0 || audio_duplicate_packets_ > 0 ||
+        !remote_audio_reorder_.empty()) {
+        ESP_LOGI(TAG,
+                 "UDP audio summary: delivered=%u reordered=%u skipped=%u duplicate=%u pending=%u",
+                 static_cast<unsigned>(audio_delivered_packets_),
+                 static_cast<unsigned>(audio_reordered_packets_),
+                 static_cast<unsigned>(audio_skipped_packets_),
+                 static_cast<unsigned>(audio_duplicate_packets_),
+                 static_cast<unsigned>(remote_audio_reorder_.size()));
+    }
+    remote_audio_reorder_.clear();
+    remote_sequence_ = 0;
+    audio_reordered_packets_ = 0;
+    audio_skipped_packets_ = 0;
+    audio_duplicate_packets_ = 0;
+    audio_delivered_packets_ = 0;
+}
+
+void MqttProtocol::DeliverIncomingAudioPackets(
+        std::vector<std::unique_ptr<AudioStreamPacket>>&& packets) {
+    std::lock_guard<std::mutex> lock(audio_delivery_mutex_);
+    for (auto& packet : packets) {
+        ++audio_delivered_packets_;
+        if (audio_delivered_packets_ <= 3 || audio_delivered_packets_ % 100 == 0) {
+            ESP_LOGI(TAG, "UDP audio packet #%u (%u bytes)",
+                     static_cast<unsigned>(audio_delivered_packets_),
+                     static_cast<unsigned>(packet->payload.size()));
+        }
+        if (on_incoming_audio_ != nullptr) {
+            on_incoming_audio_(std::move(packet));
+        }
+    }
+    if (!packets.empty()) {
+        last_incoming_time_ = std::chrono::steady_clock::now();
+    }
 }

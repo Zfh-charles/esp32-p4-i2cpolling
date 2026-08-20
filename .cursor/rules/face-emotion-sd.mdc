@@ -4,6 +4,12 @@ globs: main/boards/ep-chat-p4-ml307/**/*.{c,cc,h},main/application.cc,main/proto
 alwaysApply: false
 ---
 
+## 2026-08-17 s1ep 烧录补记
+
+- canonical 审计发现恢复/Presenter 可绕过 `SetEmotion` 直达播放叶子；已在 `PlayMjpegEmotion()` 增加幂等 canonicalize，正常输入行为不变。
+- 构建与归档：BIN SHA256=`f68bc5e8b2aefc39da1bfd4b388f436e084efa1969e48fabf23bd1f301eec3bd`；ELF SHA256=`8bdd48149ad46b0d5bee0cc0baf679425820dccd62218aba01a78907051f04d4`。
+- otadata、OTA_0、OTA_1 均写入并通过 esptool hash；启动已见 exact s1ep marker 与 `PANIC_LAST none`。USB reset 后出现 `SD_POWER_CYCLE_REQUIRED / ESP_ERR_TIMEOUT`，故必须物理断电冷启后再验素材、idle life 与三轮业务；当前不记真机通过。
+
 # 表情、SD 与语音通道（战术手册）
 
 > **服从** `xiaozhi-p4-core.mdc` 总战略指挥。  
@@ -594,3 +600,310 @@ Frozen < StaticOnly < MouthOnly < SmallAnimation < FullTransition
 - 当前源码/上板 marker=`boot_trace_v10_s1eo_reminder_defer_spk_noop`。PC 工具以 `emotion_tool_dev` 为准；推荐素材 `dialogue_v4_temporal_feather`。
 - 分支可吸收项与明确不吸项写入 `p4-current-state.mdc` 第八节（禁整包合入 `com4-proactive-reminder-stability`）。
 - 本批不改固件热路径（行为守恒存档）；代码味道债（上帝类 adapter / builder 单文件）记在第八节，另批抽取。
+
+# 2026-08-17 s1eo 三轮验收 + 首个自然失败样本
+
+- 功能现场：happy 嘴层仍有明显 `112x56` 方形边界；后续空间刀必须覆盖 `standby/neutral/happy/loving` 四个非强情绪逐包边界差，不再只看 angry/sad。时间节拍与空间接缝继续分批。
+- 退出现场：`你休息吧。` 均被 STT 正确识别；当前本地严格退出已按用户此前裁决回退，行为依赖云端 `goodbye`。日志既有约 6s 后 goodbye，也有连续三次 STT 后仍拖到云端超时，坐实云端依赖的不确定性；若恢复本地退出须作为独立产品语义批次。
+- 情绪现场：`怎么和女孩子聊天？` 云端下发 `emotion=embarrassed`；`emotion_video_player.c` 旧别名把 `embarrassed -> angry`，而其他路径又对 unsupported emotion 回 neutral，形成短暂 angry/neutral 错帧。不是云端发 angry；须独立统一六表情 canonical 映射，建议 embarrassed→neutral 或 loving，不与崩溃/素材刀同批。
+- 自然失败：s1eo `prev_t=422272ms`（422.272s，n=1），`reason=WDT`、`prev_phase=FACE_PRESENT`；`PANIC_LAST core=1 mcause=7 StoreAccessFault mepc=0x4fc19f8c ra=0x4002e1ca sp=0x4ff43560 mtval=0x482edb00 cache_on=1 flashop_seq=687`。匹配 ELF 将 RA 定位到 `CopyRgb565BandRows()` / `eezui_display_adapter.cc:153,1467`。
+- 复位前：idle standby breathe，`FACE_ROWS band=80..479 rows=400`、`FACE_BUS bytes=384000`；随后 `FACE_UNLOCK end`、`FACE_PRESENT ret`。AfeTxnDiag `flush=4657/4657 active=0`，AFE 仍有健康心跳。该 mepc/PSRAM mtval 与历史 s1di/s1dm 同家族，优先判 MSPI-751 写后读腐败暴露；邻接 FACE=最大消费者，不等于脸业务有罪。
+- 裁决：n=1 不判 s1eo 稳定性；当前样本 422.3s 低于 s1cm mean≈2054s，记预警。禁因此关闭表情系统；下一稳定刀仍按 `R0-triage/R1-guard`，idle 400行 legacy breathe 另作为暴露量对照，不与退出/情绪/素材三刀混判。
+
+# 2026-08-17 s1ep — 空间接缝/canonical/idle小轨道
+
+- 用户裁决：执行问题清单1、2、4；明确不做第3项本地退出语义。
+- 素材根因：旧工具只验羽化后最外沿1px，无法发现ROI内部颈饰/衣领属于另一动画帧。v5改为活动差软扩张×中央上部空间先验×矩形羽化，并增加outer/near/inner多圈层评分和热图。六包校验6/6；四个非强情绪分数均≤3，原MJPEG只复制不重编码。
+- 语义根因：MJPEG私有alias、mouth私有alias和presenter原字符串不一致；统一到`emotion_video_player_canonicalize_emotion()`，`embarrassed/sleepy→neutral`，保留R0关闭恢复旧输入直通。
+- 稳定刀：s1eo唯一自然失败邻接idle `rows=400 bytes=384000`；s1ep不关动态，而是优先复用standby包的双life轨道，每帧≤48行、首尾回canonical base、轮间4.2s。无包/契约失败才走legacy；R0可独立关。
+- 验收：冷启先见exact s1ep marker、pack/standby两轨bind与`idle_life=1`；idle日志不得再出现400行breathe。三轮对话复验happy嘴形、`embarrassed→neutral`、第二轮唤醒和音频；稳定性仍须per-marker n≥4对标s1cm。
+- 构建状态：PC工具语法与六包验证通过；清理本轮残留Ninja/ccache后，完整重建320/320成功。BIN=`17df3dbebdce8e2cce83964c77eaa78e4fbd979ce4752a23cd39deb53f4da706`，ELF=`b53342b3ce0cbd2cdd5c724e6d51435cd8b06b17fdf62ea80249d0654b8e8ba0`；已归档`fw_archive/xiaozhi_s1ep.bin`与`elf_snapshots/xiaozhi_s1ep.elf`。尚未烧录/冷启，不能声称真机通过。
+
+# 2026-08-17 s1eq — 冻结对话全帧 enter arc
+
+- 现场：s1ep 首次唤醒在云端下发`emotion=happy`后进入`FACE_ARC→FACE_PRIME`，首帧产生10条全宽flush（约480x480）并WDT；`prev_phase=FACE_PRIME`，DMA已完成。Saved PC仅为`_panic_handler/CaptureFrame`，损坏的`PANIC_LAST`禁止addr2line。
+- 素材否证：当前准备包六个`/mjpeg/*.mjpeg`与格式化前备份SHA256逐一一致；换卡只可能改变时序，不改变机制或素材字节，禁止把复位归因成“新MJPEG坏”。
+- 唯一行为变量：`S1CP_G_ENTER_ARC`默认1→0；保留StaticHold单次情绪seed、layered嘴部、Speaking/idle life与canonical。R0仍为`FaceRouteV2_SetEnterArc()`；不改AFE/Opus/会话/SD路径。
+- 构建：无缓存完整重建成功。BIN SHA256=`0d67c913bd8b95c90928876b703651ef1c1d8ed53cada6a6d91b0f34aee92c12`，ELF SHA256=`5ef702e681b1199f3708657e2a385e1761762c03ba063e47612c38f9cf59bd2e`；归档`fw_archive/xiaozhi_s1eq.bin`、`elf_snapshots/xiaozhi_s1eq.elf`。
+- 上板：bootloader/partition/otadata/OTA_0/OTA_1/assets单次写入，全部hash verified。物理冷启见exact marker、`PANIC_LAST none`、`SD_MOUNT_OK`、seed 6/6、pack与standby双life轨hash正常，启动旗标`g_enter=0`。
+- 短验收：首次happy会话出现`static_hold_done→mouth_arm→mouth_blit`，未出现`FACE_ARC/FACE_PRIME`且未复位。该证据只通过V2短门；per-marker n<4不判长期稳定，仍需多轮/长TTS/第二轮唤醒和长泡。
+
+# 2026-08-17 s1er — 网络掉线统一会话收尾
+
+- 复位核查：s1eq 本轮只有 `POWERON boot_count=1`，没有第二次 ROM reset、marker 或 panic；不得把 UI 回 idle/字幕停住误记为复位样本。
+- 现场链：第二次天气 TTS 尚未收到正常 stop 时 4G 掉线；旧回调直接改 idle，留下 `ch=1`，后续每 10s 报 `Channel timeout`，达到 400s+。
+- 软件根因：网络异常路径绕过 `EndSessionAndRestoreIdle()`，同时 idle debounce 未把“通道仍开”视为必须清理的异常态。
+- 唯一行为变量：掉线回调改走主事件循环的统一 teardown，关闭通道、清 decoder/speaker、恢复 Capture/WakeNet/唤醒提示；表情和总线预算保持 s1eq。
+- 验收：M+=`NET_DOWN_RECOVERY begin ... ch=1` 后出现 `network_down_recovery ... ch=0 wake=1`，无延迟 `Channel timeout`；恢复网络后第二轮可唤醒。M-=掉线后仍有 idle+ch=1、字幕残留或唤醒不恢复。
+- 交付：完整镜像双 OTA 写入并逐段 hash verified；采集恢复后见 seed 6/6、dialogue pack 与双 life 轨 hash 正常。因采集在 uptime≈25s 才打开，启动 marker 未捕获；不得把“烧录成功”冒充网络掉线恢复已验证。
+
+# 2026-08-17 s1es — 同情绪跨 TTS 代际重新提交
+
+- 现场证据：同一云 session 内连续 `天气怎么样` 都收到 `emotion=happy`。首次提交后有 StaticHold/嘴/life；后续请求因 `committed=happy` 被字符串去重，未再次 commit。新 session 首次恢复，坐实生命周期而非素材或音量问题。
+- 根因：Presenter 的 requested/pending/committed 缺少 TTS turn generation；监听边沿已把画布恢复 standby，但 committed 字符串仍保持旧 happy，形成逻辑态与渲染态分裂。
+- 唯一行为变量：Listening→Speaking 新边沿递增 generation，pending/committed 按「emotion+generation」去重。同代消息仍覆盖/去重，跨代同 emotion 重新执行一次 StaticHold 并武装 layered 嘴/life；不启用 enter arc。
+- 验收：连续三次同问题须各有新 `speech_gen`、对应 `commit ... gen` 与 `mouth_arm/blit`；无 `FACE_ARC/FACE_PRIME`、无过期补播、音频和第二轮唤醒不回退。寿命仍按 marker n≥4 判断。
+- 交付：`boot_trace_v10_s1es_emotion_turn_generation` 已编译、归档并完整烧录，全部分区 hash verified；启动日志已见 exact marker、`SD_MOUNT_OK`、`seed_stills 6/6`、dialogue pack 与双 life 轨 hash 正常，`PANIC_LAST none`。尚未把烧录成功冒充连续三问 M+，等待真机交互裁决。
+
+# 2026-08-17 s1et — angry/sad 公共 standby 退场中枢
+
+- 证据：当前 v5 hold→standby 像素差 angry=26.07、sad=23.32；原生 exit 末段降至14.20/13.77。六表情均有跨度，但 loving收益约4%，禁止做30套两两过渡。
+- 素材刀：工具新增 `release_layer`，仅 angry/sad；序列为闭嘴→眉眼/嘴交替释放，共5帧、90ms、每帧≤48行，全部预合成到对应 canonical hold。v6 对当前 v5 六个MJPEG/hold_base逐一hash守恒，验证6/6。
+- 固件刀：Listening/Idle 边沿将共享timer从mouth转交release；每tick只提交一带，结束再走原standby bookend。缺包、hash不符、锁失败或状态抢占均回原s1es路径；不解JPEG、不启全屏enter/exit、不改AFE/Opus/会话。
+- R0=`l_release`；M+=`release_bind`、`release_arm`、5次有序`release_blit`后正常聆听/退出，肉眼跳变减弱；M-=字幕/聆听明显迟滞、任何音频/唤醒回归、WDT/panic或寿命均值回退。
+- 交付：v6最终包已复制到`C:\bake\mjpeg_ai_dialogue_v6_release_hub`；BIN/ELF已归档，完整镜像逐分区烧录且hash verified。日志采集在uptime约90s恢复，旧v5包兼容路径下AFE与idle life健康；未捕获启动marker，也未部署v6，故release真机门仍待物理冷启。
+# 2026-08-17 s1et 视觉裁决 M- → s1eu standby common hub
+
+- 真机证据：angry 入口仍是 `static_hold_done full=1`，约 70ms 由 standby 直接整帧跳到 angry；退出侧 `release_arm` 后 5 个 `release_blit` 全部 `ESP_OK`，但结束仍执行 `close_seed standby`。用户观察到入口跨度大、出口花糊，与日志一致，故 s1et release v1 判视觉 M-，不得继续仅靠延长旧 release 帧数。
+- 根因：v6 小带预合成在 angry/sad 原生 hold 上，而原生 hold 与 standby 存在全局头身位移；局部释放后的混合画布不是 standby，最后必然还要全屏替换。问题是**基底/几何不一致**，不是帧数不足或锁失败。
+- s1eu 唯一变量：PC 将 angry/sad 的眉眼、嘴部语义以活动岛羽化到 standby canonical 底图；生成 8 帧 enter + 8 帧 exit，75ms/帧，每 tick 一条≤48行带。enter 最终逐像素等于 emotion hub，exit 最终逐像素等于 standby，因此固件跳过原生强情绪全帧 seed，并在 exit 后不再补全屏 standby。
+- PC 包：`mjpeg_ai_dialogue_v7_common_hub`，原始六个 MJPEG 不重编码；验证6/6。离线重放 angry/sad 的 enter/exit 终点均为 `mismatch=0`。
+- 固件 marker：`boot_trace_v10_s1eu_standby_common_hub`。R0 继续复用 `S1ET_L_RELEASE_HUB`；旧包无 `enter_layer` 自动走 s1es/s1et兼容路径。未改 AFE/Opus/会话/提醒/vendor。
+- M+：`enter_bind→enter_arm→enter_blit×8→enter_done exact_hub=1→mouth_arm`；退出 `release_blit×8→release_done exact_standby=1`，其间不得出现 `close_seed`，肉眼无首帧猛跳/末帧花糊。M-：强情绪语义过弱、ROI仍见矩形、任一音频退化/复位或退出仍有 full bookend。稳定性仍按 per-marker n≥4，不因一次观感通过宣称过门。
+# 2026-08-17 s1ev — s1et/s1eu 双实验回滚
+
+- 用户真机裁决：v7 上天气播报嘴部不动；angry 起始与终止均花糊。s1eu 由观感实验升级为基础功能 D2 回归；结合 s1et 已证“小带全部ESP_OK但末尾仍花糊”，低成本退场轨与共底双向轨均停止推进。
+- 决策：回退到 s1et 之前的 s1es 行为，不再调 release 帧数/间隔/羽化。固件 R0 `S1ET_L_RELEASE_HUB=0`，配套 SD 强制恢复 `mjpeg_ai_dialogue_v5_activity_feather`；v6/v7 仅保留为失败实验备案，禁止部署。
+- 保留 s1es 的 TTS turn generation 修复，因此同 session 重复天气应每轮重新 `commit→mouth_arm→mouth_blit`；不回退会话、音频、提醒、canonical、idle small-life。
+- marker=`boot_trace_v10_s1ev_s1es_visual_reanchor`；构建通过。BIN SHA256=`1AAE78EAC67C4CE3D4905501F2C73DAA94BFC08F6C8FD95DB5C5F59BEA088F6F`，ELF SHA256=`EC6FE907E07114E7C14EC490AC1C7075899175A61F3475564BEB50CC478F2568`。未烧录/冷启，不得写已恢复。
+
+# 2026-08-17 寿命审计口径修正与 s1ev 上板门
+
+- 诊断工具缺陷：`reboot_audit.py` 的自然失败集合遗漏 `INT_WDT`，导致 s1es 的 9975.9s 中断看门狗未计入失败样本；根目录与 `tools/stability/` 副本均已补入，固件行为未改变。
+- 全量重扫校正：s1cm=`n14/mean2053.6s`；s1es=`n2/mean5933.2s/min1890.5s/max9975.9s`。s1es 均值暂高于基线，但 `n<4`，只记趋势、不判稳定通过。
+- 活跃真源分裂：板上仍为 s1et，源码/构建产物为 s1ev；板上日志另见 `release_reject ... count=8`，说明固件与SD契约未对齐。禁止继续叠加动画实验或把 s1et 现场归因给 s1ev。
+- 下一唯一集成门：s1ev + v5 冷启 exact marker 后，按顺序验连续两次天气均有嘴部变化、angry 不花屏、正常退出、3秒内第二轮唤醒；失败即停在该单变量归因，不进入新退场轨。
+
+# 2026-08-17 FACE_SD 0x80070570 修复
+
+- 否证源包：`mjpeg_ai_dialogue_v5_activity_feather` 460 文件、46,512,681 bytes 全量实际读取，`BadFiles=0`。
+- 介质现场：FAT32 `FACE_SD (D:)` 的目标目录不可恢复，CHKDSK 发现坏目录项、坏簇链与约 93.7MB lost chains；`/F` 后续传写入再次在多个目录复发 `ERROR 1392/0x570`，坐实目标文件系统/介质路径而非某个素材文件。
+- 修复：完整格式化 2GB FACE_SD 为 FAT32，再从 `mjpeg_ai_sd_ready_v5` 单次恢复 `/mjpeg` 与 `/dialogue_v2`。结果 466/466，源/卡 SHA-256 mismatch=0；写后 CHKDSK 无错误。
+- 剩余门：安全弹出、装回设备、物理冷启；须见 `SD_MOUNT_OK`、`seed_stills done ok=6/6` 与 v5 pack bind。若短期再次出现 0x80070570/簇链损坏，直接更换 SD 卡或读卡器，禁止继续循环修补。
+
+# 2026-08-17 v5 冷启短门与联合验收器
+
+- 修复卡装回后的冷启日志见 `SD_MOUNT_OK`、`seed_stills done ok=6/6`。同一会话三段 TTS 分别出现 `speech_generation=1/2/3`，每代均重新 `mouth_arm`，共见6次 `mouth_blit`；随后 `channel_closed` 并回 idle，短窗无 `REBOOT_AFTER`/panic。
+- 该证据通过“重复同情绪不衰减”和“正常退出”短门；采集错过本次 `FW_MARKER`，且退出后尚无第二次 listening/TTS，所以不能确认 s1ev 上板或第二轮唤醒通过。
+- 新增只读 `tools/stability/s1ev_acceptance.py`：marker 不匹配判 FAIL、漏采判 PENDING；任一 panic/reboot、SD/seed/重复嘴部/退出缺失判 FAIL。当前裁决 `PENDING(marker_exact, second_wake)`。
+
+# 2026-08-17 s1ev 完整烧录
+
+- 写入前 `build/xiaozhi.bin` 与归档 s1ev BIN SHA-256 均为 `1AAE78EAC67C4CE3D4905501F2C73DAA94BFC08F6C8FD95DB5C5F59BEA088F6F`；匹配 ELF 已归档。
+- 单次 esptool 写入 `0x2000 bootloader`、`0x8000 partition`、`0x10d000 otadata`、`0x200000 ota_0`、`0x700000 ota_1`、`0xc00000 assets`，过程无 timeout，六段写入 hash verified。
+- 独立 verify：bootloader/partition/ota_0/ota_1/assets digest matched；otadata 因烧录后启动由 bootloader 写入 OTA 选择记录，与 `ota_data_initial.bin` 不再相同，属预期运行态变化。COM7 monitor 已恢复。
+- 仍未通过 V2：USB hard reset 后必须物理断电冷启，捕获 exact s1ev marker、SD mount 与 seed 6/6；不得把烧录成功写成上板验收通过。
+
+# 2026-08-17 s1ev 第二轮唤醒门校正
+
+- 旧验收器用“退出 idle→下一 listening”作为3秒门，会把用户何时再次说唤醒词计入设备延迟，属于错误指标；日志中的7279ms不得作为唤醒慢证据。
+- 校正为：必须先有一次 idle channel close，再以第二轮 `wake_word_detected` 为起点，到随后 `STATE: listening` 为终点。本轮为 `178419→178628=209ms`，通过3秒门。
+- 当前同段证据：generation 1..11、mouth_arm=13、mouth_blit=49、channel_closed=6、panic/reboot=0；联合门仅剩 exact s1ev marker，长稳仍需 n≥4。
+
+# 2026-08-17 s1ev 烧录后功能/集成短门
+
+- 烧录后 monitor 从设备启动数秒后才恢复，捕获 `seed 6/6` 但漏掉 `FW_MARKER` 与 `SD_MOUNT_OK`。该日志段内见 generation 1..7、5次 mouth_arm、29次 mouth_blit、正常退出；idle `200329ms`→下一 listening `203235ms`，二次唤醒延迟2906ms通过3秒门，且无 reboot/panic。
+- 修正 `s1ev_acceptance.py`：若最新 `MONITOR START` 晚于旧 SD mount，禁止跨段借用旧启动证据；marker/SD 日志漏采均报 PENDING，错误 marker 仍报 FAIL。
+- 当前联合裁决 `PENDING(marker_exact, sd_mount)`；功能/第二轮短门通过不等于 V2 冷启通过。下一步仅需采集开启时物理断电冷启，不改固件与素材。
+
+# 2026-08-17 P-seam — 四表情峰值嘴层离线软接缝
+
+- 用户本轮明确跳过长泡；该决定只允许继续离线/灰度工作，不得把 s1ev 的 exact marker 或 per-marker n≥4 寿命门记为通过。
+- 假设：v5 对所有嘴形使用同一 7px 活动区扩张与羽化，medium/large 峰值嘴形更容易暴露方形边界。唯一变量为 standby/neutral/happy/loving 的 medium/large 嘴层扩大软过渡区；不改 ROI、帧选择、原始 MJPEG、固件协议、眼/life、sad/angry。
+- 工具新增 `--max-mouth-soften`、`--skip-strong-hub`、`--skip-release-layer`。后两项明确阻止已判 M− 的 s1et/s1eu release/common-hub 产物偷偷进入新候选；默认路径保持兼容。
+- 候选 `mjpeg_ai_dialogue_v5p1_p_seam_candidate` 校验6/6；与当前 v5 均为460文件，missing=0、extra=0、六个 `frames.mjpeg` hash差异=0。媒体差异严格为四个目标表情两套pose下 medium/large 的 JPG+RGB565，共32文件；sad/angry及其他非目标媒体差异=0。
+- 接缝分数 standby/neutral/happy/loving：`0.197/0.916/1.862/0.489 → 0.147/0.916/1.578/0.306`。离线预览未见新增水平线或错位，但这不能代替480×480真机观感。
+- 裁决：候选仅完成 PC 侧体验工程与集成边界，不换 SD、不改固件、不编译烧录。v5仍是当前回退基线；后续若上板须单独验收四表情方块感、嘴延迟/闭嘴、重复TTS、字幕/音频与第二轮唤醒，长稳另行补门。
+
+# 2026-08-18 s1ew — 无 cloud emotion 的 Speaking 首轮嘴部兜底
+
+- 现场证据：三轮连续天气语境中，唯一缺 `mouth_arm` 的 `speech_generation=4` 从 Speaking 到 TTS stop 全段没有 `type=llm emotion`、pending、commit、StaticHold、arm 或 blit；Presenter 保持上一代 `committed=happy,cgen=3`。下一条 happy 明确绑定 generation 5。其他 generation 均在 commit 后约103–141ms完成 arm，故根因不是 SD、音量、晚到emotion串代或同情绪去重，而是云端该段未发 emotion，固件却把嘴部武装硬依赖 emotion commit。
+- 唯一功能变量：`NotifySpeechState()` 在 Listening→Speaking 边沿返回新 generation；若当前没有 pending emotion，先提交 standby bookend，再以当前v5 standby layered包 provisional武装嘴部。后到emotion仍按同代 pending/commit重绑；Presenter在新代开始时显式迁移旧 pending，避免跨代悬空。
+- 同批稳定性护栏：`FaceMouth_BindEmotion()` 会释放/替换patch，而face worker异步读取原始patch指针；provisional路径提高重绑概率，因此给bind/clear、mouth worker与可能尚在途的idle-life读取加同一递归互斥。`ArmMouthFollow()`改为返回真实成功值，只有实际bind/timer成功才打印arm，失败明确skip，禁止假阳性。
+- R0=`S1EW_M_PROVISIONAL_MOUTH=0`；M+=无emotion的TTS仍有 `!!FACE_S1EW provisional_mouth=arm gen=N` 与 mouth blit，后到emotion同代重绑成功；M-=打印arm却无blit、patch mutex持续drop、音频/字幕/唤醒退化、接缝增加或任何panic/WDT。
+- 构建：1311步完整构建成功；补齐idle-life在途读取锁后，9步增量重编译成功。最终应用大小`0x45db30`，分区余量13%。BIN SHA256=`2715059C16C23393B4B827BDF48774804810C4D6D710754D8E3BAFA593980C13`，ELF SHA256=`EC69166370EDF264879CE7B386AA273C5406D00F0954DA59F115CC0357FC72B8`；已归档`fw_archive/xiaozhi_s1ew.bin`与`elf_snapshots/xiaozhi_s1ew.elf`，二次hash一致。尚未烧录/冷启，不能声称真机解决；SD继续使用v5，无需更换。angry首尾跨度与M2素材几何问题不在本批。
+- 烧录：2026-08-18 单次连接COM7成功，以460800 baud一次写入`0x2000 bootloader`、`0x8000 partition`、`0x10d000 otadata`、`0x200000 ota_0`、`0x700000 ota_1`、`0xc00000 assets`；六段均显示`Hash of data verified`，无timeout、无重试，最终RTS hard reset成功。USB复位不替代物理冷启；尚须捕获exact s1ew marker、`SD_MOUNT_OK`与`seed_stills done ok=6/6`。
+
+# 2026-08-18 P-life-semantic — happy 头发误动语义门
+
+- 真机观感：天气/happy 嘴部动画已可接受，幅度仅略小；主要低频生命感来自右侧脸边头发持续重复运动，注意力主体错误。嘴幅与life语义是两条独立问题，本批不调嘴幅。
+- 素材根因：happy auto track0 ROI=`128,40 288x48`、motion_score=4.501，覆盖上方头发/饰品；track1 ROI=`24,384 448x48`、motion_score=3.555，提供下方身体/衣饰微动。旧工具把运动分数直接当发布许可，缺少“这个部位是否适合持续动”的产品语义门。
+- 工具修复：`life_track_policy.approved_auto_tracks`与`--life-approved-tracks EMOTION:IDS`将自动轨降级为候选；manifest写入`semantic/approval`。不同素材必须重新看预览并批准，固件禁止硬编码固定track id。长期契约已增加“头发/饰品/背景单一区域持续重复运动默认拒绝”。
+- 候选包：`mjpeg_ai_dialogue_v5p2_semantic_life`校验6/6，只批准happy track1。与v5相比六个原MJPEG一致、共有的RGB565/A8/MJPEG媒体hash差异0，仅缺少happy track0的9组RGB565+A8共18文件；其他表情、嘴层、刷新节拍和固件均不变。
+- 裁决：S1/D0/R0/V1离线门通过；当前SD未更换，设备行为未改变。若用户选择V2，整包替换`/sdcard/dialogue_v2/`后物理冷启；M+=天气长TTS头发不再循环而仍有轻微身体生命感，M-=生命感消失、嘴/字幕/音频/第二轮回退。
+
+# 2026-08-18 s1ex — 嘴部 medium 轻微增益
+
+- 用户验收 s1ew 天气嘴部“能接受，只是幅度小一点点”；本刀不扩大嘴部ROI、不提高80ms刷新频率、不改small/large门槛，也不部署P-life-semantic头发候选。
+- 唯一变量：音频mean-abs映射的`medium`门槛从1100降到1000；`small=400`、`large=2200`及release迟滞保持。故只增加中等嘴形命中率，不直接放大到large，理论上不增加单tick行带数或定时刷新次数。
+- R0=`S1EX_N_MOUTH_GAIN_SOFT=0`；M+=天气长播报中medium略多但节奏与接缝不恶化；M-=嘴部重新过密、最大开合方框更醒目、音频/字幕/二次唤醒退化或复位。稳定门仍须per-marker，短观感不能代替寿命。
+- 构建通过，marker与`!!FACE_S1EX`均存在于BIN/ELF；应用大小`0x45db80`、余量13%。BIN SHA256=`44EBD08F5EA817FE720A74F2F30857445DBB9D12F68A2914700D58E0FF5246E4`，ELF SHA256=`9364F02D563E8E31F73740D7A4126B27C4D0CA0040D900B28B5F7FFB9CDF92FB`；归档二次hash一致。
+- 烧录：2026-08-18 单次连接COM7，以460800 baud完整写入bootloader、partition、otadata、双OTA与assets；六段均`Hash of data verified`，无timeout、无重试，最终RTS hard reset成功。SD无需更换；仍需物理断电冷启确认exact marker、`SD_MOUNT_OK`、`seed_stills 6/6`并做V2嘴幅裁决，当前不得声称真机观感已通过。
+
+# 2026-08-18 s1ey — 嘴部/头发生命轨视觉权重重平衡
+
+- s1ex真机M−：用户确认嘴部仍不够，头发动画感强于嘴部。该反馈否证“只降medium门槛足以改善幅度”；档位命中率与素材几何、life语义必须分开处理。
+- 固件O刀：large mean-abs门槛`2200→2000`，medium维持1000；不改ROI、80ms节拍、pose文件或单tick行带数。独立R0=`S1EY_O_MOUTH_LARGE_GAIN_SOFT=0`。
+- 素材语义刀：standby track0=`120,76 312x48`、happy track0=`128,40 288x48`均属上半部头发；二者只保留下半部track1=`24,384 448x48`。候选`mjpeg_ai_dialogue_v5p3_mouth_focus`验证6/6；对v5的282个共有媒体hash差异0，仅删除两条track0共36个RGB565/A8媒体，禁止把效果归因成嘴素材变化。
+- 构建通过并归档：marker=`boot_trace_v10_s1ey_mouth_large_semantic_life`，应用`0x45dbe0`、余量13%；BIN SHA256=`8A6549595F0B627EFCD7D760072D268DE4FBE3BB2C95C356361C4736F7E9E0E7`，ELF SHA256=`AF824FA8D36780C78DDC5844E2F69718480421E9FFC5A6474845E9EE71631EDA`，归档hash一致。
+- 烧录：2026-08-18 单次COM7完整写入bootloader、partition、otadata、双OTA、assets，六段均`Hash of data verified`，无timeout、无重试，RTS hard reset成功。素材是否替换尚未确认；物理冷启前不得把SD或观感判为通过。
+- M+=天气播报中large略更常出现且头发不循环、下方仍有轻微life；M-=嘴过密或接缝扩大、生命感全失、音频/字幕/二次唤醒退化、panic/WDT。需配对换包+烧录+物理冷启V2；稳定仍按per-marker n≥4。
+
+# 2026-08-18 08-16/08-17 CRASH marker校正与 s1ez life-DMA 稳定性刀
+
+- 按带日期CRASH块去重后确认11起自然失败。08-16五起依次归属：00:01/01:43/02:29/03:42=`s1dm_standby_close_retry`，05:19=`s1dq_face_window_local_end`。08-17六起：02:09=`s1eo`，05:12/05:39=`s1ep`，07:54=`s1er`，10:58/11:30=`s1es`；DS把最后两起写成s1er是归属错误。故“MQTT_END 3起”横跨s1er/s1es，不能作为单marker回归。
+- 三起 `prev_phase=MQTT_END` 均在MQTT失败后继续正常运行，复位前最后活动为idle life小图；`MQTT_END`只是旧breadcrumb。10:58 INT_WDT用匹配s1es ELF解析：CPU0 `esp_cpu_compare_and_set→spinlock_acquire→xQueueSemaphoreTake→AfeFetchGateEnter→AudioDetectionTask`；Core1在SMP tick/spinlock。RTC显示AFE从life frame2后进入WAIT_GATE约0.87s，而face仍连续提交frame3..5，flush active=0。
+- 适用范围分流：08-16的s1dm/s1dq仍是旧400行/整帧暴露族；08-17的s1eo与s1ep首两起分别早于small-life收口和enter关闭，当前s1ey已包含其后继结构修复。s1er/s1es三起使用的small-life同步缺口仍存在于s1ey，故本批只认领这一个仍存根因，不宣称一刀消灭全部11起或根治MSPI-751。
+- 根因窗口：small-life旧路径持AFE门写canvas但在LVGL invalidate后立即解锁，未像全屏路径等待LCD final-DMA；audio/face同为prio3，AFE等待期间视觉tick仍可连续获门。它不是关闭动画的理由，而是“音频优先+DMA所有权”契约未落实。
+- s1ez唯一稳定性变量由R0 `S1EZ_P_LIFE_AFE_FENCE`统辖：visual TryLock改0等待；每个life帧 `prepare fence→invalidate→unlock LVGL→wait final-DMA` 后才释放AFE门；face worker prio 3→2，audio保持3；fence timeout帧丢弃不补播；逐帧日志移至AFE门释放后。嘴幅、80ms说话节拍、emotion、会话和SD媒体均不改。
+- M+=启动见 `FW_MARKER ...s1ez...`、`!!FACE_S1EZ ...p=1`、`face_worker ...prio=2 audio_prio=3`，idle life持续且日志 `gate=released`，AFE fetch/唤醒/TTS无回退；M-=连续`ESP_ERR_NOT_FINISHED`、life停止、音频欠载/第二轮失败或任何panic/WDT。稳定性仍以s1ez per-marker n≥4/mean不低于s1cm裁决。
+- 集成工具同批修正：两份`reboot_audit.py`遇到新`MONITOR START`会清空旧marker/uptime，禁止跨采集段借marker；`tools/stability`副本修正日志根路径；`s1ev_acceptance.py`在monitor中途恢复且无mount边界时返回PENDING而非伪FAIL。三脚本已通过`py_compile`，当前无冷启边界的验收结果为PENDING。
+- 构建门：独立`build_s1ez`完整构建通过，应用`0x45dbf0`、分区余量13%；二进制已确认包含exact marker、`p_life_fence`与`!!FACE_S1EZ`。归档`fw_archive/xiaozhi_s1ez.bin`/`elf_snapshots/xiaozhi_s1ez.elf`；BIN SHA256=`77C76D57CF4613987602C98924C35250A390CC4CA8CD0122098803F2F7723C2A`，ELF SHA256=`DBA5AC1499D64514D6739BB447BF0539B9B54F35B2BF38E3D05B1D3285BB0770`。尚未烧录/冷启，不得宣称稳定性已解决。
+- 烧录门：2026-08-18对COM7单次完整写入bootloader、partition、otadata、双OTA与assets，六段均`Hash of data verified`，无timeout/重试。恢复采集后见`s1ez idle_life_blit ... err=ESP_OK gate=released`、`wait_ms=0`及AFE_DIAG连续；因监控晚于启动恢复，exact `FW_MARKER`/SD seed门仍待物理冷启补证。当前只判“新路径已运行”，不判稳定性通过。
+
+# 2026-08-18 v5p4 mouth-focus soft-seam 离线合流
+
+- 边界：夜间长泡继续使用板上`s1ez + v5p3`；本批不改`main/**`、不换SD、不编译烧录，不污染s1ez寿命变量。
+- 候选=`mjpeg_ai_dialogue_v5p4_mouth_focus_soft_seam`，由v5精确真源一次重建，同时显式启用`--max-mouth-soften 1.5`、`standby:1`、`happy:1`，并继续禁止strong-hub/release失败实验。validation=6/6，424文件/45,727,234 bytes。
+- 对当前v5p3逐媒体SHA-256：两边各378文件，missing=0、extra=0、diff=32；差异只在standby/neutral/happy/loving两套pose的medium/large JPG+RGB565。sad/angry diff=0，六个MJPEG不变，standby/happy life各18文件且hash diff=0。故后续V2可把“方框感变化”归因给软接缝，不与头发生命轨混判。
+- manifest SHA256=`C86C69911859A4150FB60186628691D32E2FE467EE8608F99E5FFD27DFE78E06`；当前只完成离线门，禁止复制到SD冒充体验通过。s1ez夜间寿命无回退后再部署，重点验四表情最大嘴形边界、重复TTS、字幕/音频、退出和第二轮唤醒。
+- 集成验收器不再写死s1ev marker：默认读取`main/reminder/boot_trace.cc`真源；s1ez附加检查`p=1`、face prio2/audio3、life解锁后提交、AFE诊断连续及fence timeout上限。现有日志：generation=1/2/3、mouth_arm=6、mouth_blit=17、normal_exit通过、life gate=38、AFE_DIAG=78、fence timeout=0、panic/reboot=0；仅exact marker与实际second wake待补，裁决PENDING。
+
+# 2026-08-18 P-contract-v2 — manifest整包契约硬化
+
+- 边界：夜间长泡仍是板上`s1ez + 当前SD包`；本批只改PC工具、生成新候选并做离线测试，不改`main/**`、不换SD、不编译烧录，稳定性样本变量不变。
+- 假设：旧builder只逐clip校验，不能在复制SD前识别pack入口/路径逃逸/ROI越界/固件行带上限/未审核life语义等跨文件不一致。新增`dialogue_pack_contract.py`，把六表情入口、相对路径、480×480 RGB565、MJPEG连续索引与SHA、嘴/眼/life尺寸和hash、canonical base、pose/transition、每tick≤48行且单层统一为可执行门；builder固定输出`runtime_contract`、显式legacy根`/sdcard/mjpeg`与`contract_report.json`。
+- 自动反例4/4：合法最小包通过；`../`路径逃逸、ROI越界、RGB565尺寸错误均准确拒绝。现有v5p4硬契约`errors=0`，同时显式报告neutral/sad/angry/loving共8条`auto_unreviewed`语义警告，证明探针能发现此前隐性风险。
+- 候选`mjpeg_ai_dialogue_v5p5_contract_hardened`：standby/happy继续只批准track1；neutral/loving/sad/angry使用显式空批准，不把运动分数冒充产品语义。输出validation 6/6、contract errors=0/warnings=0。对v5p4共有234个媒体SHA完全一致、六个MJPEG一致；仅删除四表情各36个未批准life RGB565/A8文件，无新增媒体。
+- 裁决：`S1/D0/R0/V0`离线门通过，工程综合进度71→72%，板上体验仍按69%。该包在s1ez寿命门通过前禁止部署；未来V2只裁决“非happy表情不再出现无语义局部乱动”，嘴部/字幕/音频/第二轮不得回退。
+
+# 2026-08-19 s1ez 夜泡归因与 s1fa MQTT-idle 预算门
+
+- 夜泡事实（22:00后）：s1ez自然失败2起。22:31:45为Core1 LoadAccessFault，上一轮寿命2557s，`prev_phase=MQTT_CONN_BEG`；23:34:05为纯HP WDT，上一轮寿命3733s，`prev_phase=MQTT_END`。第二次复位后右删失存活约3.95h。s1ez当前仅`n=2`且已有失败，禁止用最后一段长存活宣布稳定。
+- PANIC按归因序：匹配`s1ez` ELF SHA256=`DBA5AC1499D64514D6739BB447BF0539B9B54F35B2BF38E3D05B1D3285BB0770`解析，`mepc=0x4ff0f40a`与`ra=0x4ff0f3e8`均落在`xTaskIncrementTickOtherCores`（`freertos_tasks_c_additions.h:108`）；故障指令以当前TCB的`uxPriority`乘20索引`pxReadyTasksLists`，`mtval=0x45a1b08c`表明任务控制数据/优先级索引已坏。`mtval`不近`sp=0x4ff1e9d0`，cache_on=1、flashop_depth=0、heap余量稳定，不能把MQTT breadcrumb直接解释成MQTT业务空指针。
+- 同窗证据：崩前`FACE_BREATHE skip_afe`虽然限频打印，但真实重试仍为120ms，计数已到约1.88万；折算约2.8万次Core1低价值唤醒/小时。panic前约1.1s存在`s1ez idle_life_blit ... gate=released`。第二起在MQTT connect失败/`MQTT_END`后触发纯WDT。证据支持“idle-life准入重试与MQTT AT连接窗口重叠是调度/总线暴露放大器”，但不声称它是硅片病或所有内存踩踏的唯一根因。
+- s1fa唯一变量：新增独立MSPI预算互斥。提醒MQTT的Connect/Subscribe/IsConnected/Disconnect阻塞持有；idle-life只try-lock，遇忙丢当前帧并以900ms重试。门覆盖现有AFE锁、patch读取、present与final-DMA fence的完整低频视觉事务；Speaking mouth故意不使用此门。互斥量初始化失败时fail-open，网络RAII只有真实持有才释放，避免未持有释放。
+- 四问：`S1/D1/R0/V3`。R0=`S1FA_Q_MQTT_IDLE_QUIET=0`。M+=exact marker=`boot_trace_v10_s1fa_mqtt_idle_quiet_gate`、启动`!!FACE_S1FA ... q=1 retry_ms=900`；`MQTT_CONN_BEG..OK/END`窗口若有life请求，只见`!!FACE_S1FA q=mqtt_skip`而无`idle_life_blit`；窗口结束后life恢复；Speaking仍有`mouth_arm/mouth_blit`，AFE/TTS/STT/第二轮唤醒不退化。M-=窗口内仍出现life blit、窗口外life永久冻结、音频欠载/字幕/二次唤醒回退或任何panic/WDT。
+- 构建：fresh `build_s1fa`完整构建及增量复核通过，应用`0x45df60`、分区余量13%；BIN包含exact marker与两条`!!FACE_S1FA`探针。归档`fw_archive/xiaozhi_s1fa.bin`与`elf_snapshots/xiaozhi_s1fa.elf`，二次hash一致：BIN SHA256=`CD22D87B035A93D7489E483EAA4D2A4B192B30F7B9FC898637781923A458109C`，ELF SHA256=`4EEDD0FB85BE3204D7B481B1FEE55FDF94D0780CCC94152F64D4D8C8EE19D333`。尚未烧录/冷启，不得声称真机修复；寿命门为s1fa per-marker `n≥4`且mean不低于s1cm≈2054s。
+- 烧录：2026-08-19占用COM7前按规则停止DS的serial monitor，随后以460800 baud单次写入`0x2000 bootloader`、`0x8000 partition`、`0x10d000 otadata`、`0x200000 ota_0`、`0x700000 ota_1`、`0xc00000 assets`；六段全部`Hash of data verified`，无timeout、无重试，最终RTS hard reset成功。USB复位不替代物理冷启；需DS恢复监控后断电冷启，补exact marker、`q=1/retry_ms=900`、`SD_MOUNT_OK`与`seed_stills 6/6`。
+
+# 2026-08-19 s1fa 待机饥饿复判与 s1fb AFE phase-dither
+
+- 冷启采集晚约63s接入，虽未捕获exact marker/SD seed边界，但`t=66.258s`出现`s1ez idle_life_blit track=0 frame=2/9 err=ESP_OK`，证明standby life素材、patch层和显示路径已运行；后续`s1fa idle_life_drop mqtt_window n=12..21`严格落在`MQTT_CONN_BEG..MQTT_END`，END后消失，证明q门正确释放、无网络锁泄漏。
+- 反例：MQTT结束后约47s只有`FACE_BREATHE skip_afe n=33→74`且frame不再推进。900ms固定退避约等于AFE fetch约30ms周期的30倍，每次timer都回到同一busy相位；因此s1fa视觉M−为确定性相位饥饿，不是SD素材太弱、life未武装或MQTT互斥死锁。该轮是静态偏置负载，不计完整动画工作量寿命通过。
+- s1fb唯一变量：保留MQTT miss=900ms；AFE miss改为确定性`731/887/1019ms`循环。三值跨常见20/30/40ms音频周期走相位，平均879ms，与s1fa约4k次/小时的唤醒预算基本相同，禁止恢复120ms约28k次/小时竞抢。成功后仍按260ms提交下一life帧，整轨结束仍休息4.2s；不改AFE任务、优先级、嘴部、情绪、素材或DMA fence。
+- 四问：`S1/D1/R0/V2+V3`。R0=`S1FB_R_IDLE_AFE_DITHER=0`恢复s1fa固定900ms。M+=exact marker=`boot_trace_v10_s1fb_idle_afe_phase_dither`、启动`r=1 afe_retry_ms=731/887/1019`；AFE miss日志轮换retry，非MQTT窗口8–15s内life frame持续前进；MQTT窗口仍只有q skip；AFE/TTS/STT/第二轮唤醒正常。M-=frame再次长期冻结、平均尝试率明显高于s1fa、q窗口出现blit、音频回退或panic/WDT。
+- 构建：`build_s1fa`增量14步及二次无源重编复核通过（目录名沿用，但内容marker为s1fb），应用`0x45dfe0`、分区余量13%。BIN含exact marker与两条S1FB探针；归档`fw_archive/xiaozhi_s1fb.bin`/`elf_snapshots/xiaozhi_s1fb.elf`，二次hash一致。BIN SHA256=`490B953132DE62525F0F0068E37E8980ECC5E2D2AA48F800260B21C29B7C4A6C`，ELF SHA256=`FDC1F478741854748210C3ED2DE5665179F9A6722457854DC7C1553048652D17`。尚未烧录/冷启，不得声称体验或稳定性已修复。
+- 烧录：2026-08-19按monitor启动时间只停止COM7对应进程，未动后启动的其他DS任务；460800 baud单次写入bootloader、partition、otadata、双OTA与assets，六段均`Hash of data verified`，无timeout/重试，RTS hard reset成功。需DS恢复monitor后物理断电冷启；V2先验exact marker、`r=1`、SD seed 6/6、8–15s内life帧前进，再进入V3长泡。
+- 冷启V2：monitor在uptime约31s接入，未捕获启动marker/seed边界，但`s1fb retry_ms=731/887/1019`、MQTT窗口q drop与5次`idle_life_blit`证明固件/素材/两层门均运行。约5分钟只推进5帧，92条限频skip对应AFE长期占门；肉眼静态与日志一致。裁决M−：错相修复了固定周期共振，却未达到8–15s持续推进门。禁止再调retry常数或恢复120ms；下一候选改为AFE返回安全点的低频、单帧、超时可丢令牌，且必须以音频健康和非MQTT为前置。
+# 2026-08-19 s1fc — idle-life AFE释放边沿令牌
+
+- s1fb冷启短验：约5分钟仅5次`idle_life_blit`，大多数tick仍在`FACE_BREATHE skip_afe`；错相轮询只偶尔撞中空隙，肉眼仍近静止。MQTT窗口内q-drop、窗口后回AFE skip，说明网络门有效，主因是WakeNet fetch几乎连续占门。
+- 唯一变量：idle tick撞AFE后不再启动731/887/1019ms定时重试，而登记一个latest-value pending；`AfeFetchGateLeave()`先释放互斥，再以900ms最小间隔调用非阻塞回调，仅向len=1的Face Worker队列投令牌。worker仍prio2、零等待抢AFE/MQTT门，失败即丢；回调不解码、不绘制、不打印、不等待。
+- R0=`S1FC_S_AFE_EDGE_TOKEN=0`恢复s1fb错相轮询。M+=exact marker、`s=1`、`edge_wait`后idle life能按秒级持续推进且MQTT窗口无blit；M-=仍数分钟才一帧、音频/STT退化、窗口内视觉泄漏或任一panic/WDT。寿命仍须per-marker n≥4，不因idle变动宣称稳定。
+- V0：增量构建成功，应用`0x45e1a0`、分区余量13%。BIN SHA256=`E207CAE426815B4BA0D3520F69920C6F87806229B7DD15DF6983DC9517492C14`；ELF SHA256=`D078B396B8E42ED56176B85E452F8BB02F512147C7625D81222989C5D624A2A8`；已归档。烧录与物理冷启V2尚待本批后续记录。
+- 烧录：按`serial_monitor.meta`启动时间只停止COM7对应PID，未动另外三个DS/稳定性Python进程；460800 baud单次写入bootloader、partition、otadata、OTA_0、OTA_1与assets，六段均`Hash of data verified`，无timeout/重试，RTS hard reset成功。USB复位不替代物理冷启；须由DS恢复采集后断电上电，先验exact marker、SD/seed 6/6，再看约10–20s内life是否持续推进。
+
+# 2026-08-19 s1fd — PSRAM-free 待机背光呼吸
+
+- 用户V2观感判定s1fc待机仍无动画感；同时采集器自05:09停写，现有日志只含旧s1fb，故不伪造s1fc运行链。但静态调度缺陷成立：prio3 AFE释放mutex后仅唤醒prio2 Face Worker，不等于转交所有权，AFE可立即重获门；禁止继续调retry、抬视觉优先级或人为暂停AFE。
+- 唯一变量：`S1FD_T_IDLE_BACKLIGHT_BREATHE=1`时，`ArmIdleBreathe`改走背光PWM生命轨，不再启动idle patch/AFE令牌。24级包络、300ms一步、7.2s一轮；默认亮度最多下沉4个百分点，低亮度自动缩幅。只改LEDC duty，不触碰framebuffer、PSRAM、MIPI/LCD DMA、AFE或SD。
+- 离开idle立即停止并恢复进入前亮度；若idle中外部修改亮度，下一tick把新值收作基准，避免与用户设置争夺。`SetBrightnessQuiet`不写NVS、不产生300ms日志风暴。R0关闭t恢复s1fc旧路径。
+- M+=exact marker、`t=1`、`t=arm base=N`，肉眼有低幅整体呼吸；进入Listening/Speaking见`t=stop restore=N`且字幕/嘴部/唤醒无退化。M-=无呼吸、亮度跳变/闪烁、对话后亮度不恢复或任何音频/复位回归。长期仍按per-marker n≥4。
+- V0：55步增量构建成功，应用`0x45e6c0`、分区余量13%。BIN SHA256=`F040606519566C5E8F3F7A8D96B0AFA42B4A2BDD1636F6131CEB1587FED16192`；ELF SHA256=`C5517660B53170A2BD14F632A8ACF9FD8CA3AE22AFDB65AEB699D2235B8B6A39`；已归档。烧录与物理冷启V2待本批后续记录。
+
+# 2026-08-19 s1fe — MQTT/UDP边界防御（未完成链接）
+
+- 从远端`agent/com4-proactive-reminder-stability`只吸收合法输入行为不变的防御思想，不复制UDP prime/重排/预缓冲或vendor/UI混合代码。当前真实缺陷为接收端用`sizeof(aes_nonce_)`衡量`std::string`对象而非16字节协议头，server hello多个字段直接解引用，发送端未校验空packet/nonce/payload上限，且UDP创建/连接失败仍可能继续报通道已开。
+- s1fe固定音频头为16字节；server hello严格校验transport/server/port/32位hex key与nonce；上行拒绝null与>65535 payload；收发字段用`memcpy`替代未对齐强转；下行核对header payload_len与实际CTR密文长度；CreateUdp/Connect失败清理并返回false。
+- 四问与门：`S1/D0/R2/V0→V2`。M+=正常STT/TTS/二次唤醒不变，畸形输入只产生guard日志；M-=合法包被拒、音频通道打不开或上下行退化。当前仅两改动对象经P4工具链编译通过；完整链接/归档/烧录均未完成，不能计入per-marker寿命或声称修复上板。
+- s1fd烧录补记：COM7无serial monitor进程占用；460800 baud单次写入bootloader、partition、otadata、OTA_0、OTA_1及assets，六段全部`Hash of data verified`，无timeout/重试，RTS hard reset成功。DS须恢复采集后物理断电冷启；先验exact marker、`t=1`、SD/seed，再观察完整7.2s周期和对话入口亮度恢复。
+
+# 2026-08-19 s1ff — 分支防御能力整合（V0）
+
+- 用户授权吸收 `agent/com4-proactive-reminder-stability` 中当前工程可用的优化；仍遵守“禁止整包合入”与音频优先。整合项为：assets分区表/offset边界校验和按实际长度mmap；BQ27220缓存快照+LVGL电量UI；MJPEG 16KB internal staging分段搬入PSRAM、decode栈12KB；主动提醒4帧/420ms有界预缓冲并在播放队列排空后反馈/ACK；UDP transport-only prime与3包小窗重排；保留s1fe输入guard。
+- 分流未合：vendor ML307 UART fork、12秒冷启与强制重启（无本机串口根因证据）；managed EEZ整包（会覆盖当前表情主线）；FATFS LFN heap（独占sdkconfig且无栈证据）；远程重复响铃（新产品语义）；硬编码endpoint。它们不是“遗漏”，而是当前不可安全归因/不属于同一防御目标。
+- 四问：`S2/D2/R0~R2/V0→V2/V3`。关键M+为exact s1ff、SD/seed 6/6、普通三轮STT/TTS与3秒二次唤醒不退、主动提醒ACK晚于真实音频排空、无UDP reorder stall；M-为启动误关机、电量层遮挡、SD失败、首音/尾音退化、无STT/TTS、会话卡死或任何panic/WDT。
+- 完整构建通过（应用+bootloader）：marker=`boot_trace_v10_s1ff_branch_hardening_bundle`，应用`0x461220`，分区余量12%。BIN SHA256=`BFEE4CAD65349EA68ABFEABC96562C1F177A444870EE0885D9197254DA2421C0`；ELF SHA256=`BEA5D7CF4DD0A927D0A1255EA96C581E0876CE56113DD37D7A36F2F1180BF4CF`。未归档、未烧录、未冷启，当前只能记V0；稳定性必须per-marker n≥4且mean不低于s1cm。
+- 烧录：2026-08-19确认旧COM7采集在05:09已停写且无匹配占用进程后，以460800 baud单次写入`0x2000 bootloader`、`0x8000 partition`、`0x10d000 otadata`、`0x200000 OTA_0`、`0x700000 OTA_1`、`0xc00000 assets`；六段全部`Hash of data verified`，无timeout、无重试，最终RTS hard reset成功。USB复位不替代冷启；需DS恢复采集后物理断电冷启，先验exact marker、SD/seed 6/6、电量快照，再做普通对话/主动提醒门。
+
+# 2026-08-19 s1fg — 视觉底图契约与强情绪停留（V0）
+
+- s1ff真机日志把三个现象拆开：天气轮次连续收到约30次云端`tts sentence_start`正文`% get_weather...`，随后`tts stop`且零UDP音频；同一session后续普通回答可正常播音，UDP汇总`reordered/skipped/duplicate=0`，故不能归为本地扬声器或UDP回归。angry则已`static_hold_done/mouth_arm`，但云端仅发emoji情绪且立即零音频stop，Listening入口随即画standby，造成肉眼闪回。嘴/脖子矩形接缝来自MJPEG standby seed与layered pack canonical底图未证明像素同源，却以`base_already_present=true`直接叠patch。
+- 唯一视觉契约批次：有效BQ电量取消开机30秒可见窗并常显；provisional Speaking改为`ArmMouthFollow("standby", false)`，由layered包先呈现canonical base一次，失败才回standby；angry/sad成功静态提交后保留至少1.2s，Listening期间只延迟视觉回standby，不阻塞采音。未改MQTT/UDP/AFE/SD素材和天气业务。
+- 四问：`S2/D1/R0~R1/V0→V2`。M+=exact s1fg、电量计有效时常显、`provisional_mouth arm canonical=1`、多轮天气嘴/颈无矩形底图差、angry/sad即使零音频也至少可见约1.2s且麦克风继续Listening；M-=双全屏闪烁、字幕/音频/第二轮唤醒回退、强情绪卡住不退或任何panic/WDT。天气工具循环若复现仍归云端工具结果，不得用本批视觉刀认领。
+- V0：`build_s1fa`完整应用重建并链接成功，生成应用`0x4614a0`、分区余量12%；BIN SHA256=`8E4148F4394CA990308C12E4A02A59FE5BB677A41E8A729662AAEC2F0D0B3B30`，ELF含exact marker与三条s1fg探针。默认目标在应用BIN生成后因旧bootloader子构建读取sdkconfig的GBK环境失败；不影响已成功生成的本轮ELF/BIN，但本轮尚未烧录/冷启，不得冒充V2。
+
+# 2026-08-19 当前上板冷泡右删失证据
+
+- `serial_monitor`于07:43:17接入COM7时设备uptime≈57s，推算本轮约07:42:20启动；至17:38尾部uptime=35765s≈9.94h。接入后按行号过滤`FW_MARKER/BOOT/REBOOT_AFTER/PANIC_LAST/rst/Guru Meditation`事件为0；meta实时为`running=1 state=connected`，日志持续写入，watch state=`crashes=4`且最后triage仍停在08-18 23:34旧WDT。
+- 该段超过此前记录的6.8h无复位段，是正向稳定性证据；但启动marker和seed边界在接入前被错过，不能严格归属per-marker，且单条右删失样本不满足`n≥4`。综合工程口径仅75%（+1），当前上板口径71%（+2），不宣布寿命门通过；继续泡并补下一次完整冷启exact marker。
+
+# 2026-08-19 s1fg 集成门与双槽烧录
+
+- `tools/stability/s1ev_acceptance.py`扩展为当前marker验收器：s1fg额外检查BQ初始化、`provisional_mouth canonical=1`、strong hold arm/done及可见停留≥900ms；exact marker缺失时相关项只报PENDING，避免旧固件假阴性。连续`% get_weather...`≥3次独立分类为`CLOUD_TOOL_LOOP`且不归罪本地UDP。脚本`py_compile`通过；在旧s1ff尾部正确输出PENDING、91次weather placeholder、panic/reboot=0。
+- 匹配归档：`fw_archive/xiaozhi_s1fg.bin` SHA256=`8E4148F4394CA990308C12E4A02A59FE5BB677A41E8A729662AAEC2F0D0B3B30`；`elf_snapshots/xiaozhi_s1fg.elf` SHA256=`5FE88589307BB8CE7856C1806B61B6DD5D3BA06DFFCEE84A2379CA46F626DD3C`。
+- 烧录：精确停止07:43:17启动的COM7采集PID 2480；460800 baud单次写`0x10d000 otadata`、`0x200000 OTA_0`、`0x700000 OTA_1`，三段均`Hash of data verified`，无timeout/重试，RTS hard reset成功。bootloader/partition/assets无变化未重复写。工程准备度记78%，上板口径仍71%；DS恢复采集并物理冷启后，验收器全PASS才记80%，寿命仍独立要求per-marker n≥4。
+
+# 2026-08-19 s1fh — BQ27220 冷启动有限重试（V0）
+
+- s1fg冷启后用户询问电量，日志两次出现`self.battery.get_level`真实MCP调用，云端均回答设备查不到电量；因此MCP注册、意图与显示隐藏策略不是根因，`BatteryMonitor::is_ready()`为false。monitor在uptime约20.7s才接入，漏掉约9s初始化现场，不能虚构具体I2C错误码。
+- 唯一变量：板构造早期、音频codec等其他I2C消费者启动前，BQ27220最多尝试4次；首次立即，失败后依次等500/1200/2500ms。驱动失败路径已核对会删除临时device handle并递减bus ref，重复尝试不累计设备；成功立即停止重试，失败保持unavailable。禁止运行期重试抢音频共享I2C。
+- 四问与门：`S1/D0/R2/V2`。M+=exact `boot_trace_v10_s1fh_battery_cold_retry`，随后`BATTERY_INIT_OK attempt=N/4 soc=0..100`，UI常显且再次询问返回数字；M-=四次均fail并`GIVE_UP`、启动/音频延迟异常或任何I2C/AFE回归。失败只证明延迟不足或硬件无响应，禁止改UI伪造电量。
+- V0完整重建通过：应用`0x461610`，5MB应用分区余`0x9e9f0`（12%）；归档`fw_archive/xiaozhi_s1fh.bin` SHA256=`8982D8FCD2DF7201CAAAF3F98881D3A76511B859ACC8D5C93F6E9ABAA2C0BB5A`，`elf_snapshots/xiaozhi_s1fh.elf` SHA256=`EAA36116EEC135169A895DBA9877B149C89DEB8AB5FCEC358E29DC17D93B14CC`。尚未烧录/冷启，不得声称电量已恢复。
+- 烧录：确认并精确停止COM7采集PID 524（17:57:31启动），未动其他DS任务；460800 baud单次写入`0x10d000 otadata`、`0x200000 OTA_0`、`0x700000 OTA_1`，三段全部`Hash of data verified`，无timeout、无重试，最终RTS hard reset成功。bootloader/partition/assets未变化故未重写。USB复位不替代V2；DS恢复采集后必须物理断电冷启，捕获exact s1fh及`BATTERY_INIT_OK/GIVE_UP`，再询问一次电量。
+
+# 2026-08-19 s1fi — 提醒服务离线失败退避（V0 + 双槽烧录）
+
+- 复判事实：17:57后采集连续约2.1h没有新的`BOOT/PANIC/WDT/rst`，所以用户看到的“网络卡住复位”未被该监控窗证明为自然复位；确定异常是提醒服务不可达。日志约189次MQTT失败、25次HTTP失败，MQTT约40s固定循环；PC到`114.245.176.144:8443/8883`同样超时，支持外部端点离线。不能把网络breadcrumb直接当崩溃根因，但固定重试与HTTP重叠会放大ML307 UART/调度暴露。
+- 唯一变量：MQTT任务启动先错峰16s；连续连接失败采用30/60/120/300s封顶退避并加0–15s抖动，成功后清零；长等待按1s切片并检查`running_`，保证Stop可及时退出。未改HTTP周期、MQTT/UDP会话通道、AFE、表情、SD、分区、第三方；电量链冻结，不再扩I2C/UI。
+- 四问与门：`S2/D1/R2/V0→V2→V3`。H=固定失败重试和HTTP重叠放大网络窗口。M+=exact `boot_trace_v10_s1fi_reminder_fail_backoff`，首次见`MQTT_START_STAGGER`，失败后`MQTT_FAIL_BACKOFF`按阶梯增长且AFE/普通对话/二次唤醒连续；M-=仍约40s恒定风暴、提醒停止不可退出、合法恢复后不重连或同族panic/WDT继续。
+- 构建：ESP-IDF 5.4.1完整构建通过，应用`0x461900`，5MB分区余`0x9e700`（12%）。归档`fw_archive/xiaozhi_s1fi.bin` SHA256=`2485408152B282FE6BD1F23AA707C1820535E1BAEA5B7E70BB0C5A3ABDB53D97`；`elf_snapshots/xiaozhi_s1fi.elf` SHA256=`91BDDFD9B4BD6B1F86AB4FAAE4220CB1B7188437BB76F7868D4BA6B5DBA61AB6`，与build产物逐一一致。
+- 烧录：旧`serial_monitor.meta`显示connected但系统无实际采集进程，故未停止任何无关进程；460800 baud单次写`0x10d000 otadata`、`0x200000 OTA_0`、`0x700000 OTA_1`，三段均`Hash of data verified`，无timeout/重试，RTS hard reset成功。新monitor PID 18176已连接，接入时uptime约36s，AFE/heap健康但漏exact marker。USB复位不替代冷启；物理断电冷启后补marker、退避阶梯及长期per-marker寿命。
+- 热启短门：已捕获`MQTT_FAIL_BACKOFF streak=2 base_ms=60000 jitter_ms=9765 delay_ms=69765`，下一轮为`streak=3 base_ms=120000 jitter_ms=11278 delay_ms=131278`，M+“失败间隔阶梯增长”成立；同期AFE每约5s连续、heap/PSRAM稳定，未见panic/WDT。exact marker、首次16s stagger、正常对话/二次唤醒与长期寿命仍待物理冷启后验，当前不得宣布稳定性修复完成。
+
+# 2026-08-19 s1fj — 主动提醒首次连接即时恢复（V0 + 双槽烧录）
+
+- 用户裁决：s1fi的16s首次连接错峰会延迟冷启后主动提醒上线，产品收益不足，必须撤销。s1fj删除`kInitialConnectStaggerMs`、启动等待及`MQTT_STAGGER`探针；MQTT任务启动后立即首次连接。服务离线后的30/60/120/300s封顶退避、抖动和可中断等待完整保留，不回到约40s固定风暴。
+- 四问：`S1/D0/R1~R2/V0→V2`。M+=exact `boot_trace_v10_s1fj_immediate_reminder_backoff`后`MQTT_TASK start`可直接进入`MQTT_BEG/CONN_BEG`，不存在16s `MQTT_START_STAGGER`；首次失败后仍见`s1fj MQTT_FAIL_BACKOFF`。M-=仍延迟首次连接、退避丢失、普通对话/二次唤醒回退或panic/WDT。
+- 构建/归档：完整增量构建已在中断后后台成功收口，应用BIN包含exact marker。`fw_archive/xiaozhi_s1fj.bin` SHA256=`69C6AA295BAB848C3AECFA21F6931C214732D1D884C18ABAD418B68E3B198677`；`elf_snapshots/xiaozhi_s1fj.elf` SHA256=`B38D5ABA63D1EA1B8FC104C8071768E18BC20587AC11496E5F3D918FBBCFDFB6`，均与build产物一致。
+- 烧录：精确停止COM7采集父子PID 3904/18176；460800 baud单次写`0x10d000 otadata`、`0x200000 OTA_0`、`0x700000 OTA_1`，三段均hash verified、无timeout/重试，RTS hard reset成功。新采集PID 5684接入时uptime约31s，AFE/heap健康、无panic/WDT，但错过marker/SD边界。`s1ev_acceptance.py`正确输出PENDING；物理断电冷启后再验exact marker、SD/seed、重复TTS嘴层、正常退出及3秒二次唤醒。
+- 冷启功能/集成裁决：SD mount、seed 6/6、9个Speaking generation、mouth_arm=18、mouth_blit=49、正常退出及零panic/WDT均通过；4个完整关闭周期的`channel_closed→event=wake_enable`分别为204/203/206/205ms，二次唤醒的`wake_word_detected→Listening`为218ms。`s1ev_acceptance.py`此前把关闭行错误要求为`state=idle`，导致延迟永远PENDING；工具已改为分别检查`wake_rearm_1s`与`wake_detect_to_listening_1s`，py_compile通过，当前两项均PASS。未改固件、无需烧录。
+- 进度裁决：s1fj专属`MQTT_FAIL_BACKOFF ... s1fj`、双槽hash verified及冷启SD边界共同证明运行身份；开机早期exact marker文本仍因USB枚举漏采，保留可观测性PENDING。功能/体验/集成短门据实记80%，稳定性不跟涨：08-19早晨9.94h无复位已是账本中的未严格归属marker右删失证据，不转记到s1fj；s1fj寿命仍等per-marker n≥4且mean≥s1cm。
+
+# 2026-08-19 s1fk — 延迟一次性 marker 回显（V0）
+
+- 根因不是固件身份未知，而是ESP32-P4冷启后USB串口常在约20–31s才重新枚举，早期唯一`FW_MARKER`已过去；因此长泡虽可见专属业务日志，仍无法满足严格per-marker寿命统计。下一层M2不能建立在不可归因样本上。
+- 唯一变量：复用既有每秒主事件时钟，uptime达到60s时一次性输出`FW_MARKER boot_trace_v10_s1fk_delayed_marker_echo echo=delayed_once`；不新建任务/定时器，不分配PSRAM，不改音频、AFE、显示、SD、MQTT或提醒时序。
+- 四问：`S1/D0/R2/V1→V3`。M+=60s后exact marker恰好一次且无日志洪泛；M-=缺失、重复输出或任何功能/时序回退。完整构建通过，应用`0x461900`、5MB分区余12%；BIN SHA256=`F2FC76D72A669271C002580E036E6E5E9677D00B5EC3030B22CE2168363D3446`，ELF SHA256=`6C915B1E958F32FA3BB9FDE9F46902947B6AD8C4C91758FA6C4F03930EBFF9E6`。已归档，待双槽烧录与V1 marker裁决；稳定性仍必须per-marker n≥4且mean≥s1cm。
+- 烧录/V1：精确停止COM7采集父子PID 5684/18460；仅写`0x10d000 otadata`、`0x200000 OTA_0`、`0x700000 OTA_1`，三段全部`Hash of data verified`且RTS复位成功，未写bootloader/partition/assets。新采集PID 10412连接后在uptime 61.499s捕获exact延迟marker，到73s未重复，AFE/heap/idle健康、零panic/WDT；marker门PASS。因RTS热启未获得本段SD mount/seed与交互样本，验收器其余项目诚实PENDING；物理冷启与多轮对话后补齐，长期仍按per-marker n≥4裁决。
+
+# 2026-08-20 s1fl — M2a 五档 VisualBudget 影子灰度（V0 + V1）
+
+- 前置裁决：s1fk夜泡从08-19 23:0x POWERON至审计时形成`20329.8s=5.65h`右删失样本，零自然复位；不是`n≥4`正式寿命门。用户明确授权保留s1fk根据地、先进入可回滚M2灰度，有回归即退；因此s1fl寿命独立重新计时，不继承s1fk时长。
+- 唯一变量：新增`Frozen/StaticOnly/MouthReduced/MouthOnly/TransitionCandidate`纯分类器；应用主循环每秒读取一次现有线程安全音频诊断快照，只在档位变化或60样本心跳记录`VIS_BUDGET_SHADOW ... apply=0`。`TransitionCandidate`仍须未来通过AFE/MQTT/全屏单例门，本版Face Worker完全不读取预算，不改变任何帧、嘴频、情绪、SD、网络或音频策略。R0=`S1FL_U_VISUAL_BUDGET_SHADOW=0`。
+- 四问与门：`S2/D0/R0/V1→V2/V3`。M+=idle candidate、Listening static、Speaking随真实队列落mouth两档/饥饿static，且旧画面行为、音频、退出与二次唤醒不变；M-=日志洪泛、分类永久错误、队列快照锁造成音频回退或任意panic/WDT。完整构建通过，应用`0x461cb0`、分区余12%；BIN SHA256=`480C5E2851CC2A7742F17B06C6868F321C64AE25DBA9503F0A61387708BD3972`，ELF SHA256=`8C9E3D9CA3ADD5DC1F3810646298A99F89BA02DA8CB0C4CD20B1464FAA2503F9`。
+- 烧录/V1：精确停止COM7采集父子PID 10412/3520，仅写otadata/OTA_0/OTA_1，三段hash verified且RTS复位成功；新采集PID 6404连接。uptime 61.501s捕获exact `boot_trace_v10_s1fl_m2a_visual_budget_shadow`，64.501s捕获idle `TransitionCandidate ... apply=0`心跳，到108s AFE/heap稳定、零panic/WDT。启动早期初次档位变化被USB枚举漏采不算失败；V2需用户完成一轮正常对话，检查Listening/Speaking档位、音频连续、退出和二次唤醒。
+- V2裁决：用户体感“还可以”，脚本`face_integration_gate=PASS/s1ev_gate=PASS`。同一exact marker段覆盖generation 1..13、mouth_arm=24、mouth_blit=69、四次退出重武装205/206/206/207ms、第二轮wake→Listening 224ms，零panic/reboot。影子轨迹完整：Connecting=`Frozen`、Listening=`StaticOnly`、Speaking按pq 1–2/3在`MouthReduced/MouthOnly`切换、idle settle后=`TransitionCandidate`，全部`apply=0`。M2a功能/集成V2通过；不等于s1fl V3寿命通过，下一批只允许M2b嘴部节拍消费，enter/exit与眨眼继续冻结。
+
+# 2026-08-20 s1fm — M2b 嘴部预算消费（V0）
+
+- 唯一变量：只让`MouthReduced/MouthOnly`消费嘴部上升tick；MouthReduced首步立即、后续隔tick，latest-value覆盖且不补旧口型。所有档位的闭嘴回落不受限；预算推迟嘴部时life让出该tick。无新任务/队列/锁/PSRAM/全屏事务，嘴幅、情绪、素材、enter/exit和眨眼不变。
+- 为守住首嘴，Speaking队列尚未建立的分类从StaticOnly改为`MouthReduced/provisional`。R0=`S1FM_V_VISUAL_BUDGET_MOUTH_APPLY=0`；失败退s1fl，稳定性根据地仍s1fk。
+- 四问与门：`S1/D1/R0/V0→V2→V3`。M+=健康队列行为不变、偏薄时上升降频且不补播、收口/退出/二次唤醒不回退；M-=首嘴冻结、闭嘴慢、音频断续、会话回归或panic/WDT。
+- 完整构建通过，应用`0x461e40`、分区余12%；归档BIN SHA256=`E7045ABFFF91448EAA14532E390ADEB76D802773F331D4CCE0699365C1A753E4`，ELF SHA256=`006382AE57268535DE7607767D03D57EA2E70F893B469830FDB6EF7961117A36`。
+- 烧录/V1：精确停止COM7采集父子PID 6404/16784，仅写otadata/双OTA，三段hash verified，RTS复位；新采集PID 18284。61.498s捕获exact marker，64.498s预算心跳为`TransitionCandidate apply=1`，AFE/heap健康且零panic/WDT。验收器当前marker/no-reboot PASS，其余交互门PENDING；不计体验或稳定性完成。
+- V2裁决：用户体感“还可以”，联合脚本全PASS。generation 1..9、mouth_arm=16、mouth_blit=47，日志证实`MouthReduced/MouthOnly`均进入Face Worker；4次退出重武装209/207/207/203ms，第二轮wake→Listening 225ms，正常退出且panic/reboot=0。M2b功能/体验/集成短门通过；寿命仍须s1fm per-marker V3，不能继承s1fk右删失时长。
+
+# 2026-08-20 存活门成本校正
+
+- 用户明确选择“限时灰度推进，有问题回退”。`n≥4`不再是R0/D0~D1视觉刀的硬阻塞：有失败样本时仍按per-marker mean对标s1cm；零失败时使用右删失累计暴露，6–12h记阶段正证据、48–72h可强通过。V2、匹配ELF、known-good和回滚开关缺一不可。
+- 同时最多一项未完成V3的视觉热路径变量；可重复panic/WDT、音频失效、正常退出或二次唤醒回归立即退上一marker。历史寿命记录不改写，后续账本同时列完成寿命与右删失暴露。
+
+# 2026-08-20 s1fn — M2c life 余量门（V0）
+
+- s1fm V2全PASS且用户授权按滚动门继续。唯一变量：Speaking `MouthOnly`允许现有低频life小带；`MouthReduced`丢未完成life轨、只保嘴，恢复时从轨起点继续，不补旧帧。idle背光呼吸、素材、嘴幅、情绪、enter/exit和眨眼均不变。
+- R0=`S1FN_W_VISUAL_BUDGET_LIFE_APPLY=0`；M+=薄队列`defer drop_partial=1`、恢复`resume latest_only=1`且音频/嘴/退出连续；M-=健康队列life永久消失、嘴冻、二次唤醒回归或panic/WDT。失败退s1fm，不在s1fn叠刀。
+- 完整构建通过，应用`0x461fb0`、余12%；BIN SHA256=`3C1410DE9217AC49497CE08EC6D5987AD84EF382383F66CF44E597BF3E3371E8`，ELF SHA256=`41E57DFFEB3EC99F9F26269D7A48480B2919794D2641EA7EAE2ED3B527C44AA4`。当前仅V0，尚未烧录/真机。
+- 烧录/V1：精确停止COM7采集父子PID 18284/13704，只写otadata/双OTA，三段hash verified；新采集PID 19212。61.646s exact marker、70.646s `TransitionCandidate apply=1`，AFE/heap健康且零panic/WDT。RTS热启未捕获SD/seed，PSRAM约32.5MB，验收器仅marker/no-reboot PASS；物理冷启前不验表情、不计V2。
+- V2裁决：用户体感“还可以”，联合脚本全PASS。冷启SD/seed 6/6，generation 1..9、mouth_arm=16、mouth_blit=43；`MouthReduced`多次defer且`MouthOnly`恢复latest-only，4次退出重武装205/203/205/204ms，第二轮wake→Listening 225ms，panic/reboot=0。日志中`resume level=MouthReduced`仅发生在life source转不可用后清deferred，未提交life，属探针措辞假阳性；后续裁决只认`resume level=MouthOnly`，不为此重烧。M2c V2通过，进入滚动V3。

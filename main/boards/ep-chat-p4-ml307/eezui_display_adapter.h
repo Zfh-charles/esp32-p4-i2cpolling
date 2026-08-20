@@ -74,6 +74,7 @@ protected:
     std::string current_emotion_name_;
 
     void SetupUI();
+    void SetupBatteryUI();
     void StartTypewriterEffect(const std::string& text);
     void StopTypewriterEffect();
     void UpdateDialogueBoxHeight();
@@ -106,6 +107,7 @@ public:
 
     virtual void SetEmotion(const char* emotion) override;
     virtual void SetChatMessage(const char* role, const char* content) override;
+    virtual void UpdateStatusBar(bool update_all = false) override;
 
     esp_err_t ForceStopAndSwitchEmotion(const char* emotion_name);
 
@@ -225,17 +227,26 @@ private:
     /** s1cp-g: uniform full-frame enter then hold on seed (no band MID). */
     void StartFaceEnterTransition(const char* emotion_name);
     /** s1cr-h: bind layered mouth + arm speak-time mouth follow (no-op without SD pack). */
-    void ArmMouthFollow(const char* emotion_name);
+    bool ArmMouthFollow(const char* emotion_name, bool base_already_present = false);
     void StopMouthFollow(const char* why);
     void MouthFollowTick();
     esp_err_t PresentMouthPatch(uint8_t level);
     esp_err_t PresentLifeBand(uint8_t track, uint8_t frame);
+    esp_err_t PresentReleaseBand(uint8_t frame);
+    bool ArmEmotionEnter(const char* emotion_name);
+    bool ArmEmotionRelease(const char* why);
+    void StopEmotionRelease(const char* why);
+    void EmotionReleaseTick();
     esp_err_t PresentEyePatch(uint8_t level);
     esp_err_t PresentPoseBase(uint8_t pose);
     /** s1as: idle standby ROI breathe — budgeted cycle, rest back to seed bookmark. */
     void ArmIdleBreathe(const char* why);
     void StopIdleBreathe(const char* why);
     void IdleBreatheTick();
+    bool ArmIdleBacklightBreathe(const char* why);
+    void StopIdleBacklightBreathe(const char* why);
+    void IdleBacklightBreatheTick();
+    static void IdleBacklightBreatheTimerCb(void* arg);
     bool EnsureFaceAnimTimer();
     void FacePanelAnimTick();
     static void FacePanelAnimTimerCb(void* arg);
@@ -247,6 +258,16 @@ private:
     void CancelIdleHideTimer();
 
     ScreenPresenter* presenter_ = nullptr;
+    lv_obj_t* battery_panel_ = nullptr;
+    lv_obj_t* battery_gauge_ = nullptr;
+    lv_obj_t* battery_body_ = nullptr;
+    lv_obj_t* battery_fill_ = nullptr;
+    lv_obj_t* battery_tip_ = nullptr;
+    lv_obj_t* battery_percent_label_ = nullptr;
+    int last_battery_level_ = -1;
+    bool last_battery_charging_ = false;
+    bool last_battery_low_ = false;
+    int64_t last_battery_update_us_ = 0;
     bool bypass_lvgl_stopped_ = false;
     PanelOwner panel_owner_ = PanelOwner::kLvgl;
     uint8_t* last_bypass_rgb_ = nullptr;
@@ -275,15 +296,25 @@ private:
     bool face_anim_enter_mode_ = false;
     /** s1cr-h: speaking mouth patch follow (independent of enter/MID). */
     bool mouth_follow_ = false;
+    /** Keep a just-committed strong emotion visible when cloud TTS has no audio. */
+    bool strong_emotion_hold_pending_ = false;
+    int64_t strong_emotion_hold_until_us_ = 0;
+    /** s1et: angry/sad -> standby hub, one precomposited <=48-row band per tick. */
+    bool emotion_release_active_ = false;
+    bool emotion_release_entering_ = false;
+    uint8_t emotion_release_frame_ = 0;
     uint8_t mouth_pose_ = 0;
     /** Displayed mouth pose. Target PCM level is rate-limited to avoid hard jumps. */
     uint8_t mouth_visual_level_ = 0;
+    uint8_t mouth_budget_phase_ = 0;
+    uint8_t mouth_budget_logged_level_ = 0xff;
     uint8_t pose_blink_stage_ = 0;
     bool pose_blink_will_swap_ = false;
     int64_t eye_blink_due_us_ = 0;
     int64_t pose_switch_due_us_ = 0;
     uint8_t life_target_pose_ = 0;
     uint8_t life_blend_stage_ = 0;
+    bool life_budget_deferred_ = false;
     int64_t life_due_us_ = 0;
     /** s1bl: frames advanced per MID tick after prime (1 = consecutive). */
     uint32_t face_anim_arc_step_ = 1;
@@ -297,6 +328,10 @@ private:
     bool face_band_cap_bot_ = false;
     /** s1as: idle-only standby micro-motion (not speak loop_continue). */
     bool idle_breathe_ = false;
+    /** s1ep-k: standby life assets replace legacy 400-row MJPEG breathe. */
+    bool idle_breathe_small_life_ = false;
+    uint8_t idle_life_track_ = 0;
+    uint8_t idle_life_frame_ = 0;
     bool idle_breathe_need_prime_ = false;
     int idle_breathe_left_ = 0;
     uint32_t idle_breathe_gen_ = 0;
@@ -304,6 +339,12 @@ private:
     uint32_t idle_breathe_arc_step_ = 1;
     /** s1by: absolute MJPEG frame index for next decode_at (O(1) per tick). */
     uint32_t idle_breathe_frame_idx_ = 0;
+    /** s1fd: PSRAM-free standby life via low-amplitude PWM backlight pulse. */
+    esp_timer_handle_t idle_backlight_timer_ = nullptr;
+    bool idle_backlight_breathe_ = false;
+    uint8_t idle_backlight_base_ = 0;
+    uint8_t idle_backlight_last_command_ = 0;
+    uint8_t idle_backlight_phase_ = 0;
     /** LLM emotion arrived on listen edge — play when speaking starts. */
     std::string pending_face_emo_;
     /** Idle breathe (or other) currently holds AfeFetchGate — s1cn-c must not nest-lock. */

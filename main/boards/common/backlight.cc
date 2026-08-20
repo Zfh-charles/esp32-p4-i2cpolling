@@ -67,6 +67,22 @@ void Backlight::SetBrightness(uint8_t brightness, bool permanent) {
     ESP_LOGI(TAG, "Set brightness to %d", brightness);
 }
 
+void Backlight::SetBrightnessQuiet(uint8_t brightness) {
+    if (brightness > 100) {
+        brightness = 100;
+    }
+    if (brightness_ == brightness) {
+        return;
+    }
+    target_brightness_ = brightness;
+    step_ = (target_brightness_ > brightness_) ? 1 : -1;
+    if (transition_timer_ != nullptr) {
+        // The idle pulse changes at most one percentage point per 300 ms, so
+        // this short existing transition always settles before the next step.
+        esp_timer_start_periodic(transition_timer_, 5 * 1000);
+    }
+}
+
 void Backlight::OnTransitionTimer() {
     if (brightness_ == target_brightness_) {
         esp_timer_stop(transition_timer_);
@@ -118,4 +134,3 @@ void PwmBacklight::SetBrightnessImpl(uint8_t brightness) {
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty_cycle);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
-

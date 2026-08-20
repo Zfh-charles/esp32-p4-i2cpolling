@@ -14,8 +14,8 @@
 #include "debug/afe_fetch_gate.h"
 
 #define TAG "BootTrace"
-// s1db: behavior-preserving extract (ShowFaceCanvasLayers / band ROI helpers); paths = s1da.
-#define FW_MARKER "boot_trace_v10_s1eo_reminder_defer_spk_noop"
+// s1fp: behavior-preserving smell extract — name LVGL lock budgets (values = s1fo).
+#define FW_MARKER "boot_trace_v10_s1fp_smell_lock_names"
 
 namespace {
 
@@ -38,6 +38,7 @@ struct PhaseEntry {
 };
 
 int64_t g_boot_us = 0;
+bool g_marker_echoed = false;
 // BootTraceMark is called from Core0 audio/network tasks and the Core1 face worker.
 // A std::deque here used to mutate its allocator state concurrently and eventually
 // crashed in RecordPhase with heap poison (0xBAAD5678).  Keep tracing allocation-free.
@@ -159,6 +160,7 @@ void RegisterCrashHandlers() {
 
 void BootTraceInit() {
     g_boot_us = esp_timer_get_time();
+    g_marker_echoed = false;
     RegisterCrashHandlers();
 
     if (g_rtc_boot_magic != 0xB0070002) {
@@ -219,6 +221,17 @@ void BootTraceInit() {
     AfeFetchGateBootReportAndReset();
 
     RecordPhase("APP_MAIN", ResetReasonName(reason), true);
+}
+
+void BootTraceMaybeEchoMarker() {
+    // The P4 USB serial port can enumerate after the early boot marker has
+    // already passed. Echo it once after startup settles so a soak log can be
+    // attributed to the exact firmware without adding another timer or task.
+    if (g_marker_echoed || BootMs() < 60000) {
+        return;
+    }
+    g_marker_echoed = true;
+    ESP_LOGI(TAG, "FW_MARKER %s echo=delayed_once", FW_MARKER);
 }
 
 void BootTraceMark(const char* phase, const char* detail) {

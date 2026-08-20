@@ -9,7 +9,9 @@
 
 | 包 | 本地路径 | 角色 |
 |----|----------|------|
-| **v4 temporal feather** | `mjpeg_ai_dialogue_v4_temporal_feather` | 当前推荐：canonical 预合成 + A8 羽化 + 双 48 行 life 轨 |
+| **v5 activity feather** | `mjpeg_ai_dialogue_v5_activity_feather` | 当前上板回退基线：canonical 活动岛嘴层 + 双 48 行 life 候选 |
+| v5p2 semantic life | `mjpeg_ai_dialogue_v5p2_semantic_life` | 离线候选：happy 只批准下方身体/衣饰微动，拒绝上方头发轨 |
+| v5p4 mouth-focus soft-seam | `mjpeg_ai_dialogue_v5p4_mouth_focus_soft_seam` | 离线候选：v5p3 头发语义门 + 四个非强情绪 medium/large 软接缝；夜间长泡期间不部署 |
 | v2 canonical | `mjpeg_ai_dialogue_v2_canonical` | 无 life 的基线 layered 包 |
 | posebank | `mjpeg_ai_dialogue_v2_posebank` | **实验**，眨眼已回退，勿当正式包 |
 | 旧 v2 / v3 | `mjpeg_ai_dialogue_v2` / `_v3_life_v1` | 归档参考，勿再发布 |
@@ -35,12 +37,43 @@ python dialogue_emotion_builder.py --input "C:\bake\mjpeg_ai" --output "C:\bake\
 
 `--profile` 可覆盖自动 ROI/分段；改完必须重校验。
 
+life 的运动分数只负责找候选，正式素材应使用语义批准门。例如只保留 happy 的自动候选 track 1：
+
+```powershell
+python dialogue_emotion_builder.py --input "C:\bake\xiaozhi-p4-epdainaozhong0109\release_source_v5_exact" --output "C:\bake\xiaozhi-p4-epdainaozhong0109\mjpeg_ai_dialogue_v5p2_semantic_life" --profile "C:\bake\xiaozhi-p4-epdainaozhong0109\mjpeg_ai_dialogue_v5_activity_feather\profile.generated.json" --force-layered --skip-strong-hub --skip-release-layer --life-approved-tracks happy:1
+```
+
+`profile.generated.json` 会保存 `life_track_policy`。不同素材的 track id 不具备通用语义，必须重新看 `life_preview.gif` 后批准；禁止在固件里硬编码“永远关闭 track 0”。
+
+P-seam 候选只扩大四个非强情绪的 medium/large 活动岛软过渡，不改 MJPEG、ROI 或固件协议：
+
+```powershell
+python dialogue_emotion_builder.py --input "C:\bake\xiaozhi-p4-epdainaozhong0109\release_source_v5_exact" --output "C:\bake\xiaozhi-p4-epdainaozhong0109\mjpeg_ai_dialogue_v5p1_p_seam_candidate" --profile "C:\bake\xiaozhi-p4-epdainaozhong0109\mjpeg_ai_dialogue_v5_activity_feather\profile.generated.json" --force-layered --max-mouth-soften 1.5 --skip-strong-hub --skip-release-layer
+```
+
+该输出默认仅供离线查看 `mouth_roi_preview*.png` 与 `mouth_seam_heatmap.png`；未完成人工观感门前不要复制到 SD。
+
+合并当前 v5p3 的头发语义门与 P-seam 时，两项批准必须显式写出，避免重新放出 standby/happy 的上方头发轨：
+
+```powershell
+python dialogue_emotion_builder.py --input "C:\bake\xiaozhi-p4-epdainaozhong0109\release_source_v5_exact" --output "C:\bake\xiaozhi-p4-epdainaozhong0109\mjpeg_ai_dialogue_v5p4_mouth_focus_soft_seam" --profile "C:\bake\xiaozhi-p4-epdainaozhong0109\mjpeg_ai_dialogue_v5_activity_feather\profile.generated.json" --force-layered --max-mouth-soften 1.5 --skip-strong-hub --skip-release-layer --life-approved-tracks standby:1 --life-approved-tracks happy:1
+```
+
 ## 输出要点
 
 - `pack_manifest.json`：六表情入口与 render 能力
 - 每情绪：`frames.mjpeg`（原样拷贝）+ `manifest.json` + `mouth/` + `eye/` RGB565
 - v4：`life/track_0`、`life/track_1`（各 ≤48 行，预合成到 canonical hold base）
 - `analysis_report.csv` / `validation_report.json`
+- `contract_report.json`：按固件真实加载边界检查六表情入口、安全相对路径、ROI、RGB565/A8尺寸与哈希、48行/单层预算及life语义批准状态
+
+已有素材包无需重建即可做只读契约检查：
+
+```powershell
+python dialogue_pack_contract.py "C:\bake\mjpeg_ai_dialogue_v5p4_mouth_focus_soft_seam"
+```
+
+`errors` 非空时禁止复制到 SD；`auto motion track is not semantically approved` 是体验警告，须看对应 `life_preview.gif` 后用 `--life-approved-tracks` 明确批准或留空禁用。
 
 固件契约：每 tick **最多一条** life 或嘴带；latest/drop-old；**禁止**再解 480×480 抠嘴；life 直接覆盖 ROI，**禁止**与上一帧累计 alpha。
 

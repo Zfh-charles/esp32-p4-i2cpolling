@@ -6,6 +6,7 @@
 #include "board.h"
 #include "settings.h"
 #include "system_info.h"
+#include "debug/afe_fetch_gate.h"
 #include "mqtt.h"
 #include <at_modem.h>
 
@@ -21,6 +22,37 @@
 #define TAG "ReminderMqtt"
 
 #if CONFIG_USE_REMINDER_POLL && CONFIG_REMINDER_MQTT_WAKE
+
+namespace {
+
+constexpr uint32_t kFailureBackoffMs[] = {30000, 60000, 120000, 300000};
+constexpr uint32_t kFailureJitterMaxMs = 15000;
+constexpr uint32_t kDelaySliceMs = 1000;
+
+class MspiNetworkScope {
+public:
+    MspiNetworkScope() : held_(MspiBudgetGateEnterNetwork()) {}
+    ~MspiNetworkScope() {
+        if (held_) {
+            MspiBudgetGateLeaveNetwork();
+        }
+    }
+    MspiNetworkScope(const MspiNetworkScope&) = delete;
+    MspiNetworkScope& operator=(const MspiNetworkScope&) = delete;
+
+private:
+    bool held_;
+};
+
+void DisconnectWithIdleVisualQuiet(Mqtt* mqtt) {
+    if (mqtt == nullptr) {
+        return;
+    }
+    MspiNetworkScope quiet_idle_visual;
+    mqtt->Disconnect();
+}
+
+}  // namespace
 
 static void ReplaceAll(std::string& str, const std::string& from, const std::string& to) {
     if (from.empty()) {
@@ -182,7 +214,7 @@ void ReminderMqttWake::Stop() {
         }
     }
     if (mqtt_) {
-        mqtt_->Disconnect();
+        DisconnectWithIdleVisualQuiet(mqtt_.get());
         vTaskDelay(pdMS_TO_TICKS(50));
         mqtt_.reset();
     }
@@ -244,7 +276,7 @@ bool ReminderMqttWake::ConnectOnce() {
 
     // 旧连接残留：本任务内先安全释放
     if (mqtt_) {
-        mqtt_->Disconnect();
+        DisconnectWithIdleVisualQuiet(mqtt_.get());
         vTaskDelay(pdMS_TO_TICKS(50));
         mqtt_.reset();
     }
@@ -278,7 +310,12 @@ bool ReminderMqttWake::ConnectOnce() {
         return false;
     }
     BootTraceMark("MQTT_CONN_BEG", "at");
-    if (!mqtt_->Connect(broker_address, broker_port, client_id, username, password)) {
+    bool connected = false;
+    {
+        MspiNetworkScope quiet_idle_visual;
+        connected = mqtt_->Connect(broker_address, broker_port, client_id, username, password);
+    }
+    if (!connected) {
         ESP_LOGW(TAG, "MQTT wake connect failed");
         mqtt_.reset();
         BootTraceMark("MQTT_END", "conn_fail");
@@ -287,7 +324,7 @@ bool ReminderMqttWake::ConnectOnce() {
     BootTraceMark("MQTT_CONN_OK", "at");
 
     if (!running_) {
-        mqtt_->Disconnect();
+        DisconnectWithIdleVisualQuiet(mqtt_.get());
         vTaskDelay(pdMS_TO_TICKS(50));
         mqtt_.reset();
         BootTraceMark("MQTT_END", "stop_post");
@@ -295,9 +332,14 @@ bool ReminderMqttWake::ConnectOnce() {
     }
 
     BootTraceMark("MQTT_SUB_BEG", "at");
-    if (!mqtt_->Subscribe(subscribe_topic)) {
+    bool subscribed = false;
+    {
+        MspiNetworkScope quiet_idle_visual;
+        subscribed = mqtt_->Subscribe(subscribe_topic);
+    }
+    if (!subscribed) {
         ESP_LOGW(TAG, "MQTT wake subscribe failed: %s", subscribe_topic.c_str());
-        mqtt_->Disconnect();
+        DisconnectWithIdleVisualQuiet(mqtt_.get());
         vTaskDelay(pdMS_TO_TICKS(50));
         mqtt_.reset();
         BootTraceMark("MQTT_END", "sub_fail");
@@ -314,7 +356,11 @@ bool ReminderMqttWake::ConnectOnce() {
     BootTraceMark("MQTT_WAIT", "alive");
     while (running_ && mqtt_) {
         BootTraceMark("MQTT_STATE_BEG", "chk");
-        const bool connected = mqtt_->IsConnected();
+        bool connected = false;
+        {
+            MspiNetworkScope quiet_idle_visual;
+            connected = mqtt_->IsConnected();
+        }
         BootTraceMark("MQTT_STATE_OK", connected ? "1" : "0");
         if (!connected) {
             break;
@@ -327,7 +373,7 @@ bool ReminderMqttWake::ConnectOnce() {
 
     if (mqtt_) {
         BootTraceMark("MQTT_DISC_BEG", "disc");
-        mqtt_->Disconnect();
+        DisconnectWithIdleVisualQuiet(mqtt_.get());
         vTaskDelay(pdMS_TO_TICKS(50)); // 给 UART URC 回调退场
         mqtt_.reset();
         BootTraceMark("MQTT_DISC_END", "ok");
@@ -339,12 +385,48 @@ bool ReminderMqttWake::ConnectOnce() {
 void ReminderMqttWake::MqttTask() {
     ESP_LOGI(TAG, "task start");
     BootTraceMark("MQTT_TASK", "start");
+
+    // Failed connections use jittered exponential backoff so a dead reminder
+    // endpoint cannot create a permanent 40-second hammer. The first MQTT
+    // connection remains immediate so proactive reminders are ready at boot.
+    auto delay_while_running = [this](uint32_t delay_ms) {
+        while (running_ && delay_ms > 0) {
+            const uint32_t slice_ms = delay_ms < kDelaySliceMs ? delay_ms : kDelaySliceMs;
+            vTaskDelay(pdMS_TO_TICKS(slice_ms));
+            delay_ms -= slice_ms;
+        }
+    };
+
+    uint32_t failure_streak = 0;
     while (running_) {
         if (!ConnectOnce()) {
-            // s1aw: 失败退避拉长，减少与 HTTP poll 同 UART 连打
-            vTaskDelay(pdMS_TO_TICKS(30000));
+            if (failure_streak < UINT32_MAX) {
+                ++failure_streak;
+            }
+            const size_t last = (sizeof(kFailureBackoffMs) / sizeof(kFailureBackoffMs[0])) - 1;
+            const size_t index = failure_streak - 1 < last ? failure_streak - 1 : last;
+            const uint32_t base_ms = kFailureBackoffMs[index];
+            const uint32_t jitter_seed = static_cast<uint32_t>(xTaskGetTickCount()) ^
+                                         (failure_streak * 2654435761U);
+            const uint32_t jitter_ms = jitter_seed % (kFailureJitterMaxMs + 1U);
+            const uint32_t delay_ms = base_ms + jitter_ms;
+            char detail[32];
+            snprintf(detail, sizeof(detail), "n=%lu wait=%lu",
+                     static_cast<unsigned long>(failure_streak),
+                     static_cast<unsigned long>(delay_ms));
+            ESP_LOGW(TAG,
+                     "MQTT_FAIL_BACKOFF streak=%u base_ms=%u jitter_ms=%u delay_ms=%u s1fj",
+                     static_cast<unsigned>(failure_streak), static_cast<unsigned>(base_ms),
+                     static_cast<unsigned>(jitter_ms), static_cast<unsigned>(delay_ms));
+            BootTraceMark("MQTT_BACKOFF", detail);
+            delay_while_running(delay_ms);
         } else {
-            vTaskDelay(pdMS_TO_TICKS(10000));
+            if (failure_streak > 0) {
+                ESP_LOGI(TAG, "MQTT_FAIL_BACKOFF recovered previous_streak=%u s1fj",
+                         static_cast<unsigned>(failure_streak));
+            }
+            failure_streak = 0;
+            delay_while_running(10000);
         }
     }
     ESP_LOGI(TAG, "task exit");

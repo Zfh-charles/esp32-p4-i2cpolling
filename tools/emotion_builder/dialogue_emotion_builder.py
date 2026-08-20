@@ -16,12 +16,16 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
+from dialogue_pack_contract import validate_pack
+
 
 EMOTIONS = ("standby", "neutral", "happy", "sad", "angry", "loving")
 MOUTH_LEVELS = ("closed", "small", "medium", "large")
 EYE_LEVELS = ("open", "half", "closed")
 LIFE_TRACK_ROWS = 48
 LIFE_SEQUENCE_OFFSETS = (0, 1, 2, 3, 4, 3, 2, 1, 0)
+RELEASE_TRACK_ROWS = 48
+RELEASE_EMOTIONS = ("sad", "angry")
 
 
 @dataclass(frozen=True)
@@ -194,16 +198,17 @@ def risk_report(frames: list[Frame], picks: dict[str, int], rect: dict, width: i
 
 
 def mouth_composite(base: np.ndarray, candidate: np.ndarray, rect: dict,
-                    feather_px: int, align_px: int) -> tuple[np.ndarray, dict]:
-    """Align a mouth candidate to the canonical hold base and fade its edge to that base."""
+                    feather_px: int, align_px: int,
+                    activity_expand_px: int = 7) -> tuple[np.ndarray, dict]:
+    """Align a mouth candidate and keep only softly dilated local activity."""
     x, y, w, h = rect["x"], rect["y"], rect["width"], rect["height"]
     base_patch = base[y:y+h, x:x+w].astype(np.float32)
     feather = max(2, min(int(feather_px), max(2, min(w, h) // 3)))
     yy, xx = np.mgrid[0:h, 0:w]
     edge = np.minimum.reduce((xx, yy, w - 1 - xx, h - 1 - yy)).astype(np.float32)
-    alpha = np.clip(edge / float(feather), 0.0, 1.0)
-    alpha = alpha * alpha * (3.0 - 2.0 * alpha)
-    border = alpha < 0.55
+    edge_alpha = np.clip(edge / float(feather), 0.0, 1.0)
+    edge_alpha = edge_alpha * edge_alpha * (3.0 - 2.0 * edge_alpha)
+    border = edge_alpha < 0.55
 
     best_score, best_patch, best_shift = float("inf"), None, (0, 0)
     for dy in range(-align_px, align_px + 1):
@@ -217,12 +222,65 @@ def mouth_composite(base: np.ndarray, candidate: np.ndarray, rect: dict,
                 best_score, best_patch, best_shift = score, patch, (dx, dy)
     if best_patch is None:
         best_patch = candidate[y:y+h, x:x+w].astype(np.float32)
+    # Suppress low-level whole-frame/JPEG drift inside the rectangular ROI;
+    # keep only a softly expanded mouth activity island.
+    motion = np.mean(np.abs(best_patch - base_patch), axis=2)
+    activity = np.clip((motion - 4.0) / 12.0, 0.0, 1.0)
+    expand = max(3, min(21, int(activity_expand_px)))
+    if expand % 2 == 0:
+        expand += 1
+    activity_img = Image.fromarray(np.uint8(np.rint(activity * 255.0)), "L")
+    activity_img = activity_img.filter(ImageFilter.MaxFilter(expand)).filter(
+        ImageFilter.GaussianBlur(radius=max(4.0, feather * 0.70)))
+    activity_alpha = np.asarray(activity_img, dtype=np.float32) / 255.0
+    # Mouth assets frequently include moving neckline/hair at the ROI corners.
+    # A soft central-upper prior rejects those pixels without introducing a
+    # new hard contour. Profiles can still move/resize the ROI per material.
+    nx = (xx - (w - 1) * 0.50) / max(1.0, w * 0.43)
+    ny = (yy - (h - 1) * 0.32) / max(1.0, h * 0.52)
+    spatial = np.clip(1.0 - (nx * nx + ny * ny), 0.0, 1.0)
+    spatial = spatial * spatial * (3.0 - 2.0 * spatial)
+    alpha = edge_alpha * activity_alpha * spatial
     composed = best_patch * alpha[:, :, None] + base_patch * (1.0 - alpha[:, :, None])
     composed = np.clip(np.rint(composed), 0, 255).astype(np.uint8)
-    edge_delta = float(np.mean(np.abs(composed[edge <= 1].astype(np.float32) - base_patch[edge <= 1])))
+    delta = np.mean(np.abs(composed.astype(np.float32) - base_patch), axis=2)
+    rings = {}
+    for name, lo, hi in (("outer", 0, 2), ("near", 2, 5), ("inner", 5, 9)):
+        ring = (edge >= lo) & (edge < hi)
+        rings[name] = round(float(delta[ring].mean()) if ring.any() else 0.0, 3)
+    seam_score = max(rings["outer"], rings["near"] * 0.60, rings["inner"] * 0.35)
+    transition = (alpha > 0.05) & (alpha < 0.95)
+    transition_p95 = float(np.percentile(delta[transition], 95)) if transition.any() else 0.0
+    alpha_step = np.maximum(
+        np.pad(np.abs(np.diff(alpha, axis=1)), ((0, 0), (0, 1))),
+        np.pad(np.abs(np.diff(alpha, axis=0)), ((0, 1), (0, 0))),
+    )
+    alpha_step_p95 = float(np.percentile(alpha_step[transition], 95)) if transition.any() else 0.0
     return composed, {"dx": best_shift[0], "dy": best_shift[1],
                       "border_match_delta": round(best_score, 3),
-                      "composite_edge_delta": round(edge_delta, 3)}
+                      "activity_expand_px": expand,
+                      "composite_edge_delta": rings["outer"],
+                      "composite_ring_delta": rings,
+                      "composite_seam_score": round(seam_score, 3),
+                      "transition_delta_p95": round(transition_p95, 3),
+                      "alpha_step_p95": round(alpha_step_p95, 4)}
+
+
+def save_seam_heatmap(base: np.ndarray, patches: dict[str, np.ndarray], rect: dict,
+                      target: Path) -> None:
+    """Visual audit of residual patch-vs-canonical-base deltas."""
+    x, y, w, h = rect["x"], rect["y"], rect["width"], rect["height"]
+    base_patch = base[y:y+h, x:x+w].astype(np.float32)
+    peak = np.maximum.reduce([
+        np.mean(np.abs(p.astype(np.float32) - base_patch), axis=2) for p in patches.values()
+    ])
+    heat = np.uint8(np.clip(peak * 12.0, 0, 255))
+    heat_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    heat_rgb[:, :, 0] = heat
+    heat_rgb[:, :, 1] = np.uint8(np.clip(255 - np.abs(heat.astype(np.int16) - 128) * 2, 0, 255))
+    heat_rgb[:, :, 2] = 255 - heat
+    Image.fromarray(heat_rgb, "RGB").resize(
+        (w * 3, h * 3), Image.Resampling.NEAREST).save(target)
 
 
 def save_patch_array(patch: np.ndarray, target: Path, quality: int) -> None:
@@ -236,6 +294,16 @@ def save_rgb565_array(patch: np.ndarray, target: Path) -> None:
     b = (patch[:, :, 2].astype(np.uint16) >> 3)
     pix = ((r << 11) | (g << 5) | b).astype("<u2")
     target.write_bytes(pix.tobytes())
+
+
+def load_rgb565_array(source: Path, width: int, height: int) -> np.ndarray:
+    """Load a generated RGB565 surface back to RGB888 for deterministic recomposition."""
+    pix = np.frombuffer(source.read_bytes(), dtype="<u2").reshape((height, width))
+    r = ((pix >> 11) & 0x1f).astype(np.uint8)
+    g = ((pix >> 5) & 0x3f).astype(np.uint8)
+    b = (pix & 0x1f).astype(np.uint8)
+    return np.stack(((r << 3) | (r >> 2), (g << 2) | (g >> 4),
+                     (b << 3) | (b >> 2)), axis=2)
 
 
 def _aligned_span(active: np.ndarray, limit: int, alignment: int = 8) -> tuple[int, int]:
@@ -253,8 +321,21 @@ def _aligned_span(active: np.ndarray, limit: int, alignment: int = 8) -> tuple[i
 
 
 def build_life_layer(frames: list[Frame], hold: dict, base_frame: int, base: np.ndarray,
-                     mouth_rect: dict, eye_rect: dict, out: Path, emotion: str) -> dict:
+                     mouth_rect: dict, eye_rect: dict, out: Path, emotion: str,
+                     track_policy: dict | None = None) -> dict:
     """Generate same-generation, pre-cropped RGB565+alpha life tracks."""
+    track_policy = track_policy or {}
+    approved_raw = track_policy.get("approved_auto_tracks")
+    approved_tracks = None
+    if approved_raw is not None:
+        if (not isinstance(approved_raw, list) or
+                any(not isinstance(v, int) or v not in (0, 1) for v in approved_raw) or
+                len(set(approved_raw)) != len(approved_raw)):
+            raise ValueError("life_track_policy.approved_auto_tracks must be unique track ids 0/1")
+        approved_tracks = set(approved_raw)
+    semantic_labels = track_policy.get("semantic_labels", {})
+    if not isinstance(semantic_labels, dict):
+        raise ValueError("life_track_policy.semantic_labels must be an object")
     height, width = base.shape[:2]
     direction = 1 if base_frame + 4 <= hold["end"] else -1
     ids = [max(hold["start"], min(hold["end"], base_frame + direction * n))
@@ -276,6 +357,11 @@ def build_life_layer(frames: list[Frame], hold: dict, base_frame: int, base: np.
     previews = [base.copy() for _ in arrays]
     tracks = []
     for track_id, (search_y0, search_y1) in enumerate(track_ranges):
+        # Auto motion is only a candidate detector.  A profile may approve the
+        # semantically useful tracks (for example body breathing) and reject a
+        # visually distracting hair/accessory-only track without firmware hacks.
+        if approved_tracks is not None and track_id not in approved_tracks:
+            continue
         if search_y1 - search_y0 < LIFE_TRACK_ROWS:
             continue
         row_score = motion.mean(axis=1)
@@ -323,6 +409,8 @@ def build_life_layer(frames: list[Frame], hold: dict, base_frame: int, base: np.
                             "peak_alpha": int(alpha.max()),
                             "active_ratio": round(float(np.count_nonzero(alpha)) / alpha.size, 4)})
         tracks.append({"id": track_id, "roi": roi, "motion_score": round(best_score, 3),
+                       "semantic": semantic_labels.get(str(track_id), "auto_unreviewed"),
+                       "approval": "profile" if approved_tracks is not None else "auto_unreviewed",
                        "frames": entries})
 
     generation_seed = (sha256(base.tobytes()) + emotion + json.dumps(ids) +
@@ -339,6 +427,185 @@ def build_life_layer(frames: list[Frame], hold: dict, base_frame: int, base: np.
             "sequence_ms": 120, "sequence": ids, "max_tracks_per_tick": 1,
             "schedule": "interleave_latest_drop_old", "tracks": tracks,
             "preview": "life/life_preview.gif"}
+
+
+def _release_rect(rect: dict, width: int, height: int) -> dict[str, int]:
+    """Keep a facial release patch inside one display row-band."""
+    w = min(width, int(rect["width"]))
+    h = min(RELEASE_TRACK_ROWS, int(rect["height"]), height)
+    x = max(0, min(width - w, int(rect["x"])))
+    center_y = int(rect["y"]) + int(rect["height"]) // 2
+    y = max(0, min(height - h, center_y - h // 2))
+    return {"x": x, "y": y, "width": w, "height": h}
+
+
+def _release_composite(base: np.ndarray, candidate: np.ndarray, rect: dict) -> np.ndarray:
+    """Precompose an exit crop against the emotion hold base with soft edges."""
+    x, y, w, h = rect["x"], rect["y"], rect["width"], rect["height"]
+    src = candidate[y:y+h, x:x+w].astype(np.float32)
+    dst = base[y:y+h, x:x+w].astype(np.float32)
+    yy, xx = np.mgrid[0:h, 0:w]
+    edge = np.minimum.reduce((xx, yy, w - 1 - xx, h - 1 - yy)).astype(np.float32)
+    alpha = np.clip(edge / 8.0, 0.0, 1.0)
+    alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+    return np.clip(np.rint(src * alpha[:, :, None] + dst * (1.0 - alpha[:, :, None])),
+                   0, 255).astype(np.uint8)
+
+
+def build_release_layer(frames: list[Frame], exit_seg: dict, base_frame: int,
+                        base: np.ndarray, mouth_rect: dict, eye_rect: dict,
+                        out: Path, emotion: str) -> dict | None:
+    """Generate a cheap strong-emotion release: close mouth, then relax eye/mouth bands."""
+    if emotion not in RELEASE_EMOTIONS:
+        return None
+    height, width = base.shape[:2]
+    mouth = _release_rect(mouth_rect, width, height)
+    eye = _release_rect(eye_rect, width, height)
+    mid = int(round(exit_seg["start"] + (exit_seg["end"] - exit_seg["start"]) * 0.55))
+    end = int(round(exit_seg["start"] + (exit_seg["end"] - exit_seg["start"]) * 0.92))
+    # One patch per worker tick.  First restore the canonical closed mouth,
+    # then alternate eye/mouth so no tick submits two display bands.
+    schedule = (("mouth", base_frame, mouth), ("eye", mid, eye),
+                ("mouth", mid, mouth), ("eye", end, eye), ("mouth", end, mouth))
+    root = out / "release"
+    root.mkdir(exist_ok=True)
+    preview = base.copy()
+    previews = []
+    entries = []
+    for seq, (region, frame_id, rect) in enumerate(schedule):
+        candidate = base if frame_id == base_frame else rgb(frames[frame_id])
+        patch = _release_composite(base, candidate, rect)
+        target = root / f"{seq:02d}_{region}.rgb565"
+        save_rgb565_array(patch, target)
+        x, y, w, h = rect["x"], rect["y"], rect["width"], rect["height"]
+        preview[y:y+h, x:x+w] = patch
+        previews.append(Image.fromarray(preview.copy(), "RGB"))
+        entries.append({"sequence": seq, "region": region, "source_frame": frame_id,
+                        "roi": rect, "rgb565": f"release/{target.name}",
+                        "rgb565_sha256": sha256(target.read_bytes())})
+    previews[0].save(root / "release_preview.gif", save_all=True,
+                     append_images=previews[1:], duration=90, loop=0)
+    generation_seed = (emotion + sha256(base.tobytes()) + json.dumps(entries, sort_keys=True)).encode("utf-8")
+    return {"schema": "dialogue-release-layer-v1",
+            "generation_id": sha256(generation_seed)[:20],
+            "composite_mode": "canonical_base_precomposited_v1",
+            "base_rgb565_sha256": sha256((out / "hold_base.rgb565").read_bytes()),
+            "enabled_default": True, "interval_ms": 90,
+            "max_bands_per_tick": 1, "frames": entries,
+            "preview": "release/release_preview.gif"}
+
+
+def _split_transition_rois(rects: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
+    """Split feature islands so every transition tick remains within one 48-row band."""
+    result = []
+    for name, rect in rects:
+        y, h = int(rect["y"]), int(rect["height"])
+        if h <= RELEASE_TRACK_ROWS:
+            result.append((name, dict(rect)))
+            continue
+        top_h = h // 2
+        result.append((name + "_top", {**rect, "height": top_h}))
+        result.append((name + "_bottom", {**rect, "y": y + top_h,
+                                           "height": h - top_h}))
+    return result
+
+
+def _build_hub_track(start: np.ndarray, end: np.ndarray,
+                     rects: list[tuple[str, dict]], root: Path,
+                     prefix: str, interval_ms: int = 75) -> dict:
+    """Two-stage eased feature transition; final patches are exact target pixels."""
+    root.mkdir(exist_ok=True)
+    entries, previews = [], []
+    canvas = start.copy()
+    regions = _split_transition_rois(rects)
+    for stage, alpha in enumerate((0.5, 1.0)):
+        eased = alpha * alpha * (3.0 - 2.0 * alpha)
+        for region, rect in regions:
+            x, y, w, h = (int(rect[k]) for k in ("x", "y", "width", "height"))
+            if alpha >= 1.0:
+                patch = end[y:y+h, x:x+w].copy()
+            else:
+                a = start[y:y+h, x:x+w].astype(np.float32)
+                b = end[y:y+h, x:x+w].astype(np.float32)
+                patch = np.clip(np.rint(a * (1.0 - eased) + b * eased), 0, 255).astype(np.uint8)
+            target = root / f"{len(entries):02d}_{region}.rgb565"
+            save_rgb565_array(patch, target)
+            canvas[y:y+h, x:x+w] = patch
+            previews.append(Image.fromarray(canvas.copy(), "RGB"))
+            entries.append({"sequence": len(entries), "stage": stage, "region": region,
+                            "roi": rect, "rgb565": f"{prefix}/{target.name}",
+                            "rgb565_sha256": sha256(target.read_bytes())})
+    previews[0].save(root / f"{prefix}_preview.gif", save_all=True,
+                     append_images=previews[1:], duration=interval_ms, loop=0)
+    return {"schema": "dialogue-common-hub-track-v1", "interval_ms": interval_ms,
+            "max_bands_per_tick": 1, "frames": entries,
+            "final_exact_target": True,
+            "preview": f"{prefix}/{prefix}_preview.gif"}
+
+
+def canonicalize_strong_emotion_hub(pack_root: Path, emotion: str,
+                                    quality: int) -> None:
+    """Rebase angry/sad expression islands onto standby for reversible local transitions."""
+    folder = pack_root / emotion
+    manifest_path = folder / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    standby_manifest = json.loads((pack_root / "standby" / "manifest.json").read_text(encoding="utf-8"))
+    width, height = int(manifest["source"]["width"]), int(manifest["source"]["height"])
+    standby = load_rgb565_array(pack_root / "standby" / "hold_base.rgb565", width, height)
+    native = load_rgb565_array(folder / "hold_base.rgb565", width, height)
+    mouth_rect = dict(standby_manifest["render"]["mouth_roi"])
+    eye_rect = dict(standby_manifest["render"]["eye_roi"])
+
+    # Find the source feature inside a generous alignment window, but feather it
+    # into the standby geometry.  The rest of the 480x480 canvas stays identical.
+    hub = standby.copy()
+    eye_patch, eye_align = mouth_composite(standby, native, eye_rect, 14, 32)
+    mouth_patch, mouth_align = mouth_composite(standby, native, mouth_rect, 14, 32)
+    for patch, rect in ((eye_patch, eye_rect), (mouth_patch, mouth_rect)):
+        x, y, w, h = (int(rect[k]) for k in ("x", "y", "width", "height"))
+        hub[y:y+h, x:x+w] = patch
+
+    frames = scan_mjpeg((folder / "frames.mjpeg").read_bytes())
+    mouth_levels, eye_levels = {}, {}
+    for level, item in manifest["render"]["mouth_levels"].items():
+        candidate = rgb(frames[int(item["frame"])])
+        mouth_levels[level], _ = mouth_composite(hub, candidate, mouth_rect, 14, 32)
+        save_patch_array(mouth_levels[level], folder / item["file"], quality)
+        save_rgb565_array(mouth_levels[level], folder / item["rgb565"])
+    for level, item in manifest["render"]["eye_levels"].items():
+        candidate = rgb(frames[int(item["frame"])])
+        eye_levels[level], _ = mouth_composite(hub, candidate, eye_rect, 14, 32)
+        save_patch_array(eye_levels[level], folder / item["file"], quality)
+        save_rgb565_array(eye_levels[level], folder / item["rgb565"])
+
+    Image.fromarray(hub, "RGB").save(folder / "hold_base.jpg", "JPEG",
+                                      quality=quality, optimize=True)
+    save_rgb565_array(hub, folder / "hold_base.rgb565")
+    rects = [("eye", eye_rect), ("mouth", mouth_rect)]
+    enter = _build_hub_track(standby, hub, rects, folder / "hub_enter", "hub_enter")
+    release = _build_hub_track(hub, standby, rects, folder / "hub_exit", "hub_exit")
+    base_hash = sha256((folder / "hold_base.rgb565").read_bytes())
+    enter["base_rgb565_sha256"] = base_hash
+    release["base_rgb565_sha256"] = base_hash
+    release["final_standby_rgb565_sha256"] = sha256(
+        (pack_root / "standby" / "hold_base.rgb565").read_bytes())
+
+    render = manifest["render"]
+    render["mouth_roi"], render["eye_roi"] = mouth_rect, eye_rect
+    render["hold_base"]["frame"] = -1
+    render["hold_base"]["generated"] = "standby_common_hub_v1"
+    render["pose_bank"] = {"version": 1, "count": 1,
+                           "poses": [{"id": 0, "base_frame": -1, "root": "."}]}
+    render["life_layer"] = None
+    render["enter_layer"] = enter
+    render["release_layer"] = release
+    render["common_hub"] = {"schema": "standby-common-hub-v1",
+                            "standby_rgb565_sha256": release["final_standby_rgb565_sha256"],
+                            "eye_alignment": eye_align, "mouth_alignment": mouth_align}
+    manifest["analysis"]["common_hub"] = {
+        "global_canvas_preserved": True, "transition_regions": [v for _, v in rects],
+        "entry_frames": len(enter["frames"]), "exit_frames": len(release["frames"])}
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def save_composite_preview(base: np.ndarray, patches: dict[str, np.ndarray], rect: dict,
@@ -445,23 +712,30 @@ def build_one(source: Path, out: Path, profile: dict, duration_ms: int, quality:
     pose_bases[1] = pose_bases[1].copy()
     pose_bases[1][y:y+h, x:x+w] = pose1_closed
     pose_mouth, pose_alignment = [], []
+    level_feather_scale = profile.get("mouth_level_feather_scale", {})
+    level_activity_expand = profile.get("mouth_activity_expand_px", {})
     for pose_index, pose_base in enumerate(pose_bases):
         mouth_patches, alignment = {}, {}
         for level in MOUTH_LEVELS:
             candidate = pose_base if level == "closed" else rgb(frames[picks[level]])
+            scale = max(1.0, min(2.5, float(level_feather_scale.get(level, 1.0))))
+            level_feather = max(2, int(round(feather_px * scale)))
+            level_expand = int(level_activity_expand.get(level, 7))
             mouth_patches[level], alignment[level] = mouth_composite(
-                pose_base, candidate, rect, feather_px, align_px)
+                pose_base, candidate, rect, level_feather, align_px, level_expand)
         pose_mouth.append(mouth_patches)
         pose_alignment.append(alignment)
     mouth_patches, alignment = pose_mouth[0], pose_alignment[0]
     composite_edge = max(v["composite_edge_delta"] for v in alignment.values())
+    composite_seam = max(v["composite_seam_score"] for v in alignment.values())
     risk = dict(risk)
     risk.update({"source_layered_safe": source_risk["layered_safe"],
                  "source_seam_border_delta": source_risk["seam_border_delta"],
                  "composite_edge_delta": composite_edge,
-                 "layered_safe": composite_edge <= 1.0,
-                 "recommended_render_mode": "layered" if composite_edge <= 1.0 else "full_frame_clip",
-                 "reason": "mouth patches share canonical base with feathered edges"})
+                 "composite_seam_score": composite_seam,
+                 "layered_safe": composite_seam <= 3.0,
+                 "recommended_render_mode": "layered" if composite_seam <= 3.0 else "full_frame_clip",
+                 "reason": "mouth patches use activity-masked canonical-base feathering"})
     requested_mode = profile.get("render_mode", "auto")
     if requested_mode == "auto" and profile.get("force_layered"):
         requested_mode = "layered"
@@ -507,6 +781,7 @@ def build_one(source: Path, out: Path, profile: dict, duration_ms: int, quality:
     hold_base.write_bytes(frames[picks["closed"]].data)
     save_rgb565_array(base, out / "hold_base.rgb565")
     save_composite_preview(base, mouth_patches, rect, out / "mouth_roi_preview.png", source.stem)
+    save_seam_heatmap(base, mouth_patches, rect, out / "mouth_seam_heatmap.png")
     save_preview(frames[eye_picks["open"]], eye_rect, out / "eye_roi_preview.png", f"{source.stem}: eye ROI")
 
     pose_1_dir = out / "pose_1"
@@ -524,7 +799,12 @@ def build_one(source: Path, out: Path, profile: dict, duration_ms: int, quality:
                            out / "mouth_roi_preview_pose_1.png", f"{source.stem} pose1")
 
     life_layer = build_life_layer(frames, seg["hold"], picks["closed"], base,
-                                  rect, eye_rect, out, source.stem)
+                                  rect, eye_rect, out, source.stem,
+                                  profile.get("life_track_policy"))
+    release_layer = None
+    if not profile.get("skip_release_layer"):
+        release_layer = build_release_layer(frames, seg["exit"], picks["closed"], base,
+                                            rect, eye_rect, out, source.stem)
 
     manifest = {
         "schema": "dialogue-emotion-clip-v2", "emotion": source.stem,
@@ -533,8 +813,10 @@ def build_one(source: Path, out: Path, profile: dict, duration_ms: int, quality:
         "render": {"mode": mode, "fallback": "full_frame_clip", "mouth_roi": rect,
                    "hold_base": {"frame": picks["closed"], "file": "hold_base.jpg",
                                  "rgb565": "hold_base.rgb565", "width": width, "height": height},
-                   "mouth_composite": {"method": "canonical_base_feather_v1",
+                   "mouth_composite": {"method": "canonical_base_activity_feather_v2",
                                        "feather_px": feather_px, "alignment_px": align_px,
+                                       "level_feather_scale": level_feather_scale,
+                                       "level_activity_expand_px": level_activity_expand,
                                        "levels": alignment},
                    "mouth_levels": {
                        k: {"frame": picks[k], "file": f"mouth/{k}.jpg", "rgb565": f"mouth/{k}.rgb565"}
@@ -557,11 +839,17 @@ def build_one(source: Path, out: Path, profile: dict, duration_ms: int, quality:
                      "eye_detection": eye_det,
                      "pose_bank": {"pose_1_frame": pose_1_frame, "pose_delta": pose_delta}},
     }
+    if release_layer:
+        manifest["render"]["release_layer"] = release_layer
     (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     generated = {"segments": seg, "mouth_roi": rect, "mouth_frames": picks,
                  "eye_roi": eye_rect, "eye_frames": eye_picks,
                  "pose_1_frame": pose_1_frame,
+                 "mouth_level_feather_scale": level_feather_scale,
+                 "mouth_activity_expand_px": level_activity_expand,
                  "render_mode": mode, "auto_suggested_mouth_roi": suggested_rect}
+    if "life_track_policy" in profile:
+        generated["life_track_policy"] = profile["life_track_policy"]
     return manifest, generated
 
 
@@ -620,6 +908,24 @@ def validate_clip(folder: Path, manifest: dict) -> list[str]:
                     errors.append(f"invalid life RGB565 {rgb_path.name}")
                 if not mask_path.is_file() or mask_path.stat().st_size != expected:
                     errors.append(f"invalid life mask {mask_path.name}")
+    for layer_name in ("enter_layer", "release_layer"):
+        release = manifest["render"].get(layer_name)
+        if not release:
+            continue
+        if release.get("base_rgb565_sha256") != sha256(hold_rgb.read_bytes()):
+            errors.append(f"{layer_name} base hash mismatch")
+        frames_out = release.get("frames", [])
+        if not (1 <= len(frames_out) <= 8):
+            errors.append(f"{layer_name} frame count invalid")
+        for item in frames_out:
+            roi = item.get("roi", {})
+            rh = int(roi.get("height", 0))
+            expected = int(roi.get("width", 0)) * rh * 2
+            rgb_path = folder / item.get("rgb565", "")
+            if rh <= 0 or rh > RELEASE_TRACK_ROWS:
+                errors.append(f"{layer_name} ROI exceeds {RELEASE_TRACK_ROWS} rows")
+            if not rgb_path.is_file() or rgb_path.stat().st_size != expected:
+                errors.append(f"missing or invalid {layer_name} patch {item.get('rgb565')}")
     return errors
 
 
@@ -632,10 +938,53 @@ def main() -> int:
     ap.add_argument("--quality", type=int, default=82)
     ap.add_argument("--force-layered", action="store_true",
                     help="Force render_mode=layered even when risk says unsafe (review ROI!)")
+    ap.add_argument("--max-mouth-soften", type=float, default=1.0,
+                    help="PC-only P-seam candidate: soften medium/large mouth for four non-strong emotions")
+    ap.add_argument("--skip-strong-hub", action="store_true",
+                    help="Do not generate the rejected angry/sad common-hub experiment")
+    ap.add_argument("--skip-release-layer", action="store_true",
+                    help="Keep the v5 contract: do not emit the rejected angry/sad release track")
+    ap.add_argument("--life-approved-tracks", action="append", default=[], metavar="EMOTION:IDS",
+                    help="Semantic gate for auto life candidates, e.g. happy:1 or standby:0,1")
     args = ap.parse_args()
     if args.input.resolve() == args.output.resolve() or args.input.resolve() in args.output.resolve().parents:
         raise ValueError("output must not be the input directory or inside it")
     profile = load_profile(args.profile)
+    for spec in args.life_approved_tracks:
+        emotion, sep, ids_raw = spec.partition(":")
+        if not sep or emotion not in EMOTIONS:
+            raise ValueError("--life-approved-tracks expects EMOTION:IDS with a known emotion")
+        try:
+            ids = [] if not ids_raw else [int(v) for v in ids_raw.split(",")]
+        except ValueError as exc:
+            raise ValueError("life track ids must be comma-separated integers 0/1") from exc
+        item = profile.setdefault("emotions", {}).setdefault(emotion, {})
+        item["life_track_policy"] = {
+            "approved_auto_tracks": ids,
+            "semantic_labels": {str(v): "profile_approved" for v in ids},
+        }
+    if not 1.0 <= args.max_mouth_soften <= 2.0:
+        raise ValueError("--max-mouth-soften must be in 1.0..2.0")
+    if args.max_mouth_soften > 1.0:
+        medium_scale = 1.0 + (args.max_mouth_soften - 1.0) * 0.5
+        medium_expand = int(round(7 + (args.max_mouth_soften - 1.0) * 4))
+        large_expand = int(round(7 + (args.max_mouth_soften - 1.0) * 8))
+        for value_name, value in (("medium", medium_expand), ("large", large_expand)):
+            if value % 2 == 0:
+                value += 1
+            if value_name == "medium":
+                medium_expand = value
+            else:
+                large_expand = value
+        for emotion in ("standby", "neutral", "happy", "loving"):
+            item = profile.setdefault("emotions", {}).setdefault(emotion, {})
+            item["mouth_level_feather_scale"] = {
+                "medium": round(medium_scale, 3), "large": args.max_mouth_soften}
+            item["mouth_activity_expand_px"] = {
+                "medium": medium_expand, "large": large_expand}
+    if args.skip_release_layer:
+        for emotion in EMOTIONS:
+            profile.setdefault("emotions", {}).setdefault(emotion, {})["skip_release_layer"] = True
     if args.force_layered:
         profile["force_layered"] = True
         for emo in EMOTIONS:
@@ -656,16 +1005,28 @@ def main() -> int:
                      "mode": manifest["render"]["mode"], "layered_safe": risk["layered_safe"],
                      "source_seam_delta": risk["source_seam_border_delta"],
                      "composite_edge_delta": risk["composite_edge_delta"],
+                     "composite_seam_score": risk["composite_seam_score"],
                      "global_delta": risk["global_frame_delta"]})
+    if not args.skip_strong_hub:
+        for emotion in RELEASE_EMOTIONS:
+            canonicalize_strong_emotion_hub(args.output, emotion, args.quality)
     pack = {
         "schema": "dialogue-emotion-pack-v2", "version": 2,
+        "runtime_contract": {
+            "screen": {"width": 480, "height": 480, "pixel_format": "rgb565-le"},
+            "asset_root": "/sdcard/dialogue_v2",
+            "max_rows_per_tick": LIFE_TRACK_ROWS,
+            "max_layers_per_tick": 1,
+            "delivery": "latest_drop_old",
+        },
         "state_machine": {"states": ["standby", "enter", "hold", "exit"],
                           "emotion_slots": ["requested", "pending", "committed"],
                           "tts_flow": ["enter", "hold", "exit"],
                           "mouth_signal": {"source": "smoothed_audio_rms", "levels": list(MOUTH_LEVELS),
                                            "delivery": "latest_value", "lvgl_from_audio_task": False}},
         "capabilities": ["full_frame_clip", "fixed_roi_clip", "layered", "static"],
-        "legacy_fallback": {"enabled": True, "files": [f"{e}.mjpeg" for e in EMOTIONS]},
+        "legacy_fallback": {"enabled": True, "root": "/sdcard/mjpeg",
+                            "files": [f"{e}.mjpeg" for e in EMOTIONS]},
         "clips": clips,
     }
     (args.output / "pack_manifest.json").write_text(json.dumps(pack, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -678,6 +1039,12 @@ def main() -> int:
         manifest = json.loads((args.output / rel).read_text(encoding="utf-8"))
         errors.extend(f"{emotion}: {e}" for e in validate_clip(args.output / emotion, manifest))
     validation = {"ok": not errors, "errors": errors, "clips": len(clips)}
+    contract = validate_pack(args.output)
+    errors.extend(f"contract: {e}" for e in contract["errors"])
+    validation = {"ok": not errors, "errors": errors, "clips": len(clips),
+                  "contract_warnings": contract["warnings"]}
+    (args.output / "contract_report.json").write_text(
+        json.dumps(contract, ensure_ascii=False, indent=2), encoding="utf-8")
     (args.output / "validation_report.json").write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({"output": str(args.output), "validation": validation, "analysis": rows}, ensure_ascii=False, indent=2))
     return 0 if not errors else 2

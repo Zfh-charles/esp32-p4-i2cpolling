@@ -1,4 +1,6 @@
 #include "face_mouth_layer.h"
+#include "emotion_video_player.h"
+#include "face_route_v2.h"
 
 #include <atomic>
 #include <cstdio>
@@ -10,6 +12,8 @@
 #include <esp_log.h>
 #include <esp_rom_sys.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <mbedtls/sha256.h>
 
 #define TAG "FaceMouth"
@@ -51,6 +55,14 @@ LifeFrame g_life[kLifeTrackMax][kLifeFrameMax];
 uint8_t g_life_count[kLifeTrackMax] = {};
 int g_life_x[kLifeTrackMax] = {}, g_life_y[kLifeTrackMax] = {};
 uint8_t g_life_track_count = 0;
+constexpr size_t kTransitionFrameMax = 8;
+struct TransitionFrame { Patch rgb; int x = 0; int y = 0; };
+TransitionFrame g_enter[kTransitionFrameMax];
+TransitionFrame g_release[kTransitionFrameMax];
+uint8_t g_enter_count = 0;
+uint16_t g_enter_interval_ms = 75;
+uint8_t g_release_count = 0;
+uint16_t g_release_interval_ms = 90;
 bool g_mouth_precomposited = false;
 bool g_life_precomposited = false;
 uint8_t g_pose_count = 1;
@@ -58,6 +70,16 @@ int g_roi_x = 0, g_roi_y = 0, g_roi_w = 0, g_roi_h = 0;
 int g_eye_x = 0, g_eye_y = 0, g_eye_w = 0, g_eye_h = 0;
 char g_bound_emo[32] = {0};
 bool g_ready = false;
+SemaphoreHandle_t g_patch_mutex = nullptr;
+
+class PatchLockGuard {
+public:
+    explicit PatchLockGuard(uint32_t timeout_ms) : locked_(FaceMouth_Lock(timeout_ms)) {}
+    ~PatchLockGuard() { if (locked_) FaceMouth_Unlock(); }
+    bool locked() const { return locked_; }
+private:
+    bool locked_;
+};
 
 void FreePatches() {
     for (size_t i = 0; i < kLevelCount; i++) {
@@ -99,6 +121,18 @@ void FreePatches() {
         g_life_count[track] = 0;
     }
     g_life_track_count = 0;
+    for (auto& frame : g_enter) {
+        if (frame.rgb.rgb != nullptr) heap_caps_free(frame.rgb.rgb);
+        frame = {};
+    }
+    for (auto& frame : g_release) {
+        if (frame.rgb.rgb != nullptr) heap_caps_free(frame.rgb.rgb);
+        frame = {};
+    }
+    g_enter_count = 0;
+    g_enter_interval_ms = 75;
+    g_release_count = 0;
+    g_release_interval_ms = 90;
     g_mouth_precomposited = false;
     g_life_precomposited = false;
     g_pose_count = 1;
@@ -222,18 +256,7 @@ bool LoadEyeLevelBank(const char* dir, const char* eye_subdir, uint16_t ew, uint
 }
 
 const char* ResolveEmotionDir(const char* emotion_name) {
-    if (emotion_name == nullptr || emotion_name[0] == '\0') {
-        return "neutral";
-    }
-    if (strcasecmp(emotion_name, "laughing") == 0 || strcasecmp(emotion_name, "funny") == 0 ||
-        strcasecmp(emotion_name, "excited") == 0) {
-        return "happy";
-    }
-    if (strcasecmp(emotion_name, "relaxed") == 0 || strcasecmp(emotion_name, "winking") == 0 ||
-        strcasecmp(emotion_name, "cool") == 0 || strcasecmp(emotion_name, "kissy") == 0) {
-        return "loving";
-    }
-    return emotion_name;
+    return emotion_video_player_canonicalize_emotion(emotion_name);
 }
 
 }  // namespace
@@ -247,6 +270,13 @@ void FaceMouth_SetEnabled(bool on) {
 }
 
 void FaceMouth_BootProbe(void) {
+    if (g_patch_mutex == nullptr) {
+        g_patch_mutex = xSemaphoreCreateRecursiveMutex();
+        if (g_patch_mutex == nullptr) {
+            ESP_LOGE(TAG, "s1ew patch_mutex create_fail");
+            return;
+        }
+    }
     if (!FaceMouth_Enabled()) {
         ESP_LOGW(TAG, "s1cr-h mouth flag=0");
         esp_rom_printf("!!FACE_S1CR h=0\n");
@@ -266,11 +296,34 @@ void FaceMouth_BootProbe(void) {
     }
 }
 
+bool FaceMouth_Lock(uint32_t timeout_ms) {
+    if (g_patch_mutex == nullptr) {
+        return false;
+    }
+    return xSemaphoreTakeRecursive(g_patch_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+void FaceMouth_Unlock(void) {
+    if (g_patch_mutex != nullptr) {
+        xSemaphoreGiveRecursive(g_patch_mutex);
+    }
+}
+
 void FaceMouth_Clear(void) {
+    PatchLockGuard lock(1000);
+    if (!lock.locked()) {
+        ESP_LOGW(TAG, "s1ew clear_skip patch_mutex");
+        return;
+    }
     FreePatches();
 }
 
 bool FaceMouth_BindEmotion(const char* emotion_name) {
+    PatchLockGuard lock(1500);
+    if (!lock.locked()) {
+        ESP_LOGW(TAG, "s1ew bind_skip patch_mutex emo=%s", emotion_name ? emotion_name : "-");
+        return false;
+    }
     if (!FaceMouth_Enabled() || !g_pack_present.load(std::memory_order_relaxed)) {
         return false;
     }
@@ -376,9 +429,12 @@ bool FaceMouth_BindEmotion(const char* emotion_name) {
     cJSON* mouth_composite = cJSON_GetObjectItem(render, "mouth_composite");
     cJSON* mouth_method = mouth_composite ? cJSON_GetObjectItem(mouth_composite, "method") : nullptr;
     g_mouth_precomposited = cJSON_IsString(mouth_method) &&
-                            strcmp(mouth_method->valuestring, "canonical_base_feather_v1") == 0;
+                            (strcmp(mouth_method->valuestring, "canonical_base_feather_v1") == 0 ||
+                             strcmp(mouth_method->valuestring,
+                                    "canonical_base_activity_feather_v2") == 0);
 
-    if (strcasecmp(dir, "neutral") == 0 || strcasecmp(dir, "happy") == 0) {
+    if (strcasecmp(dir, "neutral") == 0 || strcasecmp(dir, "happy") == 0 ||
+        strcasecmp(dir, "standby") == 0) {
         cJSON* life = cJSON_GetObjectItem(render, "life_layer");
         cJSON* composite_mode = life ? cJSON_GetObjectItem(life, "composite_mode") : nullptr;
         g_life_precomposited = cJSON_IsString(composite_mode) &&
@@ -425,6 +481,113 @@ bool FaceMouth_BindEmotion(const char* emotion_name) {
         }
         if (!hash_ok) {
             ESP_LOGW(TAG, "s1ej life_reject emo=%s hash=0", dir);
+        }
+    }
+
+    // s1eu: common-hub entry is the mirror of release. Both are tied to the
+    // exact generated hold base and capped to one display row-band per tick.
+    cJSON* enter = cJSON_GetObjectItem(render, "enter_layer");
+    cJSON* enter_frames = enter ? cJSON_GetObjectItem(enter, "frames") : nullptr;
+    cJSON* enter_hash = enter ? cJSON_GetObjectItem(enter, "base_rgb565_sha256") : nullptr;
+    cJSON* enter_interval = enter ? cJSON_GetObjectItem(enter, "interval_ms") : nullptr;
+    char enter_actual[65];
+    Sha256Hex(g_hold_base.rgb, hold_bytes, enter_actual);
+    const bool enter_hash_ok = cJSON_IsString(enter_hash) &&
+                               strcasecmp(enter_hash->valuestring, enter_actual) == 0;
+    const int enter_count = cJSON_IsArray(enter_frames) ? cJSON_GetArraySize(enter_frames) : 0;
+    bool enter_ok = enter_hash_ok && enter_count > 0 &&
+                    enter_count <= (int)kTransitionFrameMax;
+    for (int i = 0; enter_ok && i < enter_count; ++i) {
+        cJSON* item = cJSON_GetArrayItem(enter_frames, i);
+        cJSON* roi_item = item ? cJSON_GetObjectItem(item, "roi") : nullptr;
+        cJSON* file_item = item ? cJSON_GetObjectItem(item, "rgb565") : nullptr;
+        const int rw = cJSON_IsObject(roi_item) && cJSON_GetObjectItem(roi_item, "width")
+                           ? cJSON_GetObjectItem(roi_item, "width")->valueint : 0;
+        const int rh = cJSON_IsObject(roi_item) && cJSON_GetObjectItem(roi_item, "height")
+                           ? cJSON_GetObjectItem(roi_item, "height")->valueint : 0;
+        g_enter[i].x = cJSON_IsObject(roi_item) && cJSON_GetObjectItem(roi_item, "x")
+                           ? cJSON_GetObjectItem(roi_item, "x")->valueint : 0;
+        g_enter[i].y = cJSON_IsObject(roi_item) && cJSON_GetObjectItem(roi_item, "y")
+                           ? cJSON_GetObjectItem(roi_item, "y")->valueint : 0;
+        if (!cJSON_IsString(file_item) || rw < 8 || rh < 1 || rh > 48) {
+            enter_ok = false;
+            break;
+        }
+        char path[224];
+        snprintf(path, sizeof(path), "%s/%s/%s", kPackRoot, dir, file_item->valuestring);
+        enter_ok = LoadSizedPatch(path, (uint16_t)rw, (uint16_t)rh, &g_enter[i].rgb);
+    }
+    if (enter_ok) {
+        g_enter_count = (uint8_t)enter_count;
+        if (cJSON_IsNumber(enter_interval)) {
+            const int ms = enter_interval->valueint;
+            g_enter_interval_ms = (uint16_t)(ms < 70 ? 70 : (ms > 180 ? 180 : ms));
+        }
+        ESP_LOGW(TAG, "s1eu enter_bind emo=%s frames=%u interval_ms=%u hash=ok", dir,
+                 (unsigned)g_enter_count, (unsigned)g_enter_interval_ms);
+        esp_rom_printf("!!FACE_S1EU enter_bind emo=%s frames=%u\n", dir,
+                       (unsigned)g_enter_count);
+    } else {
+        for (auto& frame : g_enter) {
+            if (frame.rgb.rgb != nullptr) heap_caps_free(frame.rgb.rgb);
+            frame = {};
+        }
+        g_enter_count = 0;
+    }
+
+    // s1et: release is deliberately separate from life.  It is loaded only
+    // when the manifest is tied to this exact canonical hold base, and every
+    // entry is capped to one display row-band.
+    cJSON* release = cJSON_GetObjectItem(render, "release_layer");
+    cJSON* release_frames = release ? cJSON_GetObjectItem(release, "frames") : nullptr;
+    cJSON* release_hash = release ? cJSON_GetObjectItem(release, "base_rgb565_sha256") : nullptr;
+    cJSON* release_interval = release ? cJSON_GetObjectItem(release, "interval_ms") : nullptr;
+    char release_actual[65];
+    Sha256Hex(g_hold_base.rgb, hold_bytes, release_actual);
+    const bool release_hash_ok = cJSON_IsString(release_hash) &&
+                                 strcasecmp(release_hash->valuestring, release_actual) == 0;
+    const int release_count = cJSON_IsArray(release_frames) ? cJSON_GetArraySize(release_frames) : 0;
+    bool release_ok = release_hash_ok && release_count > 0 &&
+                      release_count <= (int)kTransitionFrameMax;
+    for (int i = 0; release_ok && i < release_count; ++i) {
+        cJSON* item = cJSON_GetArrayItem(release_frames, i);
+        cJSON* roi_item = item ? cJSON_GetObjectItem(item, "roi") : nullptr;
+        cJSON* file_item = item ? cJSON_GetObjectItem(item, "rgb565") : nullptr;
+        const int rw = cJSON_IsObject(roi_item) && cJSON_GetObjectItem(roi_item, "width")
+                           ? cJSON_GetObjectItem(roi_item, "width")->valueint : 0;
+        const int rh = cJSON_IsObject(roi_item) && cJSON_GetObjectItem(roi_item, "height")
+                           ? cJSON_GetObjectItem(roi_item, "height")->valueint : 0;
+        g_release[i].x = cJSON_IsObject(roi_item) && cJSON_GetObjectItem(roi_item, "x")
+                             ? cJSON_GetObjectItem(roi_item, "x")->valueint : 0;
+        g_release[i].y = cJSON_IsObject(roi_item) && cJSON_GetObjectItem(roi_item, "y")
+                             ? cJSON_GetObjectItem(roi_item, "y")->valueint : 0;
+        if (!cJSON_IsString(file_item) || rw < 8 || rh < 1 || rh > 48) {
+            release_ok = false;
+            break;
+        }
+        char path[224];
+        snprintf(path, sizeof(path), "%s/%s/%s", kPackRoot, dir, file_item->valuestring);
+        release_ok = LoadSizedPatch(path, (uint16_t)rw, (uint16_t)rh, &g_release[i].rgb);
+    }
+    if (release_ok) {
+        g_release_count = (uint8_t)release_count;
+        if (cJSON_IsNumber(release_interval)) {
+            const int ms = release_interval->valueint;
+            g_release_interval_ms = (uint16_t)(ms < 70 ? 70 : (ms > 180 ? 180 : ms));
+        }
+        ESP_LOGW(TAG, "s1et release_bind emo=%s frames=%u interval_ms=%u hash=ok", dir,
+                 (unsigned)g_release_count, (unsigned)g_release_interval_ms);
+        esp_rom_printf("!!FACE_S1ET release_bind emo=%s frames=%u\n", dir,
+                       (unsigned)g_release_count);
+    } else {
+        for (auto& frame : g_release) {
+            if (frame.rgb.rgb != nullptr) heap_caps_free(frame.rgb.rgb);
+            frame = {};
+        }
+        g_release_count = 0;
+        if (release != nullptr) {
+            ESP_LOGW(TAG, "s1et release_reject emo=%s hash=%d count=%d", dir,
+                     release_hash_ok ? 1 : 0, release_count);
         }
     }
 
@@ -485,10 +648,17 @@ void FaceMouth_PublishFromPcm(const int16_t* pcm, size_t samples) {
         acc += (uint64_t)(v < 0 ? -v : v);
     }
     const uint32_t mean = (uint32_t)(acc / n);
+    // s1ex-n: a deliberately small gain lift. Keep small/large gates unchanged so this
+    // only makes medium poses slightly easier to reach; cadence, ROI and bus cost stay fixed.
+    const uint32_t medium_threshold = FaceRouteV2_MouthGainSoftEnabled() ? 1000u : 1100u;
+    // s1ey-o: make the existing large pose slightly easier to reach without changing
+    // pose geometry, ROI or tick cadence. This remains independently reversible.
+    const uint32_t large_threshold =
+        FaceRouteV2_MouthLargeGainSoftEnabled() ? 2000u : 2200u;
     uint8_t level = 0;
-    if (mean > 2200) {
+    if (mean > large_threshold) {
         level = 3;
-    } else if (mean > 1100) {
+    } else if (mean > medium_threshold) {
         level = 2;
     } else if (mean > 400) {
         level = 1;
@@ -626,5 +796,38 @@ bool FaceMouth_LifeFrame(uint8_t track, uint8_t index, const uint8_t** rgb565, c
     if (h) *h = g_life[track][index].rgb.h;
     if (x) *x = g_life_x[track];
     if (y) *y = g_life_y[track];
+    return true;
+}
+
+bool FaceMouth_ReleaseReady(void) { return g_ready && g_release_count > 0; }
+bool FaceMouth_EnterReady(void) { return g_ready && g_enter_count > 0; }
+uint8_t FaceMouth_EnterFrameCount(void) { return FaceMouth_EnterReady() ? g_enter_count : 0; }
+uint16_t FaceMouth_EnterIntervalMs(void) {
+    return FaceMouth_EnterReady() ? g_enter_interval_ms : 75;
+}
+bool FaceMouth_EnterFrame(uint8_t index, const uint8_t** rgb565,
+                          uint16_t* w, uint16_t* h, int* x, int* y) {
+    if (!FaceMouth_EnterReady() || index >= g_enter_count ||
+        g_enter[index].rgb.rgb == nullptr) return false;
+    if (rgb565) *rgb565 = g_enter[index].rgb.rgb;
+    if (w) *w = g_enter[index].rgb.w;
+    if (h) *h = g_enter[index].rgb.h;
+    if (x) *x = g_enter[index].x;
+    if (y) *y = g_enter[index].y;
+    return true;
+}
+uint8_t FaceMouth_ReleaseFrameCount(void) { return FaceMouth_ReleaseReady() ? g_release_count : 0; }
+uint16_t FaceMouth_ReleaseIntervalMs(void) {
+    return FaceMouth_ReleaseReady() ? g_release_interval_ms : 90;
+}
+bool FaceMouth_ReleaseFrame(uint8_t index, const uint8_t** rgb565,
+                            uint16_t* w, uint16_t* h, int* x, int* y) {
+    if (!FaceMouth_ReleaseReady() || index >= g_release_count ||
+        g_release[index].rgb.rgb == nullptr) return false;
+    if (rgb565) *rgb565 = g_release[index].rgb.rgb;
+    if (w) *w = g_release[index].rgb.w;
+    if (h) *h = g_release[index].rgb.h;
+    if (x) *x = g_release[index].x;
+    if (y) *y = g_release[index].y;
     return true;
 }

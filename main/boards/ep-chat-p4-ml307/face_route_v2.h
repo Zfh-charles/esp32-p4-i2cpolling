@@ -12,6 +12,7 @@
  * | e    | S1CO_E_STATIC_DIALOGUE | dialogue StaticHold — no MID 400-row band |
  * | f    | S1CP_F_FULL_STILL      | breathe/hold/bookend use seed_full (kill seam) |
  * | g    | S1CP_G_ENTER_ARC       | short full-frame enter, then hold on seed |
+ * | p    | S1EZ_P_LIFE_AFE_FENCE  | idle life final-DMA fence + audio priority |
  *
  * Mouth layer (h) lives in face_mouth_layer.h as S1CR_H_MOUTH — not toggled here.
  *
@@ -46,10 +47,46 @@ extern "C" {
 #define S1CP_F_FULL_STILL 1
 #endif
 #ifndef S1CP_G_ENTER_ARC
-#define S1CP_G_ENTER_ARC 1
+#define S1CP_G_ENTER_ARC 0
 #endif
 #ifndef S1EF_I_LIFE_LAYER
 #define S1EF_I_LIFE_LAYER 1
+#endif
+#ifndef S1EP_J_CANONICAL_EMOTION
+#define S1EP_J_CANONICAL_EMOTION 1
+#endif
+#ifndef S1EP_K_STANDBY_LIFE
+#define S1EP_K_STANDBY_LIFE 1
+#endif
+#ifndef S1ET_L_RELEASE_HUB
+#define S1ET_L_RELEASE_HUB 0
+#endif
+#ifndef S1EW_M_PROVISIONAL_MOUTH
+#define S1EW_M_PROVISIONAL_MOUTH 1
+#endif
+#ifndef S1EX_N_MOUTH_GAIN_SOFT
+#define S1EX_N_MOUTH_GAIN_SOFT 1
+#endif
+#ifndef S1EY_O_MOUTH_LARGE_GAIN_SOFT
+#define S1EY_O_MOUTH_LARGE_GAIN_SOFT 1
+#endif
+#ifndef S1EZ_P_LIFE_AFE_FENCE
+#define S1EZ_P_LIFE_AFE_FENCE 1
+#endif
+#ifndef S1FD_T_IDLE_BACKLIGHT_BREATHE
+#define S1FD_T_IDLE_BACKLIGHT_BREATHE 1
+#endif
+#ifndef S1FL_U_VISUAL_BUDGET_SHADOW
+#define S1FL_U_VISUAL_BUDGET_SHADOW 1
+#endif
+#ifndef S1FM_V_VISUAL_BUDGET_MOUTH_APPLY
+#define S1FM_V_VISUAL_BUDGET_MOUTH_APPLY 1
+#endif
+#ifndef S1FN_W_VISUAL_BUDGET_LIFE_APPLY
+#define S1FN_W_VISUAL_BUDGET_LIFE_APPLY 1
+#endif
+#ifndef S1FO_X_IDLE_LIFE_CANARY
+#define S1FO_X_IDLE_LIFE_CANARY 1
 #endif
 
 bool FaceRouteV2_WorkerEnabled(void);
@@ -60,6 +97,18 @@ bool FaceRouteV2_StaticDialogueEnabled(void);
 bool FaceRouteV2_FullStillEnabled(void);
 bool FaceRouteV2_EnterArcEnabled(void);
 bool FaceRouteV2_LifeLayerEnabled(void);
+bool FaceRouteV2_CanonicalEmotionEnabled(void);
+bool FaceRouteV2_StandbyLifeEnabled(void);
+bool FaceRouteV2_ReleaseHubEnabled(void);
+bool FaceRouteV2_ProvisionalMouthEnabled(void);
+bool FaceRouteV2_MouthGainSoftEnabled(void);
+bool FaceRouteV2_MouthLargeGainSoftEnabled(void);
+bool FaceRouteV2_LifeAfeFenceEnabled(void);
+bool FaceRouteV2_IdleBacklightBreatheEnabled(void);
+bool FaceRouteV2_VisualBudgetShadowEnabled(void);
+bool FaceRouteV2_VisualBudgetMouthApplyEnabled(void);
+bool FaceRouteV2_VisualBudgetLifeApplyEnabled(void);
+bool FaceRouteV2_IdleLifeCanaryEnabled(void);
 
 void FaceRouteV2_SetWorker(bool on);
 void FaceRouteV2_SetEmotion3(bool on);
@@ -69,6 +118,18 @@ void FaceRouteV2_SetStaticDialogue(bool on);
 void FaceRouteV2_SetFullStill(bool on);
 void FaceRouteV2_SetEnterArc(bool on);
 void FaceRouteV2_SetLifeLayer(bool on);
+void FaceRouteV2_SetCanonicalEmotion(bool on);
+void FaceRouteV2_SetStandbyLife(bool on);
+void FaceRouteV2_SetReleaseHub(bool on);
+void FaceRouteV2_SetProvisionalMouth(bool on);
+void FaceRouteV2_SetMouthGainSoft(bool on);
+void FaceRouteV2_SetIdleBacklightBreathe(bool on);
+void FaceRouteV2_SetMouthLargeGainSoft(bool on);
+void FaceRouteV2_SetLifeAfeFence(bool on);
+void FaceRouteV2_SetVisualBudgetShadow(bool on);
+void FaceRouteV2_SetVisualBudgetMouthApply(bool on);
+void FaceRouteV2_SetVisualBudgetLifeApply(bool on);
+void FaceRouteV2_SetIdleLifeCanary(bool on);
 
 /** Boot banner: FW sub-markers s1cn-a..d on/off. */
 void FaceRouteV2_BootLog(void);

@@ -232,15 +232,39 @@ private:
 
     void InitializeBatteryMonitor() {
         ESP_LOGI(TAG, "初始化电池监控器（使用共享 I2C 总线）");
-        
-        // 使用共享的 I2C 总线初始化电池监控器
-        if (!ep_battery_level_.init(i2c_bus_)) {
-            ESP_LOGW(TAG, "⚠️ 电池监控器初始化失败");
-        } else {
-            ESP_LOGI(TAG, "✅ 电池监控器初始化成功");
-            // 打印一次电池信息确认工作正常
-            ep_battery_level_.printInfo();
+
+        // The gauge occasionally does not answer immediately after a cold
+        // power-up.  Retry here, while the shared bus is otherwise idle;
+        // retrying later would contend with the audio codecs on the same bus.
+        constexpr TickType_t kRetryDelay[] = {
+            0,
+            pdMS_TO_TICKS(500),
+            pdMS_TO_TICKS(1200),
+            pdMS_TO_TICKS(2500),
+        };
+        constexpr size_t kAttemptCount = sizeof(kRetryDelay) / sizeof(kRetryDelay[0]);
+        for (size_t attempt = 0; attempt < kAttemptCount; ++attempt) {
+            if (kRetryDelay[attempt] > 0) {
+                ESP_LOGW(TAG, "BATTERY_INIT_RETRY wait_ms=%lu attempt=%u/%u",
+                         static_cast<unsigned long>(kRetryDelay[attempt] * portTICK_PERIOD_MS),
+                         static_cast<unsigned>(attempt + 1),
+                         static_cast<unsigned>(kAttemptCount));
+                vTaskDelay(kRetryDelay[attempt]);
+            }
+            if (ep_battery_level_.init(i2c_bus_)) {
+                ESP_LOGI(TAG, "BATTERY_INIT_OK attempt=%u/%u soc=%u",
+                         static_cast<unsigned>(attempt + 1),
+                         static_cast<unsigned>(kAttemptCount),
+                         static_cast<unsigned>(ep_battery_level_.getBatterySOC()));
+                ep_battery_level_.printInfo();
+                return;
+            }
+            ESP_LOGW(TAG, "BATTERY_INIT_FAIL attempt=%u/%u",
+                     static_cast<unsigned>(attempt + 1),
+                     static_cast<unsigned>(kAttemptCount));
         }
+        ESP_LOGW(TAG, "BATTERY_INIT_GIVE_UP attempts=%u; battery remains unavailable",
+                 static_cast<unsigned>(kAttemptCount));
     }
 
 public:
@@ -251,6 +275,9 @@ public:
         mcp_server.AddTool("self.battery.get_level", 
             "获取电池电量百分比(0-100%)",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                if (!ep_battery_level_.is_ready()) {
+                    return "battery monitor unavailable";
+                }
                 int level = ep_battery_level_.getBatterySOC();
                 ESP_LOGI(TAG, "获取电池电量: %d%%", level);
                 return level;
@@ -260,6 +287,9 @@ public:
         mcp_server.AddTool("self.battery.get_voltage", 
             "获取电池电压(mV)",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                if (!ep_battery_level_.is_ready()) {
+                    return "battery monitor unavailable";
+                }
                 int voltage = ep_battery_level_.getVoltage();
                 ESP_LOGI(TAG, "获取电池电压: %dmV", voltage);
                 return voltage;
@@ -269,6 +299,9 @@ public:
         mcp_server.AddTool("self.battery.get_temperature", 
             "获取电池温度(°C)",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                if (!ep_battery_level_.is_ready()) {
+                    return "battery monitor unavailable";
+                }
                 int temp = ep_battery_level_.getTemperature();
                 ESP_LOGI(TAG, "获取电池温度: %d°C", temp);
                 return temp;
@@ -319,6 +352,24 @@ public:
 
     virtual Display *GetDisplay() override {
         return display_;
+    }
+
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        if (!ep_battery_level_.is_ready()) {
+            level = 0;
+            charging = false;
+            discharging = false;
+            return false;
+        }
+        level = static_cast<int>(ep_battery_level_.getBatterySOC());
+        if (level < 0) {
+            level = 0;
+        } else if (level > 100) {
+            level = 100;
+        }
+        charging = ep_battery_level_.is_charging();
+        discharging = ep_battery_level_.is_discharging();
+        return true;
     }
 
     virtual Backlight* GetBacklight() override {
