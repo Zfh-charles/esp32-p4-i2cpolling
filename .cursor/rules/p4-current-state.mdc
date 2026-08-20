@@ -8,22 +8,22 @@ alwaysApply: false
 > 只放**会过期的**内容：阶段、known-good、当前 marker、主矛盾方面、下一刀、冻结项。
 > 长期原则不写这里（写 core / hard-constraints）。每批次**同回合**更新本文件 + 账本。
 > **§0 是唯一权威态势**；其下「一、三…」长流水保留作历史，**不得覆盖删除**（并行会话可能在写）；新批次优先改 §0。
-> 更新日期：2026-08-20。
+> 更新日期：2026-08-21。
 
 ## §0 一页态势（权威；出刀前必读）
 
 | 项 | 值 |
 |----|----|
-| **真源 marker** | `boot_trace_v10_s1fo_m2d_idle_life_canary`（**白天基线**；源码保留 LVGL 锁名常量，数值未改；以 `boot_trace.cc` 为准） |
+| **真源 marker** | 源码/双槽已写 `boot_trace_v10_s1fq_daytime_s1fn_smell_clean`；行为回归08:00–17:00已验s1fn并保留行为守恒smell-clean，RTS后仍处`SW_SYS_RESET`窗口，**物理冷启前V1未过** |
 | **阶段标签** | 硅片地板未除（防御）+ **相持打法**（预算化视觉）；非纯防御、非反攻 |
 | **KG-Life** | `s1cm`（mean≈2054s / n=14）— 寿命统计锚；滚动正证据不可擅自替换本槽 |
-| **KG-Function** | `s1fk`/`s1fm`/`s1fo` — 体验回退优先指这里 |
-| **KG-Archive** | GitHub `s1eo` + 白天 `s1fo` 存档 + smell/PC 抽取提交 |
-| **滚动 V3 占用** | **s1fo**（M2d idle life）；锁名/PC 拆分不另占视觉滚动门 |
-| **face 能力位** | M2a–c V2✓ · M2d idle life canary；enter/exit/blink **冻结** |
+| **KG-Function** | `s1fk`/`s1fm`/`s1fn`；08:00–17:00实测回退核=`s1fn` |
+| **KG-Archive** | 原始 `s1fn` BIN+ELF哈希归档；GitHub `s1eo`；`s1fq`日间行为+smell-clean候选 |
+| **滚动 V3 占用** | 无；`s1fq`先补冷启V1/V2，M2d canary已关闭 |
+| **face 能力位** | M2a–c V2✓ · M2d idle life canary关闭；enter/exit/blink **冻结** |
 | **可发布核** | 会话闭环 + 分层嘴 + VisualBudget 消费；润色能力位可选、各自 R0 |
 | **SD 素材** | 板上 `mjpeg_ai_dialogue_v5p3_mouth_focus`；R1 回退基线=v5 |
-| **唯一下一刀** | 继续**行为守恒**可维护性抽取（adapter helper / builder 模块）+ 上库；验机另开批次；板上以用户已测白天 `s1fo` 为准 |
+| **唯一下一刀** | 物理断电冷启，验exact s1fq、SD/seed、基础对话/退出/二次唤醒；未过即回烧原始s1fn |
 | **韧性欠账（可见）** | R0-triage / R1-guard / R2-sram / R3-warm / R4-bisect — 鼓励与视觉交错 |
 | **明确冻结** | 全屏 enter、眨眼、对话期≥400 行 MID、整包混合提交、再调 Frozen 时长、200M→20M |
 

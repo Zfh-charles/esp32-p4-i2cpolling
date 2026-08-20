@@ -86,7 +86,7 @@ extern "C" {
 #define S1FN_W_VISUAL_BUDGET_LIFE_APPLY 1
 #endif
 #ifndef S1FO_X_IDLE_LIFE_CANARY
-#define S1FO_X_IDLE_LIFE_CANARY 1
+#define S1FO_X_IDLE_LIFE_CANARY 0
 #endif
 
 bool FaceRouteV2_WorkerEnabled(void);

@@ -19,7 +19,7 @@ alwaysApply: true
 | 「我在哪、known-good 是谁、下一刀」 | `p4-current-state.mdc`（**唯一常改**） |
 | 产品地图 / 长期契约 | `.cursorrules` · `AGENTS.md` |
 
-**你在这（摘要，权威以 `boot_trace.cc` 的 `FW_MARKER` + current-state **§0** 为准）**：硅片地板仍在（P4 v1.0 MSPI-751）+ 相持打法（预算化视觉）。真源 marker=`s1fo_m2d_idle_life_canary`（白天基线；锁名常量保留）；**KG-Life**=`s1cm`；**KG-Function**=`s1fk`/`s1fm`/`s1fo`；**KG-Archive**=`s1eo`+白天 s1fo 存档；滚动 V3 占用=`s1fo`。可发布核=会话闭环+分层嘴+预算消费；enter/blink 仍冻结。下一刀见 current-state §0。
+**你在这（摘要，权威以 `boot_trace.cc` 的 `FW_MARKER` + current-state **§0** 为准）**：源码/双槽=`s1fq_daytime_s1fn_smell_clean`，恢复08:00–17:00已验s1fn行为并保留行为守恒smell-clean；M2d canary关闭。RTS后仍处既有`SW_SYS_RESET`窗口，物理冷启前V1未过。**KG-Life**=`s1cm`；**KG-Function**=`s1fn`；下一刀只做冷启exact marker+SD/会话门。
 
 ## 二、出刀四问（必答，≤4 行写进回复；答不出 → 只侦察）
 

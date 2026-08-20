@@ -907,3 +907,9 @@ Frozen < StaticOnly < MouthOnly < SmallAnimation < FullTransition
 - 完整构建通过，应用`0x461fb0`、余12%；BIN SHA256=`3C1410DE9217AC49497CE08EC6D5987AD84EF382383F66CF44E597BF3E3371E8`，ELF SHA256=`41E57DFFEB3EC99F9F26269D7A48480B2919794D2641EA7EAE2ED3B527C44AA4`。当前仅V0，尚未烧录/真机。
 - 烧录/V1：精确停止COM7采集父子PID 18284/13704，只写otadata/双OTA，三段hash verified；新采集PID 19212。61.646s exact marker、70.646s `TransitionCandidate apply=1`，AFE/heap健康且零panic/WDT。RTS热启未捕获SD/seed，PSRAM约32.5MB，验收器仅marker/no-reboot PASS；物理冷启前不验表情、不计V2。
 - V2裁决：用户体感“还可以”，联合脚本全PASS。冷启SD/seed 6/6，generation 1..9、mouth_arm=16、mouth_blit=43；`MouthReduced`多次defer且`MouthOnly`恢复latest-only，4次退出重武装205/203/205/204ms，第二轮wake→Listening 225ms，panic/reboot=0。日志中`resume level=MouthReduced`仅发生在life source转不可用后清deferred，未提交life，属探针措辞假阳性；后续裁决只认`resume level=MouthOnly`，不为此重烧。M2c V2通过，进入滚动V3。
+
+# 2026-08-21 s1fq — 08:00–17:00 s1fn行为存档 + smell-clean（V0，冷启待验）
+
+- 时间线复判：08-20 08:00–17:00板上实际为原始`s1fn M2c`；07:26的`s1fo M2d`已因烧录后启动循环回退，不能把s1fo称作该时间窗已验版。保留行为守恒项：LVGL锁名常量、PC MJPEG I/O拆分、COM7脚本自杀修正；关闭`S1FO_X_IDLE_LIFE_CANARY`，marker独立为`boot_trace_v10_s1fq_daytime_s1fn_smell_clean`，不冒充原始s1fn。
+- V0完整构建通过：应用`0x4621e0`、分区余12%；BIN SHA256=`A090683B21A2AD13BEF8E6EFE596029B627E26EABB195FAADFA7B56F31EDF335`，ELF SHA256=`5256EEF42DF5CC22AF254C4B3819AF461844E7E0556201B70307955FB901BFF7`。原始s1fn对照BIN/ELF哈希分别为`3C1410DE9217AC49497CE08EC6D5987AD84EF382383F66CF44E597BF3E3371E8`/`41E57DFFEB3EC99F9F26269D7A48480B2919794D2641EA7EAE2ED3B527C44AA4`。
+- 烧录三次均为单次命令且`otadata/OTA_0/OTA_1`全部hash verified：先s1fq、再原始s1fn对照、最后s1fq。两种BIN在RTS后都复现高频`rst:0x3 SW_SYS_RESET`，否证“由idle canary或本轮源码单独导致”；该循环禁止按行计作自然崩溃。最终双槽为s1fq，但尚未进入应用，必须物理断电冷启；exact marker、SD/seed、基础会话/退出/二次唤醒未过前只记V0，不占V3滚动门。失败R1回烧原始s1fn。
