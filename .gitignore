@@ -19,12 +19,17 @@ main/mmap_generate_emoji.h
 .cache
 *.pyc
 *.bin
+*.elf
 mmap_generate_*.h
 .clangd
 build/log/
 build_*/
 elf_snapshots/
 fw_archive/
+.cursor/rules/
+.cursorrules
+AGENTS.md
+tools/S1FT_ARCHIVE.md
 __pycache__/
 *.log
 serial_monitor.log
