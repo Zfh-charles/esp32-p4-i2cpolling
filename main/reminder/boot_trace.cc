@@ -14,8 +14,8 @@
 #include "debug/afe_fetch_gate.h"
 
 #define TAG "BootTrace"
-// Daytime 08:00-17:00 s1fn behavior, rebuilt with behavior-neutral smell cleanup.
-#define FW_MARKER "boot_trace_v10_s1fq_daytime_s1fn_smell_clean"
+// s1fs: exact s1fn visual ground plus TTS-boundary 4G UDP keepalive.
+#define FW_MARKER "boot_trace_v10_s1ft_m2c_visual_budget_life"
 
 namespace {
 

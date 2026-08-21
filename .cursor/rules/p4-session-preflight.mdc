@@ -19,7 +19,7 @@ alwaysApply: true
 | 「我在哪、known-good 是谁、下一刀」 | `p4-current-state.mdc`（**唯一常改**） |
 | 产品地图 / 长期契约 | `.cursorrules` · `AGENTS.md` |
 
-**你在这（摘要，权威以 `boot_trace.cc` 的 `FW_MARKER` + current-state **§0** 为准）**：源码/双槽=`s1fq_daytime_s1fn_smell_clean`，恢复08:00–17:00已验s1fn行为并保留行为守恒smell-clean；M2d canary关闭。RTS后仍处既有`SW_SYS_RESET`窗口，物理冷启前V1未过。**KG-Life**=`s1cm`；**KG-Function**=`s1fn`；下一刀只做冷启exact marker+SD/会话门。
+**你在这（摘要，权威以板上延迟 `FW_MARKER` + current-state **§0** 为准）**：板上/源码为`s1ft`，已过镜像布局、冷启SD/seed 6/6、AFE单实例及>30s长TTS/退出/下一轮V2；正在归档并进入滚动V3。失败完整回`s1fn`。**KG-Life**=`s1cm`；**KG-Function**=`s1ft`；不叠新变量。
 
 ## 二、出刀四问（必答，≤4 行写进回复；答不出 → 只侦察）
 

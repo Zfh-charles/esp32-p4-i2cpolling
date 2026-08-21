@@ -16,7 +16,6 @@
 namespace {
 constexpr size_t kUdpAudioHeaderSize = 16;
 constexpr size_t kUdpAudioMaxPayloadSize = UINT16_MAX;
-
 bool IsValidHexString(const char* value, size_t decoded_size) {
     if (value == nullptr || strlen(value) != decoded_size * 2) {
         return false;
@@ -162,8 +161,8 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
             if (strcmp(type->valuestring, "tts") == 0) {
                 auto state = cJSON_GetObjectItem(root, "state");
                 if (cJSON_IsString(state) && strcmp(state->valuestring, "stop") == 0) {
-                    // MQTT control and UDP media are independent paths.  Release
-                    // a short confirmed gap before application teardown sees stop.
+                    // MQTT control and UDP media are independent paths. Release a
+                    // short confirmed gap before application teardown sees stop.
                     FlushAudioReorderBuffer();
                 }
             }
@@ -222,8 +221,9 @@ bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
         ESP_LOGE(TAG, "Cannot send null audio packet");
         return false;
     }
-    if (packet->payload.empty()) {
-        ESP_LOGE(TAG, "Cannot send empty application audio packet");
+    if (packet->payload.empty() &&
+        (packet->sample_rate != 0 || packet->frame_duration != 0 || packet->timestamp != 0)) {
+        ESP_LOGE(TAG, "Cannot send malformed empty packet");
         return false;
     }
     std::lock_guard<std::mutex> lock(channel_mutex_);

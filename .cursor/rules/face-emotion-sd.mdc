@@ -913,3 +913,51 @@ Frozen < StaticOnly < MouthOnly < SmallAnimation < FullTransition
 - 时间线复判：08-20 08:00–17:00板上实际为原始`s1fn M2c`；07:26的`s1fo M2d`已因烧录后启动循环回退，不能把s1fo称作该时间窗已验版。保留行为守恒项：LVGL锁名常量、PC MJPEG I/O拆分、COM7脚本自杀修正；关闭`S1FO_X_IDLE_LIFE_CANARY`，marker独立为`boot_trace_v10_s1fq_daytime_s1fn_smell_clean`，不冒充原始s1fn。
 - V0完整构建通过：应用`0x4621e0`、分区余12%；BIN SHA256=`A090683B21A2AD13BEF8E6EFE596029B627E26EABB195FAADFA7B56F31EDF335`，ELF SHA256=`5256EEF42DF5CC22AF254C4B3819AF461844E7E0556201B70307955FB901BFF7`。原始s1fn对照BIN/ELF哈希分别为`3C1410DE9217AC49497CE08EC6D5987AD84EF382383F66CF44E597BF3E3371E8`/`41E57DFFEB3EC99F9F26269D7A48480B2919794D2641EA7EAE2ED3B527C44AA4`。
 - 烧录三次均为单次命令且`otadata/OTA_0/OTA_1`全部hash verified：先s1fq、再原始s1fn对照、最后s1fq。两种BIN在RTS后都复现高频`rst:0x3 SW_SYS_RESET`，否证“由idle canary或本轮源码单独导致”；该循环禁止按行计作自然崩溃。最终双槽为s1fq，但尚未进入应用，必须物理断电冷启；exact marker、SD/seed、基础会话/退出/二次唤醒未过前只记V0，不占V3滚动门。失败R1回烧原始s1fn。
+
+# 2026-08-21 启动链完整恢复 — 原始 s1fn 重新上板（V1）
+
+- 物理冷启后`s1fq`仍黑屏并持续`rst:0x3 SW_SYS_RESET`，无应用marker；Saved PC `0x4ff2e344`由匹配bootloader ELF解析为`bootloader_reset`，说明故障边界在应用启动之前。此前仅回写otadata/双OTA的“最小恢复”边界不足，不能据此评价s1fn应用。
+- 按用户要求改为整套恢复：写入2026-08-19 `build_full` bootloader、partition-table、ota_data_initial、generated_assets，并将原始归档`s1fn` BIN同时写入OTA_0/OTA_1；六段均单次`Hash of data verified`，无重试。
+- 恢复后设备离开复位环，日志在uptime 61.777s命中`FW_MARKER boot_trace_v10_s1fn_m2c_visual_budget_life echo=delayed_once`，AFE约5s连续、free_int约155–157KB、free_psram约11.16MB。启动V1通过；SD/seed与多轮会话仍需用户短验，稳定性从本次恢复后重新按marker长泡。
+- `s1fq`判为冷启失败候选，不得合入或继续叠刀；本地源码与板上基线暂时分离，后续只能从可证明的s1fn源码点恢复，禁止凭差异反推“等价基线”。
+
+# 2026-08-21 s1fr — 长 TTS 4G UDP keepalive（V0构建通过，启动门失败并回滚）
+
+- 现场：第二轮长回答在uptime 238.162s后仍持续收到MQTT `sentence_start/end`，但到263.590s约25.4秒无任何`tts_pipe enqueue`；下一轮首批UDP为`got=916 expected=493`，确认连续缺423包，`423×约60ms=25.38s`。字幕TCP不断、stop后Capture恢复，否证LVGL、I2S与会话状态机；主假设为4G/CGNAT下行独占期间UDP回程映射过期。
+- 唯一功能变量：复用MQTT TTS控制回调，在`start/sentence_start/sentence_end`按8秒节流发送现有加密零负载UDP prime；不新建timer/task；增加1.5秒`TTS_MEDIA_STALL`探针并5秒限流。只改`mqtt_protocol.cc/.h`与marker；S2/D1/R0/V2。
+- 构建通过：应用`0x462560`、分区余12%；BIN SHA256=`5D70CEE15197AB6F648612637EBAF64C0A67600BE7F0F6ABA17082087283E106`，ELF SHA256=`8AC2662A8A5A591A02CA03EE98B09C8CF57723AD6B9D90AF1633D34B8B19E77D`，已归档。
+- 使用已验证`s1fn`启动链完整写六分区，均hash verified；但RTS后立即复现bootloader `SW_SYS_RESET`循环，无应用marker，V1失败，功能改动没有获得执行机会。按滚动门立即用原始`s1fn`完整六分区回滚，全部hash verified；回滚后seed 6/6、AFE连续、uptime61.500s exact s1fn marker，设备恢复。
+- 裁决：s1fr不得计入功能/稳定性进度，也不能归因keepalive逻辑有效或无效。下一步先恢复可证明的s1fn源码/构建根据地，再以同一补丁重做单变量V1/V2；禁止在当前失败镜像上叠刀。
+- 后勤：按用户授权停止采集后，将`serial_monitor.log`裁到2026-08-15 11:44:14起，1.58GB→约550MB；删除08-01及更早的三份独立串口日志，最近一周与稳定性账本保留。
+
+# 2026-08-21 s1fn-source-ground — 源码可重建根据地（V0+V1）
+
+- 以原始归档`s1fn` ELF为反向校准真源：`s1fn→s1fq`函数尺寸仅有`ArmIdleBreathe +154B`、`IdleBreatheTick +64B`、`FaceRouteV2_BootLog +20B`及idle-life-canary getter/原子变量。源码删除完整`s1fo` canary分支/接口，恢复s1fn的260ms帧间、4.2s轮间与背光优先路径；同时完整撤销未上板的`s1fr` UDP keepalive，并恢复exact marker。最后清除`application.cc`一处同长度`s1fo`日志尾标。
+- V0完整增量构建通过，应用大小`0x461fb0`，与原始归档BIN同为4,595,632字节。三个关键函数的链接地址+尺寸与原始ELF逐项相同：`ArmIdleBreathe=0x40030b02/0x1f2`、`IdleBreatheTick=0x40033b46/0x710`、`FaceRouteV2_BootLog=0x4003b3b2/0x1b4`。重建BIN SHA256=`EEBBA09B048460CC4A1BC96F1BDE8D40AAC2D5890E07AC58EAEE153D955E272D`；ELF SHA256=`9E3302E12BC6A1ACE4AA6C99D552349B43E663141B08693169D451579AAA0D5F`；原始归档仍保留，未覆盖。
+- 使用已验证`build_full` bootloader/partition/otadata/assets并把重建BIN写入双OTA，全部hash verified。首轮暖启进入应用、exact marker/AFE正常；发现一处视觉预算日志残留`s1fo`后仅修标签并重构，最终双槽再次hash verified。最终镜像在uptime 61.483s捕获exact marker，视觉预算日志为`s1fn`，AFE约5s连续、零panic/WDT，V1启动门通过。
+- 复验中记录一项历史启动竞态：一次暖启两路wake enable并发创建AFE，出现双`AFE_CREATE`和持续FEED-full；不改s1fn逻辑，单次干净复位后仅创建一个AFE且`AFE_FIRST_FETCH/AFE_DIAG`连续。该异常不计自然复位，但后续应独立做幂等门，禁止混入本根据地。
+- 当前RTS复位段SD未挂载（表情初始化明确skip），不能把V1冒充V2。下一步仅需用户物理断电冷启，确认`SD_MOUNT_OK + seed_stills 6/6 + AFE单实例`；失败则板上R1完整回原始`s1fn`六分区。源码根据地本身已建立，后续变量从此点单独分刀。
+
+# 2026-08-21 s1fs — s1fn根据地上的长TTS UDP保活（V0，冷启待验）
+
+- 复用s1fr已钉死的现场：MQTT字幕/句子控制继续而UDP下行从`expected=493`跳到`got=916`，连续缺423个约60ms包（约25.38s）。主假设仍是4G/CGNAT回程映射在TTS下行独占期失活；显示、I2S和会话状态机不是该现场首因。
+- 唯一功能变量：在现有TTS `start/sentence_start/sentence_end`控制边界，若距最后一次UDP上行≥8s，发送已有加密零payload transport-prime；不新增任务、timer、队列或视觉变量。编译期开关=`S1FS_X_TTS_UDP_KEEPALIVE`；M+=长TTS见`TTS_UDP_KEEPALIVE ... s1fs`且音频包持续到stop，M-=保活失败/无音/尾音截断/退出或二次唤醒回归。S2/D1/R1/V2。
+- V0完整构建通过：应用`0x4622a0`、分区余12%。归档BIN SHA256=`987E693F60CDB4B5AFC269E24D47060175505E389A79DDA55AE1D20A0223D079`，ELF SHA256=`CDF3AD7F0FBFAA985A4C05BB3163D8020A8B648155131CCDEFDBEBD52A69D89`。
+- 双槽写入均`Hash of data verified`。首次见bootloader `SW_SYS_RESET`热循环后保守回烧s1fn；对照s1fn同样复现该循环且之后进入应用，否证其为s1fs特有。最终再次把s1fs写入OTA_0/OTA_1并hash verified；当前仍在bootloader热循环，未捕获应用marker，须物理断电冷启。V1/V2未过，不计功能或稳定性完成；失败R1回烧`s1fn_source_rebuild`双槽。
+
+# 2026-08-21 s1fs 冷启裁决与黑屏恢复（V2失败 / s1fn恢复）
+
+- 用户物理断电冷启后仍黑屏；串口持续为`rst:0x3 SW_SYS_RESET`、Core0 Saved PC=`0x4ff2e344`，只见ROM装载与bootloader entry，始终没有应用marker、SD、LVGL或AFE日志。匹配历史解析仍为`bootloader_reset`，故黑屏直接原因在应用入口之前，不能归因显示初始化或长TTS运行逻辑。
+- 按启动链R1恢复，不做app-only补写：使用已验证`build_full` bootloader/partition-table/ota_data_initial/generated_assets，并把`s1fn_source_rebuild`同时写入OTA_0/OTA_1；六段一次命令写入且全部hash verified。恢复后设备进入应用，uptime>140s持续见`AFE_DIAG`、idle `VIS_BUDGET_SHADOW ... s1fn`、heap稳定，无继续SW reset。
+- 裁决：`s1fs`冷启动门失败，禁止再烧、不得计长TTS功能或稳定性进度；长TTS UDP保活假设既未被执行验证，也未被否证。本地源码同步撤销s1fs三文件改动并恢复exact s1fn marker，避免板上/源码错位。下一次长TTS方案必须先把“启动镜像变化为何触发bootloader_reset”作为独立前置问题，不能在功能补丁上继续缝补。
+- 镜像结构复核给出可重复判别指纹：known-good与撤销后重建的`s1fn`均为`0x461fb0`，7段顺序/地址/长度逐项一致（含`0x30100000/0x3d4`、`0x4ff00000/0x24`、IROM、再`0x4ff00024/0x16518`）；失败`s1fs`为`0x4622a0`，把`0x3010`数据拆为`0x2fc + 0xd8`并跨在IROM两侧，DRAM段也改从`0x4ff00000`起。两者校验和/validation hash均合法，因此不是写坏或格式损坏；当前证据支持“微小功能改动触发不兼容的应用segment布局，命中本板bootloader/硅片启动缺陷”，而不是运行期UDP逻辑或LVGL。该机制仍属强推断，后续须以链接布局守恒门验证。
+- 源码撤销后增量构建通过，应用重新为`0x461fb0`、余12%；`image_info`与已归档`s1fn_source_rebuild`的7段布局完全一致。新构建BIN hash因构建元数据不同而不要求字节相同；启动发布门改为同时检查marker、大小与segment布局，不能只看esptool hash verified。
+
+# 2026-08-21 s1ft — 主事件位驱动的长TTS UDP prime（V1）
+
+- s1fs除segment失守外还有线程模型缺陷：ML307 MQTT消息来自AT UART URC callback，若在回调内同步`udp_->Send()`可能等待同一UART响应，存在重入/死锁风险。s1ft不复用该路径：`sentence_start`只置FreeRTOS事件位，已有MainEventLoop消费后发送既有16B加密零payload transport-prime；不新增task/timer/lambda，不碰音频、视觉或会话状态。
+- 公共`SendAudio`仍拒绝带非零音频元数据的空包，只允许全零metadata的内部transport-prime；正常Opus路径不变。每个云端句子开始最多一个prime，事件位天然合并，慢时不排队补发。
+- 启动布局门：第一版新增C++ Schedule lambda使DROM增加`0xe8`并再次拆分`0x3010`段，V0直接拒绝、未烧录。最终实现DROM仅比s1fn增加4B，吃掉原有36B边界余量中的4B；7段仍保持`DROM → 完整0x30100000/0x3d4 → 0x4ff00000/0x20 → IROM → DRAM`，没有跨IROM拆段。IROM仅增加`0x60`，应用`0x462010`、余12%。
+- 归档：BIN SHA256=`10F163327FCFC1B36BEEC857C2591F8627CC81763E97B86671D9D191F62419AA`；ELF SHA256=`256EC10DB29628057E0A9A7572E5B1F1BBD8EE90AE9E396BF9918B395D33157D`。使用已验证启动链完整写六分区，全部hash verified；uptime 61.499s命中exact `s1ft` marker，AFE约5s连续、heap/idle正常，无bootloader reset，V1通过。
+- V2待用户物理冷启：先验`SD_MOUNT_OK + seed_stills 6/6 + AFE单实例`，再做>30s多句长回答。M+=sentence_start期间UDP下行序列连续至stop、播报/字幕/退出/二次唤醒完整；M-=再次出现大段sequence skip/断音、黑屏、卡会话或复位。任一M−完整R1回`s1fn_source_rebuild`，不在s1ft叠刀。
+- V2裁决PASS：物理冷启命中exact marker、`SD_MOUNT_OK`、`seed_stills done ok=6/6`、`PANIC_LAST none`且AFE单实例。长回答主段约`t=71.4s→147.7s`，连续多次`sentence_start/end`，UDP里程从约`#400`持续到`#1700`且`out_age`稳定在约24–50ms，最终`stop→Listening`正常；随后`channel_closed→wake_enable`约207ms，并成功开启下一轮会话。用户体感验收通过。当前只宣告功能V2，不以单次成功替代V3寿命裁决。

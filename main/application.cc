@@ -795,6 +795,9 @@ void Application::Start() {
                     }
                 });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+                xEventGroupSetBits(event_group_, MAIN_EVENT_TTS_UDP_PRIME);
+#endif
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
@@ -1006,6 +1009,9 @@ void Application::MainEventLoop() {
             #if CONFIG_USE_ALARM
             MAIN_EVENT_ALARM |
 #endif
+            #if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+            MAIN_EVENT_TTS_UDP_PRIME |
+#endif
             MAIN_EVENT_ERROR, pdTRUE, pdFALSE, portMAX_DELAY);
 
         if (bits & MAIN_EVENT_ERROR) {
@@ -1020,6 +1026,14 @@ void Application::MainEventLoop() {
                 }
             }
         }
+
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+        if (bits & MAIN_EVENT_TTS_UDP_PRIME) {
+            if (protocol_) {
+                protocol_->SendAudio(std::make_unique<AudioStreamPacket>());
+            }
+        }
+#endif
 
         if (bits & MAIN_EVENT_WAKE_WORD_DETECTED) {
             OnWakeWordDetected();
@@ -2097,7 +2111,7 @@ void Application::UpdateVisualBudgetShadow() {
         ? "none"
         : VisualBudgetV2_LevelName(static_cast<VisualBudgetLevel>(visual_budget_shadow_level_));
     ESP_LOGI(TAG,
-             "VIS_BUDGET_SHADOW level=%s prev=%s reason=%s state=%s dq=%u pq=%u sq=%u out_age=%ums hold=%d apply=%d s1fo",
+             "VIS_BUDGET_SHADOW level=%s prev=%s reason=%s state=%s dq=%u pq=%u sq=%u out_age=%ums hold=%d apply=%d s1fn",
              VisualBudgetV2_LevelName(decision.level), previous, decision.reason,
              STATE_STRINGS[device_state_], static_cast<unsigned>(sample.decode_queue),
              static_cast<unsigned>(sample.playback_queue), static_cast<unsigned>(sample.send_queue),

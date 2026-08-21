@@ -37,6 +37,9 @@
 #if CONFIG_USE_ALARM
 #define MAIN_EVENT_ALARM (1 << 7)
 #endif
+#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
+#define MAIN_EVENT_TTS_UDP_PRIME (1 << 8)
+#endif
 
 
 
