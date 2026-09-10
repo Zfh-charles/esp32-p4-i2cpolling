@@ -1,0 +1,9 @@
+{
+  "relay": "http://127.0.0.1:8768",
+  "state_dir": "C:/bake/xiaozhi-p4-epdainaozhong0109/lab-node-state",
+  "port": "COM7",
+  "monitor_lock": "C:/bake/xiaozhi-p4-epdainaozhong0109/serial_monitor.COM7.lock",
+  "allow_flash": false,
+  "approved_flash_sha256": [],
+  "flash_adapter": []
+}

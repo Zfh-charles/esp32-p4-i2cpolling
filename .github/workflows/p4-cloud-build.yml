@@ -1,0 +1,78 @@
+name: P4 cloud release
+
+on:
+  workflow_dispatch:
+    inputs:
+      inputs_commit:
+        description: Reviewed private build-inputs repository commit (40 hex characters)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p4-cloud-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # sdkconfig can contain compiled credentials. Never publish its BIN/ELF
+    # as public-repository artifacts, even when build inputs are private.
+    if: ${{ github.event.repository.private == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: p4-cloud-build
+    env:
+      LAB_IDF_PATH: ${{ runner.temp }}/esp-idf
+      LAB_OUTPUT: ${{ runner.temp }}/p4-release
+      LAB_JOB_ID: run-${{ github.run_id }}-${{ github.run_attempt }}
+      PRIVATE_INPUTS_COMMIT: ${{ inputs.inputs_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: source
+          persist-credentials: false
+      - name: Validate private input revision
+        run: '[[ "$PRIVATE_INPUTS_COMMIT" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Read pinned private build inputs
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.P4_INPUTS_REPOSITORY }}
+          ref: ${{ inputs.inputs_commit }}
+          token: ${{ secrets.P4_INPUTS_READ_TOKEN }}
+          path: private-inputs
+          persist-credentials: false
+      - name: Verify and install private inputs
+        run: python3 source/tools/lab_gateway/prepare_inputs.py --source private-inputs --project source
+      - name: Test delivery channel
+        working-directory: source/tools/lab_gateway
+        run: python3 -m unittest -v test_gateway test_github_delivery
+      - name: Install ESP-IDF Linux prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget flex bison gperf python3 python3-pip python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0
+      - name: Install pinned ESP-IDF
+        run: bash source/tools/lab_gateway/setup-cloud.sh
+      - name: Check release plan
+        run: bash source/tools/lab_gateway/build-cloud.sh --project "$GITHUB_WORKSPACE/source" --output "$LAB_OUTPUT" --id "$LAB_JOB_ID"
+      - name: Build release in one graph
+        run: bash source/tools/lab_gateway/build-cloud.sh --project "$GITHUB_WORKSPACE/source" --output "$LAB_OUTPUT" --id "$LAB_JOB_ID" --execute
+      - name: Store Surface firmware bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: p4-firmware-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.LAB_OUTPUT }}/${{ env.LAB_JOB_ID }}/firmware.bin
+            ${{ env.LAB_OUTPUT }}/${{ env.LAB_JOB_ID }}/job.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Store matching debug ELF separately
+        uses: actions/upload-artifact@v4
+        with:
+          name: p4-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.LAB_OUTPUT }}/${{ env.LAB_JOB_ID }}/firmware.elf
+            ${{ env.LAB_OUTPUT }}/${{ env.LAB_JOB_ID }}/job.json
+          if-no-files-found: error
+          retention-days: 7
