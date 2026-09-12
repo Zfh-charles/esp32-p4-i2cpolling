@@ -56,4 +56,7 @@ private:
     std::unique_ptr<Http> SetupHttp();
 };
 
+/** ABI-neutral entry used by the delayed local-health confirmation path. */
+bool OtaMarkCurrentVersionValid();
+
 #endif // _OTA_H

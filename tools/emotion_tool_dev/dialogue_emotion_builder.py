@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import shutil
 import sys
@@ -369,10 +370,27 @@ def build_life_layer(frames: list[Frame], hold: dict, base_frame: int, base: np.
                             "mask_sha256": sha256(mask_path.read_bytes()),
                             "peak_alpha": int(alpha.max()),
                             "active_ratio": round(float(np.count_nonzero(alpha)) / alpha.size, 4)})
-        tracks.append({"id": track_id, "roi": roi, "motion_score": round(best_score, 3),
-                       "semantic": semantic_labels.get(str(track_id), "auto_unreviewed"),
-                       "approval": "profile" if approved_tracks is not None else "auto_unreviewed",
-                       "frames": entries})
+        semantic = semantic_labels.get(str(track_id), "auto_unreviewed")
+        track = {"id": track_id, "roi": roi, "motion_score": round(best_score, 3),
+                 "semantic": semantic,
+                 "approval": "profile" if approved_tracks is not None else "auto_unreviewed",
+                 "frames": entries}
+        if approved_tracks is not None and semantic not in ("", "auto_unreviewed", "profile_approved"):
+            # Four perceptual keyframes preserve the full PC-authored rise/peak/fall/base
+            # gesture while capping P4 idle traffic to four <=48-row commits.
+            last = len(entries) - 1
+            keyframes = [1, len(entries) // 2, max(1, last - 1), last]
+            keyframes = list(dict.fromkeys(keyframes))
+            if len(keyframes) >= 3:
+                track["choreography"] = {
+                    "schema": "idle-life-cluster-v1",
+                    "keyframes": keyframes,
+                    "frame_interval_ms": 240,
+                    "rest_ms": {"min": 4200, "max": 6900},
+                    "busy_policy": "abort_to_base_no_replay",
+                    "returns_to_base": True,
+                }
+        tracks.append(track)
 
     generation_seed = (sha256(base.tobytes()) + emotion + json.dumps(ids) +
                        json.dumps([t["roi"] for t in tracks], sort_keys=True)).encode("utf-8")
@@ -905,16 +923,20 @@ def main() -> int:
                     help="Do not generate the rejected angry/sad common-hub experiment")
     ap.add_argument("--skip-release-layer", action="store_true",
                     help="Keep the v5 contract: do not emit the rejected angry/sad release track")
-    ap.add_argument("--life-approved-tracks", action="append", default=[], metavar="EMOTION:IDS",
-                    help="Semantic gate for auto life candidates, e.g. happy:1 or standby:0,1")
+    ap.add_argument("--life-approved-tracks", action="append", default=[], metavar="EMOTION:IDS[:SEMANTIC]",
+                    help="Semantic gate, e.g. standby:1:body_breathe or happy:1:body_weight_shift")
     args = ap.parse_args()
     if args.input.resolve() == args.output.resolve() or args.input.resolve() in args.output.resolve().parents:
         raise ValueError("output must not be the input directory or inside it")
     profile = load_profile(args.profile)
     for spec in args.life_approved_tracks:
-        emotion, sep, ids_raw = spec.partition(":")
-        if not sep or emotion not in EMOTIONS:
-            raise ValueError("--life-approved-tracks expects EMOTION:IDS with a known emotion")
+        parts = spec.split(":", 2)
+        if len(parts) < 2 or parts[0] not in EMOTIONS:
+            raise ValueError("--life-approved-tracks expects EMOTION:IDS[:SEMANTIC] with a known emotion")
+        emotion, ids_raw = parts[0], parts[1]
+        semantic = parts[2].strip() if len(parts) == 3 else "profile_approved"
+        if len(parts) == 3 and (not semantic or not semantic.replace("_", "").isalnum()):
+            raise ValueError("life semantic must be a non-empty identifier")
         try:
             ids = [] if not ids_raw else [int(v) for v in ids_raw.split(",")]
         except ValueError as exc:
@@ -922,7 +944,7 @@ def main() -> int:
         item = profile.setdefault("emotions", {}).setdefault(emotion, {})
         item["life_track_policy"] = {
             "approved_auto_tracks": ids,
-            "semantic_labels": {str(v): "profile_approved" for v in ids},
+            "semantic_labels": {str(v): semantic for v in ids},
         }
     if not 1.0 <= args.max_mouth_soften <= 2.0:
         raise ValueError("--max-mouth-soften must be in 1.0..2.0")

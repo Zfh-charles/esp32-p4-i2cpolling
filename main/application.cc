@@ -12,6 +12,7 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "ports/visual_port.h"
 #include <esp_system.h>
 #if CONFIG_USE_REMINDER_POLL
 #include "reminder/reminder_trace.h"
@@ -26,7 +27,6 @@
 #endif
 
 #if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
-#include "boards/ep-chat-p4-ml307/eezui_display_adapter.h"
 #include "boards/ep-chat-p4-ml307/face_route_v2.h"
 #include "boards/ep-chat-p4-ml307/visual_budget_v2.h"
 #endif
@@ -39,6 +39,7 @@ inline void IdleWdtMarkTraced(const char* phase, const char* detail) {
     BootTraceMark(phase, detail ? detail : "-");
 #endif
 }
+
 }  // namespace
 
 #include <cstring>
@@ -51,36 +52,8 @@ inline void IdleWdtMarkTraced(const char* phase, const char* detail) {
 #include <arpa/inet.h>
 #include <font_awesome.h>
 
-#if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
-namespace {
-// Cloud often answers TTS without type=llm; map user STT intent to a face still.
-const char* InferFaceEmotionFromStt(const char* text) {
-    if (!text || text[0] == '\0') {
-        return nullptr;
-    }
-    if (strstr(text, "愤怒") || strstr(text, "生气") || strstr(text, "发火") ||
-        strstr(text, "怒") || strstr(text, "angry")) {
-        return "angry";
-    }
-    if (strstr(text, "悲伤") || strstr(text, "难过") || strstr(text, "伤心") ||
-        strstr(text, "哭") || strstr(text, "sad")) {
-        return "sad";
-    }
-    if (strstr(text, "开心") || strstr(text, "高兴") || strstr(text, "快乐") ||
-        strstr(text, "笑") || strstr(text, "happy")) {
-        return "happy";
-    }
-    if (strstr(text, "喜欢") || strstr(text, "亲亲") || strstr(text, "loving") ||
-        strstr(text, "love")) {
-        return "loving";
-    }
-    if (strstr(text, "中性") || strstr(text, "平静") || strstr(text, "neutral")) {
-        return "neutral";
-    }
-    return nullptr;
-}
-}  // namespace
-#endif
+#include "domain/emotion_intent_policy.h"
+
 #define TAG "Application"
 
 
@@ -265,7 +238,8 @@ void Application::CheckNewVersion(Ota& ota) {
             // If upgrade failed, continue to normal operation (don't break, just fall through)
         }
 
-        // No new version, mark the current version as valid
+        // Cloud success is the fast confirmation path. BootTrace provides the
+        // bounded local-health fallback when this endpoint is unavailable.
         ota.MarkCurrentVersionValid();
         if (!ota.HasActivationCode() && !ota.HasActivationChallenge()) {
             xEventGroupSetBits(event_group_, MAIN_EVENT_CHECK_NEW_VERSION_DONE);
@@ -580,8 +554,11 @@ void Application::Start() {
         last_error_message_ = message;
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
     });
-    protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        auto push_audio = [this](std::unique_ptr<AudioStreamPacket> pkt) {
+    protocol_->OnIncomingAudio([this, display](std::unique_ptr<AudioStreamPacket> packet) {
+        auto push_audio = [this, display](std::unique_ptr<AudioStreamPacket> pkt) {
+            if (!visual_tts_audio_started_.exchange(true, std::memory_order_acq_rel)) {
+                VisualPort(display).NotifyTtsAudioFirst();
+            }
 #if CONFIG_USE_REMINDER_POLL
             if (session_kind_ == SessionKind::ProactiveReminder) {
                 proactive_audio_packets_++;
@@ -714,7 +691,13 @@ void Application::Start() {
         }
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
+            if (!cJSON_IsString(state) || state->valuestring == nullptr) {
+                ESP_LOGW(TAG, "CTRL tts state=invalid");
+                return;
+            }
             if (strcmp(state->valuestring, "start") == 0) {
+                visual_tts_audio_started_.store(false, std::memory_order_release);
+                VisualPort(display).NotifyTtsStart();
                 Schedule([this]() {
                     aborted_ = false;
 #if CONFIG_USE_REMINDER_POLL
@@ -818,7 +801,7 @@ void Application::Start() {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
 #if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
                 // Sync hint before Schedule — TTS/speaking often races past STT UI task.
-                if (const char* hint = InferFaceEmotionFromStt(text->valuestring)) {
+                if (const char* hint = domain::InferCanonicalEmotionFromText(text->valuestring)) {
                     stt_face_hint_ = hint;
                     ESP_LOGW(TAG, "FACE_STT_HINT emo=%s text=%.48s", hint, text->valuestring);
                     esp_rom_printf("!!FACE_STT_HINT emo=%s\n", hint);
@@ -1280,14 +1263,14 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
     auto& audio = audio_service_;
 
 #if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
-    auto* eezui_display = dynamic_cast<EezuiDisplayAdapter*>(Board::GetInstance().GetDisplay());
+    VisualPort visual_port(Board::GetInstance().GetDisplay());
     auto ApplyMjpegForConversation = [&](const char* why, bool is_speaking) {
-        if (eezui_display == nullptr) {
+        if (!visual_port.Available()) {
             return;
         }
         if ((!is_speaking && mjpeg_skip_resume_while_listening_) ||
             (is_speaking && mjpeg_skip_resume_while_speaking_)) {
-            eezui_display->PauseMjpegHeavyWork();
+            visual_port.PauseMjpegHeavyWork();
             mjpeg_wake_coexist_paused_ = true;
             ESP_LOGW(TAG, "CTRL pause MJPEG in conversation (%s) speaking=%d",
                      why ? why : "?", (int)is_speaking);
@@ -1297,13 +1280,13 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
         }
         if (is_speaking) {
             const uint32_t fps = mjpeg_speaking_fps_ ? mjpeg_speaking_fps_ : 5;
-            eezui_display->ResumeMjpegHeavyWorkAtFps(fps);
+            visual_port.ResumeMjpegHeavyWorkAtFps(fps);
             mjpeg_wake_coexist_paused_ = false;
             ESP_LOGW(TAG, "CTRL resume MJPEG speaking@%ufps (%s)", (unsigned)fps, why ? why : "?");
             BootTraceMark("MJPEG_SPEAK_FPS", why ? why : "-");
             return;
         }
-        eezui_display->ResumeMjpegHeavyWork();
+        visual_port.ResumeMjpegHeavyWork();
         mjpeg_wake_coexist_paused_ = false;
         ESP_LOGW(TAG, "POLICY resume MJPEG for conversation (%s)", why ? why : "?");
         BootTraceMark("MJPEG_RESUME_CONV", why ? why : "-");
@@ -1336,9 +1319,9 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
                 }
 #if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
                 // Pause decode BEFORE arming wake — AFE + full-screen LVGL flush => HP_WDT.
-                if (eezui_display != nullptr) {
-                    eezui_display->LeaveConversationPresent();
-                    eezui_display->PauseMjpegHeavyWork();
+                if (visual_port.Available()) {
+                    visual_port.LeaveConversationPresent();
+                    visual_port.PauseMjpegHeavyWork();
                     mjpeg_wake_coexist_paused_ = true;
                     mjpeg_resume_since_us_ = 0;
                     emotion_preload_arm_since_us_ = 0;
@@ -1348,7 +1331,7 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
                         ESP_LOGW(TAG, "CTRL P2 safe_preload sync begin (wake=0)");
                         SystemInfo::PrintHeapStats("p2_preload_begin");
                         BootTraceMarkHeap("P2_PRELOAD_BEGIN");
-                        const bool ok = eezui_display->PreloadBaseEmotionsSync();
+                        const bool ok = visual_port.PreloadBaseEmotionsSync();
                         deferred_emotion_preload_started_ = true;
                         ESP_LOGW(TAG, "CTRL P2 safe_preload sync end ok=%d", ok ? 1 : 0);
                         SystemInfo::PrintHeapStats("p2_preload_end");
@@ -1376,8 +1359,8 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
                 }
 #if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
                 ApplyMjpegForConversation("listening_reminder", false);
-                if (eezui_display != nullptr) {
-                    eezui_display->EnterConversationPresent();
+                if (visual_port.Available()) {
+                    visual_port.EnterConversationPresent();
                 }
 #endif
                 break;
@@ -1396,7 +1379,7 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
                 }
                 protocol_->SendStartListening(listening_mode_);
             }
-            if (eezui_display != nullptr) {
+            if (visual_port.Available()) {
                 ESP_LOGW(TAG, "CTRL PRESENT DIAG before_enter wake=%d voice=%d state=listening",
                          audio.IsWakeWordRunning() ? 1 : 0,
                          audio.IsAudioProcessorRunning() ? 1 : 0);
@@ -1404,7 +1387,7 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
                 esp_rom_printf("!!PRESENT_HOOK listen wake=%d voice=%d\n",
                                audio.IsWakeWordRunning() ? 1 : 0,
                                audio.IsAudioProcessorRunning() ? 1 : 0);
-                eezui_display->EnterConversationPresent();
+                visual_port.EnterConversationPresent();
                 esp_rom_printf("!!PRESENT_HOOK listen done\n");
                 ESP_LOGW(TAG, "CTRL PRESENT DIAG after_enter wake=%d voice=%d",
                          audio.IsWakeWordRunning() ? 1 : 0,
@@ -1427,8 +1410,8 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
                 audio.SetAudioRoute(AudioRoute::Playback);
 #if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
                 ApplyMjpegForConversation("speaking_reminder", true);
-                if (eezui_display != nullptr) {
-                    eezui_display->EnterConversationPresent();
+                if (visual_port.Available()) {
+                    visual_port.EnterConversationPresent();
                 }
 #endif
                 break;
@@ -1447,8 +1430,8 @@ void Application::ApplyAudioPolicyForState(DeviceState state, DeviceState previo
             audio.ResetDecoder();
 #if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
             ApplyMjpegForConversation("speaking", true);
-            if (eezui_display != nullptr) {
-                eezui_display->EnterConversationPresent();
+            if (visual_port.Available()) {
+                visual_port.EnterConversationPresent();
                 // Cloud often skips type=llm; apply STT face hint as still-only (no burst).
                 if (!stt_face_hint_.empty()) {
                     const std::string emo = stt_face_hint_;
@@ -1633,8 +1616,8 @@ void Application::TryStartDeferredEmotionPreload() {
         return;
     }
 
-    auto* eezui_display = dynamic_cast<EezuiDisplayAdapter*>(Board::GetInstance().GetDisplay());
-    if (eezui_display != nullptr) {
+    VisualPort visual_port(Board::GetInstance().GetDisplay());
+    if (visual_port.Available()) {
         if (mjpeg_wake_coexist_paused_ && mjpeg_resume_since_us_ == 0) {
             if (mjpeg_skip_resume_while_wake_) {
                 // Keep paused_; only unblock reminder-net stagger.
@@ -1652,7 +1635,7 @@ void Application::TryStartDeferredEmotionPreload() {
                 BootTraceClearCrashStreak();
                 IdleWdtMarkTraced("IDLE_SKIP_END", "ok");
             } else {
-                eezui_display->ResumeMjpegHeavyWork();
+                visual_port.ResumeMjpegHeavyWork();
                 mjpeg_wake_coexist_paused_ = false;
                 mjpeg_resume_since_us_ = now_us;
                 ESP_LOGI(TAG, "MJPEG resumed %ds after wake stable", (int)mjpeg_resume_defer_sec_);
@@ -1685,14 +1668,14 @@ void Application::TryStartDeferredEmotionPreload() {
                      (int)wake_elapsed_s, (int)after_net_s, (unsigned)free_int, (unsigned)free_psram);
             SystemInfo::PrintHeapStats("preload_start");
             StackDiagLog("app_before_preload_start", "arming_emotion_preload");
-            eezui_display->StartDeferredEmotionPreload();
+            visual_port.StartDeferredEmotionPreload();
             deferred_emotion_preload_started_ = true;
             ESP_LOGI(TAG, "Deferred emotion preload started %ds after wake ready", (int)wake_elapsed_s);
         }
     } else if (!deferred_emotion_preload_started_) {
         mjpeg_wake_coexist_paused_ = false;
         deferred_emotion_preload_started_ = true;
-        ESP_LOGW(TAG, "Skip deferred emotion preload: display is not EezuiDisplayAdapter");
+        ESP_LOGW(TAG, "Skip deferred emotion preload: visual port unavailable");
     }
 }
 #endif
@@ -2038,10 +2021,10 @@ void Application::SetDeviceState(DeviceState state) {
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
 #if CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307
-            // Leave conversation before idle face so seed blit is outside present mode.
-            if (auto* eezui = dynamic_cast<EezuiDisplayAdapter*>(display)) {
-                eezui->LeaveConversationPresent();
-            }
+            // Arm sparse idle life only after full-frame MJPEG is paused.  The
+            // previous order could silently lose the one-shot arm at idle entry.
+            VisualPort(display).LeaveConversationPresent();
+            VisualPort(display).PauseMjpegHeavyWork();
 #endif
             display->SetEmotion("standby");
             break;
@@ -2111,7 +2094,7 @@ void Application::UpdateVisualBudgetShadow() {
         ? "none"
         : VisualBudgetV2_LevelName(static_cast<VisualBudgetLevel>(visual_budget_shadow_level_));
     ESP_LOGI(TAG,
-             "VIS_BUDGET_SHADOW level=%s prev=%s reason=%s state=%s dq=%u pq=%u sq=%u out_age=%ums hold=%d apply=%d s1fn",
+             "VIS_BUDGET_SHADOW level=%s prev=%s reason=%s state=%s dq=%u pq=%u sq=%u out_age=%ums hold=%d apply=%d s1fz",
              VisualBudgetV2_LevelName(decision.level), previous, decision.reason,
              STATE_STRINGS[device_state_], static_cast<unsigned>(sample.decode_queue),
              static_cast<unsigned>(sample.playback_queue), static_cast<unsigned>(sample.send_queue),

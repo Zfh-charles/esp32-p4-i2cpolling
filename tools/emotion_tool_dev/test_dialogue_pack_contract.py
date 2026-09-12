@@ -96,6 +96,72 @@ class DialoguePackContractTest(unittest.TestCase):
             self.assertFalse(report["ok"])
             self.assertTrue(any("RGB565 size" in e for e in report["errors"]))
 
+    def add_closed_life_choreography(self, root: Path, *, break_closure: bool = False) -> None:
+        folder = root / "standby"
+        path = folder / "manifest.json"
+        manifest = json.loads(path.read_text())
+        life_dir = folder / "life" / "track_1"
+        life_dir.mkdir(parents=True)
+        frames = []
+        values = (0, 32, 96, 0 if not break_closure else 7)
+        for index, value in enumerate(values):
+            rgb = bytes([value]) * (8 * 8 * 2)
+            mask = bytes([0 if index in (0, 3) else 128]) * (8 * 8)
+            rgb_path = life_dir / f"{index:02d}.rgb565"
+            mask_path = life_dir / f"{index:02d}.a8"
+            rgb_path.write_bytes(rgb)
+            mask_path.write_bytes(mask)
+            frames.append({
+                "sequence": index,
+                "rgb565": f"life/track_1/{index:02d}.rgb565",
+                "rgb565_sha256": hashlib.sha256(rgb).hexdigest(),
+                "mask_a8": f"life/track_1/{index:02d}.a8",
+                "mask_sha256": hashlib.sha256(mask).hexdigest(),
+                "peak_alpha": 0 if index in (0, 3) else 128,
+                "active_ratio": 0.0 if index in (0, 3) else 1.0,
+            })
+        hold_hash = hashlib.sha256((folder / "hold_base.rgb565").read_bytes()).hexdigest()
+        manifest["render"]["life_layer"] = {
+            "base_rgb565_sha256": hold_hash,
+            "max_tracks_per_tick": 1,
+            "schedule": "interleave_latest_drop_old",
+            "tracks": [{
+                "id": 1,
+                "approval": "profile",
+                "semantic": "body_breathe",
+                "roi": {"x": 200, "y": 360, "width": 8, "height": 8},
+                "frames": frames,
+                "choreography": {
+                    "schema": "idle-life-cluster-v1",
+                    "keyframes": [1, 2, 3],
+                    "frame_interval_ms": 240,
+                    "rest_ms": {"min": 4200, "max": 6900},
+                    "busy_policy": "abort_to_base_no_replay",
+                    "returns_to_base": True,
+                },
+            }],
+        }
+        path.write_text(json.dumps(manifest))
+
+    def test_accepts_profile_approved_closed_life_choreography(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            self.make_pack(root)
+            self.add_closed_life_choreography(root)
+            report = validate_pack(root)
+            self.assertTrue(report["ok"], report["errors"])
+            standby = next(item for item in report["clips"] if item["emotion"] == "standby")
+            self.assertEqual(standby["life_choreographies"], 1)
+
+    def test_rejects_life_choreography_that_does_not_return_to_base(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            self.make_pack(root)
+            self.add_closed_life_choreography(root, break_closure=True)
+            report = validate_pack(root)
+            self.assertFalse(report["ok"])
+            self.assertTrue(any("close exactly on canonical base" in e for e in report["errors"]))
+
 
 if __name__ == "__main__":
     unittest.main()

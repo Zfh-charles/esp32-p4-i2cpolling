@@ -7,6 +7,8 @@
 #include <esp_err.h>
 #include <esp_timer.h>
 
+#include "domain/face_state_reducer.h"
+
 class EezuiDisplayAdapter;
 
 /**
@@ -25,6 +27,12 @@ class EezuiDisplayAdapter;
 
 #ifndef SCREEN_PRESENT_USE_COMPOSE_BLIT
 #define SCREEN_PRESENT_USE_COMPOSE_BLIT 0
+#endif
+
+// R0 for the G3b state-owner flip. Zero restores the legacy scalar fields and
+// branch logic without changing any presenter call site.
+#ifndef SCREEN_PRESENTER_USE_STATE_REDUCER
+#define SCREEN_PRESENTER_USE_STATE_REDUCER 1
 #endif
 
 /**
@@ -97,10 +105,14 @@ private:
     /** s1cn-b: requested → pending → committed (overwrite pending; commit at safe points). */
     std::string emotion_pending_;
     std::string emotion_committed_;
+#if SCREEN_PRESENTER_USE_STATE_REDUCER
+    domain::FaceStateReducer face_state_;
+#else
     uint32_t speech_generation_ = 0;
     uint32_t emotion_pending_generation_ = 0;
     uint32_t emotion_committed_generation_ = 0;
     bool speech_turn_active_ = false;
+#endif
     std::string dialogue_text_;
     std::string caption_role_;
     std::string status_phase_;

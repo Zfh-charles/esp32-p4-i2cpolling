@@ -1,5 +1,7 @@
 #include "eezui_display_adapter.h"
 #include "face_mouth_layer.h"
+#include "face_asset_source.h"
+#include "face_speech_core_bank.h"
 #include "face_route_v2.h"
 #include "visual_budget_v2.h"
 #include "screen_presenter.h"
@@ -7,6 +9,7 @@
 
 #include <esp_log.h>
 #include <esp_err.h>
+#include <esp_attr.h>
 #include <esp_timer.h>
 #include <esp_rom_sys.h>
 #include <esp_lvgl_port.h>
@@ -81,6 +84,13 @@ static constexpr int kLvglLockTickMs = 10;    /* anim tick best-effort */
 static constexpr int kLvglLockCbMs = 5;       /* short callback / timer path */
 
 namespace {
+
+// Optional-canary diagnostics are internal-DRAM strings.  This preserves the
+// P4 v1.0 pre-IROM/TCM topology while adding no pixel buffer at runtime.
+DRAM_ATTR const char kIdleFlashArmLog[] = "I (%lu) FaceIdle: arm rows=48 flash=1\n";
+DRAM_ATTR const char kIdleFlashFallbackLog[] = "I (%lu) FaceIdle: asset=0 fallback=1\n";
+DRAM_ATTR const char kIdleFlashFrameLog[] = "I (%lu) FaceIdle: f=%u abort=%u err=%d next=%u\n";
+DRAM_ATTR const char kIdleFlashDropLog[] = "I (%lu) FaceIdle: drop=%u\n";
 
 bool IsLifeLayerEmotion(const std::string& emotion) {
     return strcasecmp(emotion.c_str(), "happy") == 0 ||
@@ -230,6 +240,9 @@ EezuiDisplayAdapter::~EezuiDisplayAdapter() {
     }
 
 void EezuiDisplayAdapter::ShowFaceCanvasLayers() {
+    // Any canonical face commit supersedes the idle child overlay.  This runs
+    // under the caller's LVGL lock and closes the rare StopIdleBreathe try-lock miss.
+    idle_flash_overlay_.Hide();
     if (main_image_ != nullptr) {
         lv_obj_add_flag(main_image_, LV_OBJ_FLAG_HIDDEN);
     }
@@ -985,6 +998,7 @@ MipiEezuiDisplayAdapter::MipiEezuiDisplayAdapter(esp_lcd_panel_io_handle_t panel
         // s1aq: use dirty flush area (was always 480² → false "full flush" signal).
         if (code == LV_EVENT_FLUSH_START || code == LV_EVENT_FLUSH_FINISH) {
             const lv_area_t* area = (const lv_area_t*)lv_event_get_param(e);
+            if (code == LV_EVENT_FLUSH_START) IdleFlashBandOverlay::TraceFlush(disp, area);
             if (area) {
                 area_px = (uint32_t)(area->x2 - area->x1 + 1) * (uint32_t)(area->y2 - area->y1 + 1);
             }
@@ -1187,6 +1201,7 @@ bool EezuiDisplayAdapter::PreloadBaseEmotionsSync() {
         esp_rom_printf("!!FACE_SELFTEST skip_boot_burst\n");
         // s1cs/s1ct: restore idle BAND breathe — do not kill dynamics for WDT (B3/F6).
         FaceMouth_BootProbe();
+        const bool speech_core_ready = FaceSpeechCore_Preload();
         ArmIdleBreathe("seed_ready");
     }
     return ret == ESP_OK;
@@ -1684,7 +1699,6 @@ esp_err_t EezuiDisplayAdapter::PresentFaceFrameToLvgl(const uint8_t* rgb, uint32
         end_fs();
         return serr;
     }
-
     if (!seed_full && last_bypass_rgb_ != nullptr && last_bypass_w_ == w &&
         last_bypass_h_ == h && last_bypass_size_ >= size) {
         const uint16_t* prev = reinterpret_cast<const uint16_t*>(last_bypass_rgb_);
@@ -1872,13 +1886,21 @@ void EezuiDisplayAdapter::HideFaceLayersForPanelHold() {
 void EezuiDisplayAdapter::StopIdleBreathe(const char* why) {
     AfeFetchGateCancelIdleVisualEdge();
     StopIdleBacklightBreathe(why);
-    if (!idle_breathe_ && !idle_breathe_need_prime_ && idle_breathe_left_ <= 0) {
+    if (idle_breathe_flash_overlay_ && SafeLVGLLock(0)) {
+        idle_flash_overlay_.Hide();
+        SafeLVGLUnlock();
+    }
+    if (!idle_breathe_ && !idle_breathe_need_prime_ && idle_breathe_left_ <= 0 &&
+        !idle_breathe_flash_overlay_) {
         return;
     }
     idle_breathe_ = false;
     idle_breathe_small_life_ = false;
+    idle_breathe_flash_overlay_ = false;
     idle_life_track_ = 0;
     idle_life_frame_ = 0;
+    idle_life_repair_attempts_ = 0;
+    idle_life_repair_pending_ = false;
     idle_breathe_need_prime_ = false;
     idle_breathe_left_ = 0;
     idle_breathe_gen_++;
@@ -1908,13 +1930,56 @@ void EezuiDisplayAdapter::ArmIdleBreathe(const char* why) {
         face_anim_await_settle_) {
         return;
     }
-    const bool idle_life_canary = FaceRouteV2_VisualBudgetShadowEnabled() &&
-                                  FaceRouteV2_IdleLifeCanaryEnabled();
-    // s1fd: standby life must not compete with continuously-running WakeNet.
-    // PWM changes only the backlight duty and touches no framebuffer/PSRAM/DMA.
-    // s1fo deliberately bypasses it only for the approved <=48-row life canary.
-    if (!idle_life_canary && FaceRouteV2_IdleBacklightBreatheEnabled() &&
-        ArmIdleBacklightBreathe(why)) {
+    if (FaceRouteV2_IdleFlashOverlayEnabled() && idle_flash_overlay_.Ready()) {
+        if (!EnsureFaceAnimTimer()) {
+            return;
+        }
+        StopIdleBacklightBreathe("s1gt_flash_overlay");
+        idle_breathe_ = true;
+        idle_breathe_flash_overlay_ = true;
+        idle_breathe_small_life_ = false;
+        idle_life_frame_ = 0;
+        idle_life_repair_attempts_ = 0;
+        idle_life_repair_pending_ = false;
+        idle_breathe_need_prime_ = false;
+        idle_breathe_left_ = IdleFlashBandOverlay::kFrameCount;
+        idle_breathe_gen_++;
+        esp_timer_stop(face_anim_timer_);
+        esp_timer_start_once(face_anim_timer_, 4200 * 1000LL);
+        esp_log_write(ESP_LOG_INFO, TAG, kIdleFlashArmLog,
+                      static_cast<unsigned long>(esp_log_timestamp()));
+        return;
+    }
+    if (FaceRouteV2_IdleFlashOverlayEnabled()) {
+        // Missing/corrupt assets must not reopen the rejected s1gs PSRAM token path.
+        // Keep the s1fw visible fallback or static standby instead.
+        if (FaceRouteV2_IdleBacklightBreatheEnabled()) {
+            (void)ArmIdleBacklightBreathe("s1gt_asset_fallback");
+        }
+        esp_log_write(ESP_LOG_INFO, TAG, kIdleFlashFallbackLog,
+                      static_cast<unsigned long>(esp_log_timestamp()));
+        return;
+    }
+    // s1fu: the v5p3-approved lower standby track is the only framebuffer
+    // idle-life candidate. The approved PC profile track1 is compacted to
+    // runtime slot 0; qualify it again by its single-track/lower-face geometry.
+    const bool token_canary = FaceRouteV2_IdleLifeTokenCanaryEnabled();
+    bool small_life = false;
+    if (token_canary && FaceRouteV2_StandbyLifeEnabled() &&
+        FaceMouth_BindEmotion("standby") && FaceAsset_LifeReady() &&
+        FaceAsset_LifeTrackCount() == 1) {
+        small_life = FaceAsset_LifeFrameCount(0) > 1;
+    }
+    if (token_canary && small_life && FaceRouteV2_IdleBacklightBreatheEnabled()) {
+        (void)ArmIdleBacklightBreathe("s1fw_visible_base");
+    }
+    if (!small_life && FaceRouteV2_IdleBacklightBreatheEnabled() &&
+        ArmIdleBacklightBreathe(token_canary ? "s1fu_asset_fallback" : why)) {
+        return;
+    }
+    if (token_canary && !small_life) {
+        // Never let a missing/invalid layered contract reopen the legacy 400-row
+        // idle path. Static standby is the safe final fallback for this canary.
         return;
     }
     // s1cs: FullStill still arms idle breathe, but ticks use BAND (not 480² seed_full).
@@ -1923,15 +1988,9 @@ void EezuiDisplayAdapter::ArmIdleBreathe(const char* why) {
     if (!EnsureFaceAnimTimer()) {
         return;
     }
-    const bool small_life = FaceRouteV2_StandbyLifeEnabled() &&
-                            FaceMouth_BindEmotion("standby") && FaceMouth_LifeReady();
-    if (idle_life_canary && !small_life) {
-        // Never let a missing v2 pack fall through to the legacy 400-row band.
-        ESP_LOGW(TAG, "s1fo idle_life_canary fallback=backlight reason=no_pack");
-        if (FaceRouteV2_IdleBacklightBreatheEnabled()) {
-            ArmIdleBacklightBreathe("s1fo_no_pack");
-        }
-        return;
+    if (!token_canary) {
+        small_life = FaceRouteV2_StandbyLifeEnabled() &&
+                     FaceMouth_BindEmotion("standby") && FaceAsset_LifeReady();
     }
     AfeFetchGateSetIdleVisualNotify(&IdleVisualAfeEdgeNotify, nullptr);
     idle_breathe_ = true;
@@ -1939,8 +1998,10 @@ void EezuiDisplayAdapter::ArmIdleBreathe(const char* why) {
     idle_breathe_small_life_ = small_life;
     idle_life_track_ = 0;
     idle_life_frame_ = 0;
+    idle_life_repair_attempts_ = 0;
+    idle_life_repair_pending_ = false;
     idle_breathe_left_ = idle_breathe_small_life_
-                             ? (int)FaceMouth_LifeFrameCount(idle_life_track_)
+                             ? (int)FaceAsset_LifeFrameCount(idle_life_track_)
                              : 6;  // budgeted cycle (not speak loop_continue)
     // s1bx: span standby clip like MID arc — not 6 consecutive frames at fc/3.
     idle_breathe_arc_step_ =
@@ -1956,13 +2017,10 @@ void EezuiDisplayAdapter::ArmIdleBreathe(const char* why) {
              idle_breathe_left_, (unsigned)idle_breathe_arc_step_);
     esp_rom_printf("!!FACE_S1EP idle_life=%d frames=%d\n",
                    idle_breathe_small_life_ ? 1 : 0, idle_breathe_left_);
-    if (idle_life_canary) {
-        ESP_LOGW(TAG,
-                 "s1fo idle_life_canary arm rows_max=48 frame_ms=420 rest_ms=8000 latest=1");
-        esp_rom_printf("!!FACE_S1FO x=idle_life_arm rows=48\n");
-    }
-    // First tick after short delay so bookend flush settles.
-    esp_timer_start_once(face_anim_timer_, 500 * 1000);
+    // The canary spends one sparse token every 4–7 seconds; the legacy path
+    // retains its existing short prime delay.
+    esp_timer_start_once(face_anim_timer_,
+                         token_canary ? (4200 * 1000LL) : (500 * 1000LL));
 }
 
 bool EezuiDisplayAdapter::ArmIdleBacklightBreathe(const char* why) {
@@ -2054,15 +2112,16 @@ void EezuiDisplayAdapter::IdleBacklightBreatheTick() {
         idle_backlight_last_command_ = current;
         idle_backlight_phase_ = 0;
     }
-    // 24 x 300ms = 7.2s.  One-percent steps approximate a shallow breath while
-    // avoiding any framebuffer work.  At low brightness the amplitude scales down.
+    // 24 x 300ms = 7.2s. s1fd's four-point ceiling was imperceptible on this
+    // panel; s1fw keeps the same smooth envelope but allows an eight-point peak.
+    // This remains PSRAM-free and scales down automatically at low brightness.
     static constexpr uint8_t kEnvelope[24] = {
         0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 4,
         4, 4, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0,
     };
-    uint8_t amplitude = idle_backlight_base_ / 18;
+    uint8_t amplitude = idle_backlight_base_ / 12;
     if (amplitude < 1) amplitude = 1;
-    if (amplitude > 4) amplitude = 4;
+    if (amplitude > 8) amplitude = 8;
     const uint8_t depth =
         (uint8_t)((kEnvelope[idle_backlight_phase_] * amplitude + 2) / 4);
     const uint8_t target = idle_backlight_base_ > depth
@@ -2096,17 +2155,124 @@ void EezuiDisplayAdapter::IdleBreatheTick() {
         return;
     }
 
-    const bool idle_life_canary = FaceRouteV2_VisualBudgetShadowEnabled() &&
-                                  FaceRouteV2_IdleLifeCanaryEnabled();
-    if (idle_life_canary && idle_breathe_small_life_ &&
-        VisualBudgetV2_Current() != VisualBudgetLevel::TransitionCandidate) {
-        // Candidate is necessary but not sufficient; the existing AFE/MQTT
-        // try-locks below remain the final authority. Never queue missed life.
+    if (idle_breathe_flash_overlay_) {
+        static constexpr uint16_t kRestMs[] = {4200, 5300, 6400, 6900};
+        constexpr uint16_t kFrameMs = 240;
+        constexpr uint16_t kRepairMs = 40;
+        const bool visual_ok =
+            VisualBudgetV2_Current() == VisualBudgetLevel::TransitionCandidate;
+        bool gate_held = false;
+        bool abort_to_base = idle_life_repair_pending_;
+        uint8_t target = abort_to_base ? (IdleFlashBandOverlay::kFrameCount - 1)
+                                       : idle_life_frame_;
+        if (!abort_to_base && visual_ok) {
+            gate_held = MspiBudgetGateTryEnterIdleVisual();
+        }
+        if (!abort_to_base && !gate_held) {
+            if (idle_life_frame_ == 0) {
+                const uint16_t delay = kRestMs[(++idle_breathe_gen_) & 3U];
+                esp_timer_start_once(face_anim_timer_, (int64_t)delay * 1000LL);
+                esp_log_write(ESP_LOG_INFO, TAG, kIdleFlashDropLog,
+                              static_cast<unsigned long>(esp_log_timestamp()), visual_ok ? 1U : 2U);
+                return;
+            }
+            abort_to_base = true;
+            target = IdleFlashBandOverlay::kFrameCount - 1;
+        }
+
+        const esp_err_t perr = PresentIdleFlashBand(target);
+        if (gate_held) {
+            MspiBudgetGateLeaveIdleVisual();
+        }
+        const bool submitted = perr == ESP_OK || perr == ESP_ERR_NOT_FINISHED;
+        uint16_t delay = kFrameMs;
+        if (submitted) {
+            idle_life_repair_pending_ = false;
+            idle_life_repair_attempts_ = 0;
+            if (abort_to_base || target == IdleFlashBandOverlay::kFrameCount - 1) {
+                idle_life_frame_ = 0;
+                delay = kRestMs[(++idle_breathe_gen_) & 3U];
+            } else {
+                idle_life_frame_ = target + 1;
+            }
+        } else if (idle_life_frame_ > 0 && idle_life_repair_attempts_ < 2) {
+            idle_life_repair_pending_ = true;
+            idle_life_repair_attempts_++;
+            delay = kRepairMs;
+        } else {
+            idle_life_frame_ = 0;
+            idle_life_repair_pending_ = false;
+            idle_life_repair_attempts_ = 0;
+            delay = kRestMs[(++idle_breathe_gen_) & 3U];
+        }
+        esp_log_write(ESP_LOG_INFO, TAG, kIdleFlashFrameLog,
+                       static_cast<unsigned long>(esp_log_timestamp()), static_cast<unsigned>(target),
+                       abort_to_base ? 1U : 0U, static_cast<int>(perr),
+                       static_cast<unsigned>(delay));
+        esp_timer_start_once(face_anim_timer_, (int64_t)delay * 1000LL);
+        return;
+    }
+
+    if (FaceRouteV2_IdleLifeTokenCanaryEnabled()) {
+        // Deterministic sparse jitter avoids a fixed AFE cadence while keeping
+        // every attempt within the promised 4–7 second envelope.
+        static constexpr uint16_t kTokenDelayMs[] = {4200, 5300, 6400, 6900};
+        const uint8_t count = FaceAsset_LifeFrameCount(0);
+        if (!idle_breathe_small_life_ || count < 5 || FaceAsset_LifeTrackCount() != 1) {
+            StopIdleBreathe("s1fu_asset_lost");
+            ArmIdleBacklightBreathe("s1fu_asset_lost");
+            return;
+        }
+        const uint8_t keyframes[4] = {
+            1, (uint8_t)(count / 2), (uint8_t)(count - 2), (uint8_t)(count - 1)};
+        const uint8_t target_frame = idle_life_repair_pending_
+                                         ? keyframes[3]
+                                         : keyframes[idle_life_frame_];
+        bool presented = false;
+        if (VisualBudgetV2_Current() == VisualBudgetLevel::TransitionCandidate &&
+            MspiBudgetGateTryEnterIdleVisual()) {
+            if (AfeFetchGateTryLock(0)) {
+                face_holds_afe_gate_ = true;
+                if (FaceMouth_Lock(0)) {
+                    const esp_err_t perr = PresentLifeBand(0, target_frame, 0);
+                    presented = perr == ESP_OK || perr == ESP_ERR_NOT_FINISHED;
+                    ESP_LOGW(TAG, "s1fu idle_token blit f=%u/%u e=%d",
+                             (unsigned)target_frame, (unsigned)count, (int)perr);
+                    FaceMouth_Unlock();
+                }
+                face_holds_afe_gate_ = false;
+                AfeFetchGateUnlock();
+            }
+            MspiBudgetGateLeaveIdleVisual();
+        }
+        uint16_t delay_ms = 240;
+        if (presented) {
+            idle_life_repair_attempts_ = 0;
+            if (idle_life_repair_pending_) {
+                idle_life_repair_pending_ = false;
+                idle_life_frame_ = 0;
+            } else {
+                idle_life_frame_++;
+                if (idle_life_frame_ >= 4) idle_life_frame_ = 0;
+            }
+        } else {
+            idle_life_repair_pending_ = idle_life_repair_pending_ || idle_life_frame_ > 0;
+            idle_life_frame_ = 0;
+            if (idle_life_repair_pending_ && idle_life_repair_attempts_ < 2) {
+                idle_life_repair_attempts_++;
+            } else if (idle_life_repair_pending_) {
+                delay_ms = kTokenDelayMs[(++idle_breathe_gen_) & 3U];
+            }
+        }
+        if (idle_life_frame_ == 0 && !idle_life_repair_pending_) {
+            delay_ms = kTokenDelayMs[(++idle_breathe_gen_) & 3U];
+        }
         if (face_anim_timer_ != nullptr) {
-            esp_timer_start_once(face_anim_timer_, 900 * 1000LL);
+            esp_timer_start_once(face_anim_timer_, (int64_t)delay_ms * 1000LL);
         }
         return;
     }
+
 
     constexpr int kCycleFrames = 6;
     // s1cs: under FullStill idle uses band (cheaper than 480²); slightly slower cadence.
@@ -2206,7 +2372,7 @@ void EezuiDisplayAdapter::IdleBreatheTick() {
             }
             face_holds_afe_gate_ = false;
             AfeFetchGateUnlock();
-            const int64_t rest_us = idle_life_canary ? (8000 * 1000LL) : (4200 * 1000LL);
+            const int64_t rest_us = 4200 * 1000LL;
             if (face_anim_timer_ != nullptr) esp_timer_start_once(face_anim_timer_, rest_us);
             return;
         }
@@ -2222,7 +2388,7 @@ void EezuiDisplayAdapter::IdleBreatheTick() {
         ESP_LOGW(TAG, "s1ez idle_life_blit track=%u frame=%u/%u err=%s gate=released",
                  (unsigned)presented_track, (unsigned)presented_frame, (unsigned)count,
                  esp_err_to_name(perr));
-        const int64_t frame_us = idle_life_canary ? (420 * 1000LL) : (260 * 1000LL);
+        const int64_t frame_us = 260 * 1000LL;
         if (face_anim_timer_ != nullptr) esp_timer_start_once(face_anim_timer_, frame_us);
         return;
     }
@@ -2843,7 +3009,22 @@ bool EezuiDisplayAdapter::ArmMouthFollow(const char* emotion_name, bool base_alr
     }
     struct MouthUnlock { ~MouthUnlock() { FaceMouth_Unlock(); } } mouth_unlock;
     StopEmotionRelease("mouth_arm");
-    if (!FaceMouth_BindEmotion(emotion_name) || !FaceMouth_Ready()) {
+    const bool core_ready = FaceSpeechCore_Ready(emotion_name);
+    if (core_ready && !base_already_present &&
+        (speech_core_tts_started_.load(std::memory_order_acquire) ||
+         speech_core_full_committed_)) {
+        pending_face_emo_ = emotion_video_player_canonicalize_emotion(emotion_name);
+        speech_core_pending_generation_ = speech_core_generation_;
+        ESP_LOGW(TAG, "s1gl core_defer emo=%s tts=%d full=%d latest_only=1",
+                 emotion_name,
+                 speech_core_tts_started_.load(std::memory_order_relaxed) ? 1 : 0,
+                 speech_core_full_committed_ ? 1 : 0);
+        return false;
+    }
+    const bool bound = core_ready ? FaceSpeechCore_Select(emotion_name)
+                                  : FaceMouth_BindEmotion(emotion_name);
+    const bool core_selected = core_ready && FaceSpeechCore_Active();
+    if (!bound || !FaceAsset_Ready()) {
         ESP_LOGW(TAG, "s1cr-h mouth_skip emo=%s (no layered pack)", emotion_name);
         return false;
     }
@@ -2851,7 +3032,7 @@ bool EezuiDisplayAdapter::ArmMouthFollow(const char* emotion_name, bool base_alr
         return false;
     }
     uint16_t base_w = 0, base_h = 0;
-    const uint8_t* base = FaceMouth_PoseBaseRgb565(0, &base_w, &base_h);
+    const uint8_t* base = FaceAsset_PoseBase(0, &base_w, &base_h);
     if (base == nullptr || base_w == 0 || base_h == 0) {
         ESP_LOGW(TAG, "s1cx mouth_skip emo=%s (no canonical base)", emotion_name);
         return false;
@@ -2859,6 +3040,10 @@ bool EezuiDisplayAdapter::ArmMouthFollow(const char* emotion_name, bool base_alr
     const esp_err_t base_err = base_already_present ? ESP_OK : PresentFaceFrameToLvgl(
         base, (uint32_t)base_w * (uint32_t)base_h * 2U, base_w, base_h, true, false);
     if (base_err != ESP_OK) {
+        if (core_selected) {
+            FaceSpeechCore_Deactivate();
+            return false;
+        }
         // Speaking is intentionally allowed to reject a second fullscreen base
         // transaction. Keep the already-present emotion hold and still arm the
         // small mouth layer; dropping the whole layer freezes long TTS replies.
@@ -2874,6 +3059,12 @@ bool EezuiDisplayAdapter::ArmMouthFollow(const char* emotion_name, bool base_alr
             return false;
         }
     }
+    if (core_selected && !base_already_present) {
+        speech_core_full_committed_ = true;
+        ESP_LOGW(TAG, "s1gl core_full_commit emo=%s gen=%u count=1",
+                 emotion_name, static_cast<unsigned>(speech_core_generation_));
+    }
+    current_emotion_name_ = emotion_video_player_canonicalize_emotion(emotion_name);
     mouth_follow_ = true;
     mouth_pose_ = 0;
     mouth_visual_level_ = 0;
@@ -2888,9 +3079,9 @@ bool EezuiDisplayAdapter::ArmMouthFollow(const char* emotion_name, bool base_alr
     eye_blink_due_us_ = esp_timer_get_time() + 1800 * 1000LL;
     pose_switch_due_us_ = esp_timer_get_time() + 3600 * 1000LL;
     face_anim_emo_ = emotion_name;
-    ESP_LOGW(TAG, "s1cy mouth_arm emo=%s poses=%u", emotion_name, (unsigned)FaceMouth_PoseCount());
+    ESP_LOGW(TAG, "s1cy mouth_arm emo=%s poses=%u", emotion_name, (unsigned)FaceAsset_PoseCount());
     esp_rom_printf("!!FACE_S1CY pose_arm emo=%s poses=%u\n", emotion_name,
-                   (unsigned)FaceMouth_PoseCount());
+                   (unsigned)FaceAsset_PoseCount());
     esp_timer_stop(face_anim_timer_);
     esp_timer_start_once(face_anim_timer_, kMouthFollowTickUs);
     return true;
@@ -2913,7 +3104,7 @@ void EezuiDisplayAdapter::MouthFollowTick() {
         StopMouthFollow("leave_speak");
         return;
     }
-    if (!FaceMouth_Ready() || video_canvas_ == nullptr) {
+    if (!FaceAsset_Ready() || video_canvas_ == nullptr) {
         StopMouthFollow("not_ready");
         return;
     }
@@ -2960,7 +3151,7 @@ void EezuiDisplayAdapter::MouthFollowTick() {
     const uint8_t level = mouth_visual_level_;
     const bool life_source_eligible = FaceRouteV2_LifeLayerEnabled() &&
                                       st == kDeviceStateSpeaking &&
-                                      FaceMouth_LifeReady() &&
+                                      FaceAsset_LifeReady() &&
                                       IsLifeLayerEmotion(face_anim_emo_);
     const bool life_budget_apply = FaceRouteV2_VisualBudgetShadowEnabled() &&
                                    FaceRouteV2_VisualBudgetLifeApplyEnabled();
@@ -2988,20 +3179,20 @@ void EezuiDisplayAdapter::MouthFollowTick() {
         // One flush band per worker tick.  A non-overlapping life track may use
         // the next free tick even while speech keeps the mouth open; overlapping
         // tracks still wait for a closed/small mouth to avoid facial tearing.
-        const bool overlaps_mouth = FaceMouth_LifeOverlapsMouth(life_target_pose_);
+        const bool overlaps_mouth = FaceAsset_LifeOverlapsMouth(life_target_pose_);
         if (mouth_blit_this_tick || mouth_deferred_by_budget) {
             life_due_us_ = now + kMouthFollowTickUs;
         } else if (overlaps_mouth && level > 1) {
             life_due_us_ = now + 240 * 1000LL;
         } else {
-            const uint8_t count = FaceMouth_LifeFrameCount(life_target_pose_);
+            const uint8_t count = FaceAsset_LifeFrameCount(life_target_pose_);
             const esp_err_t life_err = PresentLifeBand(life_target_pose_, life_blend_stage_);
             if (life_err == ESP_OK) {
                 life_blend_stage_++;
                 if (life_blend_stage_ >= count) {
                     life_blend_stage_ = 0;
-                    if (FaceMouth_LifeTrackCount() > 1) {
-                        life_target_pose_ = (uint8_t)((life_target_pose_ + 1) % FaceMouth_LifeTrackCount());
+                    if (FaceAsset_LifeTrackCount() > 1) {
+                        life_target_pose_ = (uint8_t)((life_target_pose_ + 1) % FaceAsset_LifeTrackCount());
                     }
                     life_due_us_ = now + kLifeHoldUs;
                 } else {
@@ -3016,7 +3207,7 @@ void EezuiDisplayAdapter::MouthFollowTick() {
         life_target_pose_ = 0;
         life_budget_deferred_ = false;
     }
-    if (kBlinkPoseChoreographyEnabled && FaceMouth_PoseCount() > 1) {
+    if (kBlinkPoseChoreographyEnabled && FaceAsset_PoseCount() > 1) {
         const bool pose_due = st == kDeviceStateSpeaking && level == 0 && now >= pose_switch_due_us_;
         const bool blink_due = now >= eye_blink_due_us_;
         if (pose_blink_stage_ == 0 && (pose_due || blink_due)) {
@@ -3212,16 +3403,42 @@ esp_err_t EezuiDisplayAdapter::PresentReleaseBand(uint8_t frame) {
     return ESP_OK;
 }
 
-esp_err_t EezuiDisplayAdapter::PresentLifeBand(uint8_t track, uint8_t frame) {
+esp_err_t EezuiDisplayAdapter::PresentIdleFlashBand(uint8_t frame) {
+    if (!idle_flash_overlay_.Ready() || frame >= IdleFlashBandOverlay::kFrameCount) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!SafeLVGLLock(0)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    afe_display_fence_t display_fence{};
+    AfeFetchGatePrepareDisplayFence(&display_fence);
+    const bool shown = idle_flash_overlay_.ShowFrame(frame);
+    if (dialogue_box_ != nullptr) {
+        lv_obj_move_foreground(dialogue_box_);
+    }
+    SafeLVGLUnlock();
+    if (!shown) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint32_t waited_ms = 0;
+    if (!AfeFetchGateWaitDisplayFence(&display_fence, kFlushFenceWaitMs, &waited_ms)) {
+        return ESP_ERR_NOT_FINISHED;
+    }
+    return ESP_OK;
+}
+
+
+esp_err_t EezuiDisplayAdapter::PresentLifeBand(uint8_t track, uint8_t frame,
+                                               uint32_t lock_wait_ms) {
     const uint8_t* patch = nullptr;
     const uint8_t* mask = nullptr;
     uint16_t pw = 0, ph = 0;
     int rx = 0, ry = 0;
-    if (!FaceMouth_LifeFrame(track, frame, &patch, &mask, &pw, &ph, &rx, &ry) ||
+    if (!FaceAsset_LifeFrame(track, frame, &patch, &mask, &pw, &ph, &rx, &ry) ||
         video_canvas_ == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!SafeLVGLLock(kLvglLockMouthMs)) {
+    if (!SafeLVGLLock(lock_wait_ms)) {
         return ESP_ERR_TIMEOUT;
     }
     const bool fence_dma = FaceRouteV2_LifeAfeFenceEnabled();
@@ -3254,7 +3471,7 @@ esp_err_t EezuiDisplayAdapter::PresentLifeBand(uint8_t track, uint8_t frame) {
     for (uint32_t y = 0; y < ph; ++y) {
         auto* dst = reinterpret_cast<uint16_t*>(canvas + ((size_t)(ry + y) * cw + rx) * 2U);
         const auto* src = reinterpret_cast<const uint16_t*>(patch + (size_t)y * pw * 2U);
-        if (FaceMouth_LifePrecomposited()) {
+        if (FaceAsset_LifePrecomposited()) {
             memcpy(dst, src, (size_t)pw * 2U);
         } else {
             const auto* a = mask + (size_t)y * pw;
@@ -3297,9 +3514,9 @@ esp_err_t EezuiDisplayAdapter::PresentLifeBand(uint8_t track, uint8_t frame) {
 
 esp_err_t EezuiDisplayAdapter::PresentMouthPatch(uint8_t level) {
     uint16_t pw = 0, ph = 0;
-    const uint8_t* patch = FaceMouth_PosePatchRgb565(mouth_pose_, level, &pw, &ph);
+    const uint8_t* patch = FaceAsset_PosePatch(mouth_pose_, level, &pw, &ph);
     int rx = 0, ry = 0, rw = 0, rh = 0;
-    FaceMouth_Roi(&rx, &ry, &rw, &rh);
+    FaceAsset_MouthRoi(&rx, &ry, &rw, &rh);
     if (patch == nullptr || pw == 0 || ph == 0 || video_canvas_ == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -3343,7 +3560,7 @@ esp_err_t EezuiDisplayAdapter::PresentMouthPatch(uint8_t level) {
             canvas_buf + ((size_t)(ry + y) * cw + (size_t)rx) * 2);
         const auto* src = reinterpret_cast<const uint16_t*>(patch + ((size_t)y * pw) * 2);
         const uint16_t edge = std::min<uint16_t>(y, (uint16_t)(ph - 1U - y));
-        if (FaceMouth_MouthPrecomposited() || edge >= kFeatherRows) {
+        if (FaceAsset_MouthPrecomposited() || edge >= kFeatherRows) {
             memcpy(dst, src, (size_t)pw * 2);
         } else {
             // Row 0 stays on the current hold; rows 1..3 progressively merge.
@@ -3371,23 +3588,23 @@ esp_err_t EezuiDisplayAdapter::PresentMouthPatch(uint8_t level) {
     if (FaceRouteV2_ShouldLogFrame()) {
         ESP_LOGW(TAG, "s1el mouth_blit level=%u roi=%d,%d %ux%u compose=%s", (unsigned)level, rx, ry,
                  (unsigned)pw, (unsigned)ph,
-                 FaceMouth_MouthPrecomposited() ? "canonical" : "legacy_feather");
+                 FaceAsset_MouthPrecomposited() ? "canonical" : "legacy_feather");
     }
     return ESP_OK;
 }
 
 esp_err_t EezuiDisplayAdapter::PresentPoseBase(uint8_t pose) {
     uint16_t w = 0, h = 0;
-    const uint8_t* base = FaceMouth_PoseBaseRgb565(pose, &w, &h);
+    const uint8_t* base = FaceAsset_PoseBase(pose, &w, &h);
     if (base == nullptr || w == 0 || h == 0) return ESP_ERR_INVALID_STATE;
     return PresentFaceFrameToLvgl(base, (uint32_t)w * (uint32_t)h * 2U, w, h, true, false);
 }
 
 esp_err_t EezuiDisplayAdapter::PresentEyePatch(uint8_t level) {
     uint16_t pw = 0, ph = 0;
-    const uint8_t* patch = FaceMouth_EyePatchRgb565(mouth_pose_, level, &pw, &ph);
+    const uint8_t* patch = FaceAsset_EyePatch(mouth_pose_, level, &pw, &ph);
     int rx = 0, ry = 0, rw = 0, rh = 0;
-    FaceMouth_EyeRoi(&rx, &ry, &rw, &rh);
+    FaceAsset_EyeRoi(&rx, &ry, &rw, &rh);
     if (patch == nullptr || pw == 0 || ph == 0 || video_canvas_ == nullptr) return ESP_ERR_INVALID_STATE;
     if (!SafeLVGLLock(kLvglLockMouthMs)) return ESP_ERR_TIMEOUT;
     const lv_image_dsc_t* img = lv_canvas_get_image(video_canvas_);
@@ -3467,12 +3684,27 @@ esp_err_t EezuiDisplayAdapter::PresentStandbyBookend(const char* tag) {
     const int64_t td0 = esp_timer_get_time();
     // s1cd: bookend = mid-clip **seed** (fc/3) open-eye rest. s1cc used frame0 "contract"
     // but SD clip head is often blink/closed-eye → wake/dialogue looked eyes-shut.
-    esp_err_t derr =
-        emotion_video_player_get_seed_rgb565(emotion_player_, "standby", &rgb, &size, &w, &h);
-    if (derr != ESP_OK || rgb == nullptr) {
-        derr = emotion_video_player_decode_at_rgb565(
-            emotion_player_, "standby",
-            emotion_video_player_mid_stride_skip(emotion_player_, "standby"), &rgb, &size, &w, &h);
+    const auto state = Application::GetInstance().GetDeviceState();
+    const bool conversation_core =
+        state != kDeviceStateIdle && FaceSpeechCore_Ready("standby") &&
+        FaceSpeechCore_Select("standby");
+    esp_err_t derr = ESP_FAIL;
+    if (conversation_core) {
+        uint16_t core_w = 0, core_h = 0;
+        rgb = FaceSpeechCore_Base(&core_w, &core_h);
+        w = core_w;
+        h = core_h;
+        size = w * h * 2U;
+        derr = rgb ? ESP_OK : ESP_FAIL;
+    } else {
+        derr = emotion_video_player_get_seed_rgb565(
+            emotion_player_, "standby", &rgb, &size, &w, &h);
+        if (derr != ESP_OK || rgb == nullptr) {
+            derr = emotion_video_player_decode_at_rgb565(
+                emotion_player_, "standby",
+                emotion_video_player_mid_stride_skip(emotion_player_, "standby"),
+                &rgb, &size, &w, &h);
+        }
     }
     if (derr != ESP_OK || rgb == nullptr) {
         derr = emotion_video_player_decode_one_rgb565(emotion_player_, "standby", 0, &rgb, &size, &w,
@@ -3622,6 +3854,19 @@ esp_err_t EezuiDisplayAdapter::CommitFaceStillOnce(const char* emotion_name, boo
             StartFaceRoiFollow(kFaceMidFrames);
         }
     } else if (static_hold) {
+        // Speech Core owns preloaded layered emotions. Never fall through to
+        // native MJPEG seed/decode while speaking: a failed/late request keeps
+        // the current safe hold and remains latest-only pending.
+        if (speaking && FaceSpeechCore_Ready(emotion_name)) {
+            const bool armed = ArmMouthFollow(emotion_name, false);
+            if (presenter_ != nullptr) presenter_->OnBypassAnimEnded();
+            if (armed &&
+                (strcasecmp(emotion_name, "angry") == 0 ||
+                 strcasecmp(emotion_name, "sad") == 0)) {
+                strong_emotion_hold_until_us_ = esp_timer_get_time() + 1200 * 1000LL;
+            }
+            return ESP_OK;
+        }
         // s1eu: strong emotions with a common standby hub grow only their
         // expression islands. Never present the globally shifted native seed.
         if (speaking && canvas_was_standby && ArmEmotionEnter(emotion_name)) {
@@ -3692,6 +3937,7 @@ esp_err_t EezuiDisplayAdapter::PaintSeedEmotionPartial(const char* emotion_name)
     if (wake_edge) {
         StopFacePanelAnim("wake_edge");
         pending_face_emo_ = emotion_name;
+        speech_core_pending_generation_ = 0;
         ESP_LOGW(TAG, "SAD_DIAG face_still defer+pending emo=%s state=%d", emotion_name,
                  (int)st);
         return ESP_OK;
@@ -3809,6 +4055,7 @@ void EezuiDisplayAdapter::DeinitEmotionSystem() {
         if (!SafeLVGLLock(kLvglLockTickMs)) {
             ESP_LOGW(TAG, "⚠️ 无法获取LVGL锁，跳过画布清理");
         } else {
+            idle_flash_overlay_.Detach();
             lv_obj_del(video_canvas_);
             video_canvas_ = nullptr;
             SafeLVGLUnlock();
@@ -4003,6 +4250,9 @@ void EezuiDisplayAdapter::CreateVideoCanvas() {
         return;
     }
     lv_canvas_set_buffer(video_canvas_, canvas_buf, canvas_width, canvas_height, LV_COLOR_FORMAT_RGB565);
+    if (FaceRouteV2_IdleFlashOverlayEnabled()) {
+        (void)idle_flash_overlay_.Initialize(video_canvas_);
+    }
     lv_obj_add_flag(video_canvas_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(video_canvas_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(video_canvas_, lv_color_black(), 0);
@@ -4169,134 +4419,6 @@ void EezuiDisplayAdapter::EmotionVideoEventCallback(emotion_video_event_t event,
 
 bool EezuiDisplayAdapter::InConversationPresent() const {
     return presenter_ != nullptr && presenter_->IsConversationMode();
-}
-
-void EezuiDisplayAdapter::EnterConversationPresent() {
-    // Recover from a prior emotion hold that left LVGL stopped.
-    if (bypass_lvgl_stopped_ || panel_owner_ == PanelOwner::kEmotion) {
-        ESP_LOGW(TAG, "CTRL PRESENT enter recover LVGL");
-        ReleasePanelToLvgl(false);
-    }
-
-    StopIdleBreathe("present_enter");
-
-    const auto st = Application::GetInstance().GetDeviceState();
-    // s1ew: establish the render generation before consuming an emotion that
-    // was queued while Listening.  The old order tagged that emotion with the
-    // previous generation and could leave the first TTS turn without a mouth.
-    const uint32_t new_speech_generation =
-        presenter_ != nullptr ? presenter_->NotifySpeechState(st == kDeviceStateSpeaking) : 0;
-    if (st == kDeviceStateSpeaking) {
-        strong_emotion_hold_pending_ = false;
-        strong_emotion_hold_until_us_ = 0;
-    }
-    bool release_holding = emotion_release_active_;
-    if (st == kDeviceStateListening || st == kDeviceStateConnecting) {
-        // s1cj: ALWAYS restore open-eye standby seed on listen enter.
-        // Idle breathe can leave a blink/closed frame on the canvas; SetEmotion
-        // then ignores standby during live (protect LLM face), so that closed
-        // pose freezes for the whole listening period — user sees "eyes shut +
-        // 正在聆听". Previously bookend only ran if dialogue MID flags were set,
-        // which idle breathe never sets → miss.
-        if (st == kDeviceStateListening &&
-            strong_emotion_hold_until_us_ > esp_timer_get_time() &&
-            (strcasecmp(current_emotion_name_.c_str(), "angry") == 0 ||
-             strcasecmp(current_emotion_name_.c_str(), "sad") == 0)) {
-            StopMouthFollow("strong_hold");
-            strong_emotion_hold_pending_ = EnsureFaceAnimTimer();
-            if (strong_emotion_hold_pending_) {
-                const int64_t remain_us =
-                    std::max<int64_t>(1000, strong_emotion_hold_until_us_ - esp_timer_get_time());
-                esp_timer_stop(face_anim_timer_);
-                esp_timer_start_once(face_anim_timer_, remain_us);
-                release_holding = true;
-                ESP_LOGW(TAG, "s1fg strong_hold_arm emo=%s remain_ms=%lld",
-                         current_emotion_name_.c_str(),
-                         (long long)(remain_us / 1000));
-            }
-        } else if (st == kDeviceStateListening) {
-            release_holding = ArmEmotionRelease("present_listen");
-        }
-        if (!release_holding) {
-            PresentStandbyBookend("present_listen");
-            StopFacePanelAnim("present_listen");
-        }
-    } else if (st == kDeviceStateSpeaking && !pending_face_emo_.empty()) {
-        const std::string emo = pending_face_emo_;
-        pending_face_emo_.clear();
-        if (presenter_ != nullptr) {
-            ESP_LOGW(TAG, "CTRL PRESENT commit emo=%s via=presenter why=flush_pending s1bj",
-                     emo.c_str());
-            presenter_->NotifyEmotion(emo.c_str());
-        } else {
-            ESP_LOGW(TAG, "CTRL PRESENT commit emo=%s via=leaf why=flush_pending_no_presenter s1bj",
-                     emo.c_str());
-            CommitFaceStillOnce(emo.c_str());
-        }
-    } else if (st == kDeviceStateSpeaking) {
-        // No llm / STT hint yet. The layered patches were generated against the
-        // pack's canonical base, which is not proven pixel-identical to the MJPEG
-        // standby seed. Present that canonical base once instead of pasting mouth
-        // and neck/life rectangles onto an unrelated seed.
-        if (!(face_anim_roi_only_ || face_anim_sustain_ || face_anim_left_ > 0 ||
-              face_anim_need_prime_ || face_anim_await_settle_)) {
-            if (new_speech_generation != 0 && FaceRouteV2_ProvisionalMouthEnabled()) {
-                if (ArmMouthFollow("standby", false)) {
-                    ESP_LOGW(TAG, "s1fg provisional_mouth arm canonical=1 gen=%u",
-                             (unsigned)new_speech_generation);
-                    esp_rom_printf("!!FACE_S1FG provisional_mouth=arm canonical=1 gen=%u\n",
-                                   (unsigned)new_speech_generation);
-                } else {
-                    ESP_LOGW(TAG, "s1fg provisional_mouth fallback=standby gen=%u",
-                             (unsigned)new_speech_generation);
-                    PresentStandbyBookend("present_speak_fallback");
-                }
-            } else {
-                PresentStandbyBookend("present_speak_seed");
-            }
-        }
-    }
-
-    if (SafeLVGLLock(kLvglLockQuickMs)) {
-        if (main_image_ != nullptr) {
-            lv_obj_add_flag(main_image_, LV_OBJ_FLAG_HIDDEN);
-        }
-        // Same caption chrome as idle / SetChatMessage.
-        EnsureDialogueCaptionStyle();
-        CancelIdleHideTimer();
-        SafeLVGLUnlock();
-    }
-    ESP_LOGW(TAG, "CTRL PRESENT enter state=%d pending=%d anim_left=%d", (int)st,
-             pending_face_emo_.empty() ? 0 : 1, face_anim_left_);
-    if (presenter_ != nullptr) {
-        presenter_->EnterConversation();
-    }
-}
-
-void EezuiDisplayAdapter::LeaveConversationPresent() {
-    strong_emotion_hold_pending_ = false;
-    strong_emotion_hold_until_us_ = 0;
-    StopIdleBreathe("present_leave");
-    const bool release_holding = emotion_release_active_ || ArmEmotionRelease("present_leave");
-    if (!release_holding &&
-        (face_anim_roi_only_ || face_anim_sustain_ || face_anim_left_ > 0 ||
-        (last_bypass_rgb_ != nullptr &&
-         strcasecmp(current_emotion_name_.c_str(), "standby") != 0))) {
-        PresentStandbyBookend("present_leave");
-    }
-    if (!release_holding) {
-        StopFacePanelAnim("present_leave");
-    }
-    pending_face_emo_.clear();
-    if (presenter_ != nullptr) {
-        presenter_->LeaveConversation();
-    }
-    // Back to idle rest pose + breathe only when SD seeds are ready (s1at).
-    if (!release_holding && Application::GetInstance().GetDeviceState() == kDeviceStateIdle &&
-        emotion_player_ != nullptr &&
-        emotion_video_player_seed_stills_ready(emotion_player_)) {
-        PresentStandbyBookend("idle_standby");
-    }
 }
 
 void EezuiDisplayAdapter::PresenterPlayEmotion(const char* emotion_name) {

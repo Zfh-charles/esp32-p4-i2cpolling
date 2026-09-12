@@ -85,10 +85,12 @@ extern "C" {
 #ifndef S1FN_W_VISUAL_BUDGET_LIFE_APPLY
 #define S1FN_W_VISUAL_BUDGET_LIFE_APPLY 1
 #endif
-#ifndef S1FO_X_IDLE_LIFE_CANARY
-#define S1FO_X_IDLE_LIFE_CANARY 0
+#ifndef S1FU_X_IDLE_LIFE_TOKEN_CANARY
+#define S1FU_X_IDLE_LIFE_TOKEN_CANARY 1
 #endif
-
+#ifndef S1GT_Y_IDLE_FLASH_OVERLAY
+#define S1GT_Y_IDLE_FLASH_OVERLAY 1
+#endif
 bool FaceRouteV2_WorkerEnabled(void);
 bool FaceRouteV2_Emotion3Enabled(void);
 bool FaceRouteV2_FsGateEnabled(void);
@@ -108,7 +110,8 @@ bool FaceRouteV2_IdleBacklightBreatheEnabled(void);
 bool FaceRouteV2_VisualBudgetShadowEnabled(void);
 bool FaceRouteV2_VisualBudgetMouthApplyEnabled(void);
 bool FaceRouteV2_VisualBudgetLifeApplyEnabled(void);
-bool FaceRouteV2_IdleLifeCanaryEnabled(void);
+bool FaceRouteV2_IdleLifeTokenCanaryEnabled(void);
+bool FaceRouteV2_IdleFlashOverlayEnabled(void);
 
 void FaceRouteV2_SetWorker(bool on);
 void FaceRouteV2_SetEmotion3(bool on);
@@ -129,7 +132,8 @@ void FaceRouteV2_SetLifeAfeFence(bool on);
 void FaceRouteV2_SetVisualBudgetShadow(bool on);
 void FaceRouteV2_SetVisualBudgetMouthApply(bool on);
 void FaceRouteV2_SetVisualBudgetLifeApply(bool on);
-void FaceRouteV2_SetIdleLifeCanary(bool on);
+void FaceRouteV2_SetIdleLifeTokenCanary(bool on);
+void FaceRouteV2_SetIdleFlashOverlay(bool on);
 
 /** Boot banner: FW sub-markers s1cn-a..d on/off. */
 void FaceRouteV2_BootLog(void);

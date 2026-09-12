@@ -1,6 +1,6 @@
 tmp/
-components/*
-!components/eezui/
+# Local component overrides are required build inputs, not a download cache.
+components/eezui/eezui/
 managed_components/
 build/
 .vscode/
@@ -33,3 +33,25 @@ tools/S1FT_ARCHIVE.md
 __pycache__/
 *.log
 serial_monitor.log
+
+# Local-only projects, AI harness and private runtime data.
+game/
+**/game/
+.cursor/
+.codex/
+.agents/
+**/[Aa][Gg][Ee][Nn][Tt].[Mm][Dd]
+**/[Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
+*.code-workspace
+*.eez-project-ui-state
+*.bak
+*.tmp
+*.sqlite*
+*.partial
+*.local.json
+backups/
+manual_*/
+tools/**/logs/
+tools/**/reports/
+**/.env.*
+!**/.env.example

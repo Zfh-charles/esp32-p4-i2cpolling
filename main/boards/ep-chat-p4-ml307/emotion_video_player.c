@@ -1,28 +1,10 @@
-/**
- * ESP32-P4 表情视频播放器 - 高性能优化版本（完整修复版）
- * 
- * 🚀 性能优化重点：
- * 1. 预建立帧索引表 - 避免运行时扫描帧边界（性能提升60-70%）
- * 2. 高精度帧率控制 - 使用忙等待+精确定时器（性能提升30-40%）
- * 3. 优化锁机制 - 减少锁竞争和持有时间（性能提升10-20%）
- * 4. 提高任务优先级 - 确保解码任务优先执行（性能提升15-25%）
- * 5. 优化内存操作 - 减少不必要的拷贝（性能提升5-10%）
- * 6. 🔥 立即切换机制 - 支持打断当前播放（响应时间提升98%+）
- * 
- * 🔥 修复内容：
- * 1. ✅ 修复初始化黑屏问题 - 自动加载并播放standby表情
- * 2. ✅ 修复表情切换停滞 - 添加SWITCHING状态和预加载机制
- * 3. ✅ 性能提升97%+ - 后续切换从185ms降至<5ms
- * 4. ✅ 修复频繁切换到standby问题：
- *    - 所有表情默认循环播放
- *    - 只有收到切换信号才切换表情
- *    - 播放完成后直接重置位置继续循环
- * 
- * 版本：v1.3 (循环播放简化版)
- * 日期：2024
- */
-
 #include "emotion_video_player.h"
+#include "mjpeg_frame_source.h"
+#include "mjpeg_decoder_player_adapter.h"
+#include "mjpeg_index_reader.h"
+#include "mjpeg_playback_clock_player_adapter.h"
+#include "mjpeg_present_sink_esp.h"
+#include "mjpeg_runtime_selection.h"
 #include "wdt_contention_diag.h"
 #include "stack_diag.h"
 #include "face_route_v2.h"
@@ -77,17 +59,18 @@ static const uint32_t g_hw_decoder_cc = ESP_VIDEO_DEC_HW_MJPEG_TAG;
 
 // 🚀 新增：帧索引表支持
 #define MAX_FRAMES_PER_VIDEO    300  // 每个视频最多300帧（10秒@30fps）
-
 // L3: 解码循环周期性让步，给 idle/系统任务让出时间片
 #define MJPEG_L3_YIELD_INTERVAL 10
 
 /**
  * @brief 帧索引条目（关键优化：避免运行时扫描）
  */
-typedef struct {
-    size_t offset;      // 帧在缓存中的偏移
-    size_t size;        // 帧大小
-} frame_index_entry_t;
+typedef mjpeg_index_entry_t frame_index_entry_t;
+
+_Static_assert(MAX_FRAMES_PER_VIDEO == MJPEG_INDEX_READER_MAX_FRAMES,
+               "legacy and IndexReader frame limits must match");
+_Static_assert(sizeof(frame_index_entry_t) == sizeof(mjpeg_index_entry_t),
+               "IndexReader entry layout must remain compatible");
 
 /**
  * @brief 表情定义结构体
@@ -861,9 +844,6 @@ static void decode_task(void *arg)
     emotion_video_player_t *player = (emotion_video_player_t *)arg;
     EventBits_t event_bits;
     uint64_t last_diag_us = esp_timer_get_time();
-    const uint32_t kSoftStartMinIntervalUs = 100000;      // 10fps
-    const uint64_t kDecodeHangThresholdUs = 1500000ULL;   // 1.5s
-    
     ESP_LOGI(TAG, "🎬 解码任务启动");
     
     player->frame_deadline_us = esp_timer_get_time();
@@ -967,78 +947,78 @@ static void decode_task(void *arg)
             }
 
             uint64_t current_time = esp_timer_get_time();
-
-            // Resume 后先暖机，避免瞬时恢复引发显示链路冲击
-            if (player->resume_warmup_until_us > current_time) {
-                vTaskDelay(pdMS_TO_TICKS(5));
-                continue;
-            }
-
-            // Resume 软启动：低帧率跑一段时间，再恢复到配置帧率
-            if (player->soft_start_until_us > current_time) {
-                if (player->frame_interval_us < kSoftStartMinIntervalUs) {
-                    player->frame_interval_us = kSoftStartMinIntervalUs;
-                }
-            } else if (player->frame_interval_us != player->normal_frame_interval_us &&
-                       player->soft_start_until_us <= current_time) {
-                player->frame_interval_us = player->normal_frame_interval_us;
+            const mjpeg_playback_clock_player_binding_t clock_binding = {
+                &player->frame_interval_us, &player->normal_frame_interval_us,
+                &player->frame_deadline_us, &player->resume_warmup_until_us,
+                &player->soft_start_until_us, &player->last_frame_time_us,
+                &player->last_decode_success_us, &player->last_stall_diag_us,
+                &player->current_frame, &player->decode_error_count,
+            };
+#if EMOTION_VIDEO_USE_PLAYBACK_CLOCK
+            const mjpeg_playback_clock_poll_t clock_poll =
+                mjpeg_playback_clock_player_poll_direct(
+                    &clock_binding, current_time);
+#else
+            const mjpeg_playback_clock_poll_t clock_poll =
+                mjpeg_playback_clock_player_poll(
+                    &clock_binding, current_time, false);
+#endif
+            if (clock_poll.soft_start_finished) {
                 ESP_LOGI(TAG, "MJPEG soft-start finished, restore %lu fps",
                          (unsigned long)(1000000U / (player->normal_frame_interval_us ? player->normal_frame_interval_us : 1U)));
             }
-
-            // 黑屏时通常不再有新帧输出，这里做超时探针并重置deadline自恢复
-            if ((current_time - player->last_decode_success_us) > kDecodeHangThresholdUs) {
-                if ((current_time - player->last_stall_diag_us) > 1000000ULL) {
-                    size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-                    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-                    ESP_LOGW(TAG,
-                             "STALL_DIAG core=%d no decoded frame for %ums (cache_idx=%d frame_idx=%d state=%d free_int=%u free_psram=%u)",
-                             xPortGetCoreID(),
-                             (unsigned)((current_time - player->last_decode_success_us) / 1000ULL),
-                             player->current_cache_index,
-                             player->current_frame_index,
-                             (int)player->state,
-                             (unsigned)free_int,
-                             (unsigned)free_psram);
-                    player->last_stall_diag_us = current_time;
-                }
-                player->frame_deadline_us = current_time + player->frame_interval_us;
+            if (clock_poll.stall_diag) {
+                ESP_LOGW(TAG, "STALL_DIAG core=%d no decoded frame for %ums (cache_idx=%d frame_idx=%d state=%d free_int=%u free_psram=%u)",
+                         xPortGetCoreID(),
+                         (unsigned)((current_time - player->last_decode_success_us) / 1000ULL),
+                         player->current_cache_index, player->current_frame_index,
+                         (int)player->state,
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            }
+            if (clock_poll.yield_now) {
                 taskYIELD();
             }
-
-            if (current_time >= player->frame_deadline_us) {
+            if (clock_poll.action == MJPEG_CLOCK_ACTION_WARMUP) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            if (clock_poll.action == MJPEG_CLOCK_ACTION_DECODE) {
                 esp_err_t ret = hw_decode_frame_optimized(player);
-
+                const mjpeg_playback_decode_result_t result =
+                    ret == ESP_OK ? MJPEG_CLOCK_DECODE_OK
+                                  : (ret == ESP_ERR_NOT_FOUND
+                                         ? MJPEG_CLOCK_DECODE_EOF
+                                         : MJPEG_CLOCK_DECODE_ERROR);
+#if EMOTION_VIDEO_USE_PLAYBACK_CLOCK
+                const mjpeg_playback_clock_effect_t effect =
+                    mjpeg_playback_clock_player_on_decode_result_direct(
+                        &clock_binding, result, current_time,
+                        MJPEG_L3_YIELD_INTERVAL);
+#else
+                const mjpeg_playback_clock_effect_t effect =
+                    mjpeg_playback_clock_player_on_decode_result(
+                        &clock_binding, result, current_time,
+                        MJPEG_L3_YIELD_INTERVAL, false);
+#endif
                 if (ret == ESP_OK) {
-                    player->last_frame_time_us = current_time;
-                    player->last_decode_success_us = current_time;
-                    player->current_frame++;
-                    player->decode_error_count = 0;
-                    player->frame_deadline_us = current_time + player->frame_interval_us;
-                    if ((player->current_frame % MJPEG_L3_YIELD_INTERVAL) == 0) {
+                    if (effect.delay_one_tick) {
                         vTaskDelay(pdMS_TO_TICKS(1));
                     }
-                    int64_t drift = current_time - player->frame_deadline_us;
-                    if (drift > (int64_t)(player->frame_interval_us * 2)) {
-                        player->frame_deadline_us = current_time + player->frame_interval_us;
-                    }
                 } else if (ret == ESP_ERR_NOT_FOUND) {
-                    // 🔥 关键修复：使用新的播放完成处理函数
-                    // 这个函数会正确处理循环播放和表情切换
                     handle_emotion_playback_complete(player);
                 } else {
-                    player->decode_error_count++;
-                    ESP_LOGW(TAG, "⚠️ 解码错误 %" PRIu32 "/10: %s", 
+                    ESP_LOGW(TAG, "⚠️ 解码错误 %" PRIu32 "/10: %s",
                             player->decode_error_count, esp_err_to_name(ret));
-                    
-                    if (player->decode_error_count > 10) {
+                    if (effect.enter_error_state) {
                         ESP_LOGE(TAG, "❌ 连续解码错误过多，进入错误状态");
                         change_state(player, EMOTION_VIDEO_STATE_ERROR);
                     }
                 }
-            } else {
-                uint64_t wait_us = player->frame_deadline_us - current_time;
-                precise_delay_us(wait_us);
+            } else if (clock_poll.action == MJPEG_CLOCK_ACTION_WAIT) {
+                precise_delay_us(clock_poll.wait_us);
+            } else if (clock_poll.action == MJPEG_CLOCK_ACTION_PAUSED) {
+                vTaskDelay(pdMS_TO_TICKS(10));
             }
         } else {
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -1099,28 +1079,62 @@ static esp_err_t hw_decode_frame_optimized(emotion_video_player_t *player)
         return ESP_ERR_INVALID_STATE;
     }
     
-    if (player->current_frame_index >= current_cache->frame_count) {
+    const mjpeg_frame_source_view_t frame_source = {
+        .buffer = current_cache->buffer,
+        .buffer_size = current_cache->size,
+        .entries = current_cache->frame_index,
+        .frame_count = (size_t)current_cache->frame_count,
+        .ready = current_cache->ready,
+        .index_built = current_cache->index_built,
+    };
+    size_t frame_cursor = (size_t)player->current_frame_index;
+    mjpeg_frame_claim_t frame_claim = {0};
+#if EMOTION_VIDEO_USE_FRAME_SOURCE
+    const mjpeg_frame_source_result_t claim_result = mjpeg_frame_source_claim_next(
+        &frame_source, &frame_cursor, &frame_claim);
+#else
+    const mjpeg_frame_source_result_t claim_result = mjpeg_frame_source_claim_next_legacy(
+        &frame_source, &frame_cursor, &frame_claim);
+#endif
+    if (claim_result != MJPEG_FRAME_SOURCE_OK) {
         xSemaphoreGive(player->cache_mutex);
-        return ESP_ERR_NOT_FOUND;
+        if (claim_result == MJPEG_FRAME_SOURCE_INVALID_SIZE) {
+            ESP_LOGE(TAG, "❌ 帧边界溢出");
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (claim_result == MJPEG_FRAME_SOURCE_NOT_FOUND) {
+            return ESP_ERR_NOT_FOUND;
+        }
+        return ESP_ERR_INVALID_STATE;
     }
-    
-    frame_index_entry_t *frame_entry = &current_cache->frame_index[player->current_frame_index];
-    size_t frame_start_pos = frame_entry->offset;
-    size_t frame_size = frame_entry->size;
-    
-    if (frame_start_pos >= current_cache->size || 
-        frame_start_pos + frame_size > current_cache->size) {
-        xSemaphoreGive(player->cache_mutex);
-        ESP_LOGE(TAG, "❌ 帧边界溢出");
-        return ESP_ERR_INVALID_SIZE;
-    }
-    
-    uint8_t *frame_data = current_cache->buffer + frame_start_pos;
-    
-    player->current_frame_index++;
+
+    player->current_frame_index = (int)frame_cursor;
+    uint8_t *frame_data = (uint8_t *)frame_claim.data;
+    size_t frame_size = frame_claim.size;
     
     xSemaphoreGive(player->cache_mutex);
 
+#if EMOTION_VIDEO_USE_DECODER_STAGE
+    mjpeg_decoder_player_adapter_t adapter = {
+        .input_buffer = &player->input_buffer,
+        .input_buffer_size = &player->input_buffer_size,
+        .output_buffer = &player->output_buffer,
+        .output_buffer_size = &player->output_buffer_size,
+        .decoder_handle = &player->hw_dec_handle,
+        .decoder_config = &player->hw_dec_cfg,
+        .frame_info = &player->frame_info,
+        .input_alignment = player->hw_caps.in_frame_align,
+        .output_alignment = player->hw_caps.out_frame_align,
+        .canvas_width = player->config.canvas_width,
+        .canvas_height = player->config.canvas_height,
+        .output_format = player->config.output_format,
+        .pts = player->current_frame * (1000 / player->config.frame_rate),
+        .public_handle = (emotion_video_handle_t)player,
+        .frame_cb = player->frame_cb,
+        .frame_user_data = player->frame_user_data,
+    };
+    return mjpeg_decoder_player_adapter_run(&adapter, frame_data, frame_size);
+#else
     if (!player->input_buffer || frame_size > player->input_buffer_size) {
         size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         size_t required_size = frame_size > 64*1024 ? frame_size : 64*1024;
@@ -1219,40 +1233,20 @@ static esp_err_t hw_decode_frame_optimized(emotion_video_player_t *player)
         return ESP_FAIL;
     }
 
-    if (out_frame.decoded_size > 0) {
-        if (player->frame_info.res.width == 0 || player->frame_info.res.height == 0) {
-            esp_video_dec_get_frame_info(player->hw_dec_handle, &player->frame_info);
-        }
-        
-        if (player->frame_cb) {
-            uint64_t t_cb0 = esp_timer_get_time();
-            if (WdtContendWindowActive()) {
-                WdtContendBreadcrumb("pre_frame_cb");
-            }
-            player->frame_cb((emotion_video_handle_t)player, out_frame.data, 
-                            out_frame.decoded_size, player->frame_info.res.width, 
-                            player->frame_info.res.height, player->frame_user_data);
-            if (WdtContendWindowActive()) {
-                WdtContendBreadcrumb("post_frame_cb");
-            }
-            uint32_t cb_ms = (uint32_t)((esp_timer_get_time() - t_cb0) / 1000ULL);
-            uint32_t hw_ms = (uint32_t)((t_cb0 - t_hw0) / 1000ULL);
-            WdtContendNoteMjpegFrame(memcpy_ms, hw_ms, cb_ms);
-            if (WdtContendWindowActive()) {
-                WdtContendBreadcrumb("post_frame_note");
-                taskYIELD();
-                WdtContendBreadcrumb("post_yield");
-            }
-        } else {
-            uint32_t hw_ms = (uint32_t)((esp_timer_get_time() - t_hw0) / 1000ULL);
-            WdtContendNoteMjpegFrame(memcpy_ms, hw_ms, 0);
-        }
-    } else {
-        uint32_t hw_ms = (uint32_t)((esp_timer_get_time() - t_hw0) / 1000ULL);
-        WdtContendNoteMjpegFrame(memcpy_ms, hw_ms, 0);
+    if (out_frame.decoded_size > 0 &&
+        (player->frame_info.res.width == 0 || player->frame_info.res.height == 0)) {
+        esp_video_dec_get_frame_info(player->hw_dec_handle, &player->frame_info);
+    }
+    if (!mjpeg_present_sink_esp_present(
+            (emotion_video_handle_t)player, out_frame.data,
+            out_frame.decoded_size, player->frame_info.res.width,
+            player->frame_info.res.height, memcpy_ms, t_hw0,
+            player->frame_cb, player->frame_user_data)) {
+        return ESP_FAIL;
     }
 
     return ESP_OK;
+#endif
 }
 
 static esp_err_t init_hw_decoder(emotion_video_player_t *player)
@@ -2202,6 +2196,12 @@ static esp_err_t load_video_to_cache(emotion_video_player_t *player, int cache_i
     return ESP_OK;
 }
 
+static void index_reader_yield(void *context)
+{
+    (void)context;
+    taskYIELD();
+}
+
 // 🚀 关键新增函数：建立帧索引表
 static esp_err_t build_frame_index(emotion_video_player_t *player, int cache_index)
 {
@@ -2222,60 +2222,27 @@ static esp_err_t build_frame_index(emotion_video_player_t *player, int cache_ind
     
     ESP_LOGI(TAG, "🔨 开始建立帧索引表: %s", cache->file_name);
     
-    const uint8_t start_marker[] = {0xFF, 0xD8};
-    const uint8_t end_marker[] = {0xFF, 0xD9};
-    
-    uint8_t *buffer = cache->buffer;
-    size_t buffer_size = cache->size;
-    size_t search_pos = 0;
-    int frame_count = 0;
-    int yield_budget = 0;
-    
-    while (search_pos < buffer_size && frame_count < MAX_FRAMES_PER_VIDEO) {
-        uint8_t *frame_start = (uint8_t *)memmem(
-            buffer + search_pos,
-            buffer_size - search_pos,
-            start_marker,
-            2
-        );
-        
-        if (!frame_start) {
-            break;
-        }
-        
-        size_t start_offset = frame_start - buffer;
-        
-        uint8_t *frame_end = (uint8_t *)memmem(
-            frame_start + 2,
-            buffer_size - start_offset - 2,
-            end_marker,
-            2
-        );
-        
-        if (!frame_end) {
-            break;
-        }
-        
-        size_t end_offset = (frame_end - buffer) + 2;
-        size_t frame_size = end_offset - start_offset;
-        
-        if (frame_size >= 100 && frame_size <= 2*1024*1024) {
-            cache->frame_index[frame_count].offset = start_offset;
-            cache->frame_index[frame_count].size = frame_size;
-            frame_count++;
-        }
-        
-        search_pos = end_offset;
-        if (++yield_budget >= 8) {
-            yield_budget = 0;
-            taskYIELD();
-        }
+    size_t frame_count = 0;
+#if EMOTION_VIDEO_USE_INDEX_READER
+    const mjpeg_index_reader_result_t index_result = mjpeg_index_reader_build(
+#else
+    const mjpeg_index_reader_result_t index_result = mjpeg_index_reader_build_legacy(
+#endif
+        cache->buffer,
+        cache->size,
+        cache->frame_index,
+        MAX_FRAMES_PER_VIDEO,
+        &frame_count,
+        index_reader_yield,
+        NULL);
+    if (index_result != MJPEG_INDEX_READER_OK) {
+        return ESP_FAIL;
     }
-    
-    cache->frame_count = frame_count;
+    cache->frame_count = (int)frame_count;
     cache->index_built = true;
     
-    ESP_LOGI(TAG, "✅ 帧索引表建立完成: %s (共 %d 帧)", cache->file_name, frame_count);
+    ESP_LOGI(TAG, "✅ 帧索引表建立完成: %s (共 %d 帧) g4=%d",
+             cache->file_name, cache->frame_count, EMOTION_VIDEO_USE_INDEX_READER);
     
     return ESP_OK;
 }

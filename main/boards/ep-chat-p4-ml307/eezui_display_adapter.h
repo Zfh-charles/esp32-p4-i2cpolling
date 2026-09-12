@@ -2,6 +2,7 @@
 #define EEZUI_DISPLAY_ADAPTER_H
 
 #include "display.h"
+#include "idle_flash_band_overlay.h"
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_timer.h>
@@ -150,6 +151,9 @@ public:
 
     void EnterConversationPresent();
     void LeaveConversationPresent();
+    /** Protocol-thread notifications; atomic only, no LVGL/SD work. */
+    void NotifyTtsStart();
+    void NotifyTtsAudioFirst();
 
     void PresenterPlayEmotion(const char* emotion_name);
     void PresenterApplyDialogue(const char* role, const char* content);
@@ -231,7 +235,8 @@ private:
     void StopMouthFollow(const char* why);
     void MouthFollowTick();
     esp_err_t PresentMouthPatch(uint8_t level);
-    esp_err_t PresentLifeBand(uint8_t track, uint8_t frame);
+    esp_err_t PresentLifeBand(uint8_t track, uint8_t frame, uint32_t lock_wait_ms = 40);
+    esp_err_t PresentIdleFlashBand(uint8_t frame);
     esp_err_t PresentReleaseBand(uint8_t frame);
     bool ArmEmotionEnter(const char* emotion_name);
     bool ArmEmotionRelease(const char* why);
@@ -330,8 +335,13 @@ private:
     bool idle_breathe_ = false;
     /** s1ep-k: standby life assets replace legacy 400-row MJPEG breathe. */
     bool idle_breathe_small_life_ = false;
+    /** s1gt: flash-mapped opaque child image; never writes/reads the PSRAM face canvas. */
+    IdleFlashBandOverlay idle_flash_overlay_;
+    bool idle_breathe_flash_overlay_ = false;
     uint8_t idle_life_track_ = 0;
     uint8_t idle_life_frame_ = 0;
+    uint8_t idle_life_repair_attempts_ = 0;
+    bool idle_life_repair_pending_ = false;
     bool idle_breathe_need_prime_ = false;
     int idle_breathe_left_ = 0;
     uint32_t idle_breathe_gen_ = 0;
@@ -347,6 +357,10 @@ private:
     uint8_t idle_backlight_phase_ = 0;
     /** LLM emotion arrived on listen edge — play when speaking starts. */
     std::string pending_face_emo_;
+    uint32_t speech_core_generation_ = 0;
+    uint32_t speech_core_pending_generation_ = 0;
+    std::atomic<bool> speech_core_tts_started_{false};
+    bool speech_core_full_committed_ = false;
     /** Idle breathe (or other) currently holds AfeFetchGate — s1cn-c must not nest-lock. */
     bool face_holds_afe_gate_ = false;
 };

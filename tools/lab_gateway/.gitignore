@@ -1,0 +1,6 @@
+__pycache__/
+surface.local.json
+*.sqlite*
+*.partial
+*.log
+.env

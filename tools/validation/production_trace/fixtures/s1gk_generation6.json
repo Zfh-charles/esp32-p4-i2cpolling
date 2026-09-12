@@ -1,0 +1,20 @@
+{
+  "source": {
+    "path": "tools/logs/crash_COM7_20260826_1800_s1gk.log",
+    "sha256": "2b40695cf3c921e628fcc9547c37533c1bf94bd33d01449873d34e9611930762",
+    "line_numbering": "one-based LF-separated raw bytes; trailing CR removed",
+    "attribution": "s1gk historical capture; exact s1gk marker occurs after the reset at source line 17723, not inside this pre-reset excerpt",
+    "proves_completed_transactions": false
+  },
+  "records": [
+    {"line": 17637, "text": "W (3446904) ScreenPresenter: s1es speech_generation=6"},
+    {"line": 17650, "text": "W (3446908) FaceRouteV2: s1cn-c begin why=happy afe_held=0"},
+    {"line": 17651, "text": "W (3446918) EezuiDisplayAdapter: SAD_DIAG lvgl_face seed emo=happy full=480x480 s1cn-c"},
+    {"line": 17660, "text": "I (3447797) ReminderTrace: LC | owner=User phase=tts_audio_first ok=1 pkt=1"},
+    {"line": 17684, "text": "W (3448210) FaceRouteV2: s1cn-c begin why=happy afe_held=0"},
+    {"line": 17686, "text": "W (3448222) EezuiDisplayAdapter: SAD_DIAG lvgl_face seed emo=happy full=480x480 s1cn-c"},
+    {"line": 17688, "text": "W (3448264) ScreenPresenter: SAD_DIAG PRESENT play_done emo=happy cost_ms=1357 s1cn-b"},
+    {"line": 17710, "text": "W (3448312) FaceRouteV2: s1cn-c begin why=neutral afe_held=0"},
+    {"line": 17713, "text": "rst:0x7 (HP_SYS_HP_WDT_RESET),boot:0x30e (SPI_FAST_FLASH_BOOT)"}
+  ]
+}

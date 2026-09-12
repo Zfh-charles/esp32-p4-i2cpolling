@@ -1,25 +1,28 @@
-# tools/ 布局（存档约定）
+# Product tools and assets
 
+- `emotion_tool_dev/`: canonical PC asset builder, Character Pack compiler,
+  character profiles and regression tests.
+- `emotion_builder/`: compatibility entry points; no separate algorithm copy.
+- `product_contracts/`: shared schemas, examples and validator required by the compiler.
+- `mjpeg_ai_dialogue_v5p3_mouth_focus/`: the archived six-expression SD pack.
+  Firmware deployment uses `/sdcard/dialogue_v2/`; do not mix files from different packs.
+- `code_health/`: architecture, image-layout and public-archive checks.
+- `host_tests/`, `validation/`: automated production-oriented tests and gates.
+- Other reminder/MCP and development utilities retain their own usage guides.
+
+Historical asset directories are retained as references, not alternative default
+deployments. The archived pack is not proof of the contents of a currently inserted
+SD card. A source archive is not a tested firmware binary; see
+[`../docs/source-archive.md`](../docs/source-archive.md).
+
+From the repository root:
+
+```sh
+python -m unittest discover -s tools/emotion_tool_dev -p test_character_pack_compiler.py -v
+python tools/emotion_tool_dev/dialogue_pack_contract.py tools/mjpeg_ai_dialogue_v5p3_mouth_focus
+python tools/code_health/public_archive_guard.py
 ```
-tools/
-  emotion_tool_dev/                       # PC 自动化工具源码（权威）
-    dialogue_emotion_builder.py
-    README.md
-  emotion_builder/                        # 兼容旧路径（与 emotion_tool_dev 同步）
-  mjpeg_ai_dialogue_v4_temporal_feather/  # 曾推荐 v4 包（归档）
-  emotion_assets/
-    dialogue_v2_canonical/                # 无 life 基线包
-  experimental/
-    dialogue_v2_posebank/                 # 实验，非发布
-  stability/                              # reboot_audit / soak / serial
-```
 
-板上当前常用 SD 包可能是工作区 `mjpeg_ai_dialogue_v5p3_mouth_focus`（以 current-state §0 为准）；部署路径仍是 `/sdcard/dialogue_v2/`。
-
-代码味道审计：仓库根 `docs/code-smell-audit-20260820.md`。
-
-## 明确不入库
-
-- `serial_monitor.log`、`build_*.log`、`flash_*.log`
-- `build/`、`managed_components/`、`sdkconfig`、`elf_snapshots/`、`fw_archive/`
-- `__pycache__`、`.pyc`
+Keep game projects, local rules/AGENTS, device backups, private settings, build
+outputs and runtime logs outside the public archive. The archive guard checks
+the Git index and therefore must run after staging, not merely before copying.

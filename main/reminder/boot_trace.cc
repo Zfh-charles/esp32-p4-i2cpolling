@@ -12,10 +12,11 @@
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include "debug/afe_fetch_gate.h"
+#include "ota.h"
 
 #define TAG "BootTrace"
-// s1fs: exact s1fn visual ground plus TTS-boundary 4G UDP keepalive.
-#define FW_MARKER "boot_trace_v10_s1ft_m2c_visual_budget_life"
+// G4 PresentSink isolated production flip; Decoder and Clock remain legacy.
+#define FW_MARKER "boot_trace_v10_s1gy_idle_output_probe"
 
 namespace {
 
@@ -39,6 +40,8 @@ struct PhaseEntry {
 
 int64_t g_boot_us = 0;
 bool g_marker_echoed = false;
+bool g_afe_first_fetch_seen = false;
+bool g_local_ota_confirmed = false;
 // BootTraceMark is called from Core0 audio/network tasks and the Core1 face worker.
 // A std::deque here used to mutate its allocator state concurrently and eventually
 // crashed in RecordPhase with heap poison (0xBAAD5678).  Keep tracing allocation-free.
@@ -114,6 +117,9 @@ void RecordPhase(const char* phase, const char* detail, bool log_heap) {
     // s1ch: largest_free_block walks tlsf — skip under MSPI errata (same as PrintHeapStats).
     entry.heap_largest = 0;
     portENTER_CRITICAL(&g_phase_mux);
+    if (std::strcmp(phase, "AFE_FIRST_FETCH") == 0) {
+        g_afe_first_fetch_seen = true;
+    }
     g_phases[g_phase_head] = entry;
     g_phase_head = (g_phase_head + 1) % kPhaseRingCap;
     if (g_phase_count < kPhaseRingCap) {
@@ -161,6 +167,8 @@ void RegisterCrashHandlers() {
 void BootTraceInit() {
     g_boot_us = esp_timer_get_time();
     g_marker_echoed = false;
+    g_afe_first_fetch_seen = false;
+    g_local_ota_confirmed = false;
     RegisterCrashHandlers();
 
     if (g_rtc_boot_magic != 0xB0070002) {
@@ -227,7 +235,11 @@ void BootTraceMaybeEchoMarker() {
     // The P4 USB serial port can enumerate after the early boot marker has
     // already passed. Echo it once after startup settles so a soak log can be
     // attributed to the exact firmware without adding another timer or task.
-    if (g_marker_echoed || BootMs() < 60000) {
+    const uint32_t boot_ms = BootMs();
+    if (!g_local_ota_confirmed && boot_ms >= 60000 && g_afe_first_fetch_seen) {
+        g_local_ota_confirmed = OtaMarkCurrentVersionValid();
+    }
+    if (g_marker_echoed || boot_ms < 60000) {
         return;
     }
     g_marker_echoed = true;

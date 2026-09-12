@@ -240,24 +240,32 @@ bool Ota::CheckVersion() {
     return true;
 }
 
-void Ota::MarkCurrentVersionValid() {
+bool OtaMarkCurrentVersionValid() {
     auto partition = esp_ota_get_running_partition();
+    if (partition == nullptr) {
+        return false;
+    }
     if (strcmp(partition->label, "factory") == 0) {
         ESP_LOGI(TAG, "Running from factory partition, skipping");
-        return;
+        return true;
     }
 
     ESP_LOGI(TAG, "Running partition: %s", partition->label);
     esp_ota_img_states_t state;
     if (esp_ota_get_state_partition(partition, &state) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to get state of partition");
-        return;
+        return false;
     }
 
     if (state == ESP_OTA_IMG_PENDING_VERIFY) {
         ESP_LOGI(TAG, "Marking firmware as valid");
-        esp_ota_mark_app_valid_cancel_rollback();
+        return esp_ota_mark_app_valid_cancel_rollback() == ESP_OK;
     }
+    return state == ESP_OTA_IMG_VALID || state == ESP_OTA_IMG_UNDEFINED;
+}
+
+void Ota::MarkCurrentVersionValid() {
+    (void)OtaMarkCurrentVersionValid();
 }
 
 bool Ota::Upgrade(const std::string& firmware_url) {

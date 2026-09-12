@@ -632,9 +632,7 @@ bool FaceMouth_BindEmotion(const char* emotion_name) {
     return true;
 }
 
-bool FaceMouth_Ready(void) {
-    return FaceMouth_Enabled() && g_ready;
-}
+bool FaceMouth_Ready(void) { return FaceMouth_Enabled() && g_ready; }
 
 void FaceMouth_PublishFromPcm(const int16_t* pcm, size_t samples) {
     if (!FaceMouth_Enabled() || pcm == nullptr || samples == 0) {
@@ -722,7 +720,9 @@ const uint8_t* FaceMouth_HoldBaseRgb565(uint16_t* out_w, uint16_t* out_h) {
     return g_hold_base.rgb;
 }
 
-uint8_t FaceMouth_PoseCount(void) { return g_ready ? g_pose_count : 0; }
+uint8_t FaceMouth_PoseCount(void) {
+    return g_ready ? g_pose_count : 0;
+}
 
 const uint8_t* FaceMouth_PoseBaseRgb565(uint8_t pose, uint16_t* out_w, uint16_t* out_h) {
     Patch* p = pose == 1 && g_pose_count > 1 ? &g_pose1_base : &g_hold_base;
@@ -798,13 +798,10 @@ bool FaceMouth_LifeFrame(uint8_t track, uint8_t index, const uint8_t** rgb565, c
     if (y) *y = g_life_y[track];
     return true;
 }
-
 bool FaceMouth_ReleaseReady(void) { return g_ready && g_release_count > 0; }
 bool FaceMouth_EnterReady(void) { return g_ready && g_enter_count > 0; }
 uint8_t FaceMouth_EnterFrameCount(void) { return FaceMouth_EnterReady() ? g_enter_count : 0; }
-uint16_t FaceMouth_EnterIntervalMs(void) {
-    return FaceMouth_EnterReady() ? g_enter_interval_ms : 75;
-}
+uint16_t FaceMouth_EnterIntervalMs(void) { return FaceMouth_EnterReady() ? g_enter_interval_ms : 75; }
 bool FaceMouth_EnterFrame(uint8_t index, const uint8_t** rgb565,
                           uint16_t* w, uint16_t* h, int* x, int* y) {
     if (!FaceMouth_EnterReady() || index >= g_enter_count ||
@@ -817,9 +814,7 @@ bool FaceMouth_EnterFrame(uint8_t index, const uint8_t** rgb565,
     return true;
 }
 uint8_t FaceMouth_ReleaseFrameCount(void) { return FaceMouth_ReleaseReady() ? g_release_count : 0; }
-uint16_t FaceMouth_ReleaseIntervalMs(void) {
-    return FaceMouth_ReleaseReady() ? g_release_interval_ms : 90;
-}
+uint16_t FaceMouth_ReleaseIntervalMs(void) { return FaceMouth_ReleaseReady() ? g_release_interval_ms : 90; }
 bool FaceMouth_ReleaseFrame(uint8_t index, const uint8_t** rgb565,
                             uint16_t* w, uint16_t* h, int* x, int* y) {
     if (!FaceMouth_ReleaseReady() || index >= g_release_count ||

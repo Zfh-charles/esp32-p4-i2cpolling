@@ -20,6 +20,7 @@ MAX_BAND_ROWS = 48
 MAX_LIFE_TRACKS = 2
 MAX_LIFE_FRAMES = 12
 MAX_TRANSITION_FRAMES = 8
+GENERIC_LIFE_SEMANTICS = {None, "", "auto_unreviewed", "profile_approved"}
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -192,7 +193,7 @@ def _validate_clip(pack_root: Path, emotion: str, rel: Any, capabilities: set[st
         errors.append(f"{emotion}: invalid fallback mode")
 
     summary = {"emotion": emotion, "mode": mode, "life_tracks": 0,
-               "unreviewed_life_tracks": 0}
+               "life_choreographies": 0, "unreviewed_life_tracks": 0}
     if mode != "layered":
         return summary
 
@@ -276,11 +277,37 @@ def _validate_clip(pack_root: Path, emotion: str, rel: Any, capabilities: set[st
                     if track.get("approval") != "profile":
                         summary["unreviewed_life_tracks"] += 1
                         warnings.append(f"{label}: auto motion track is not semantically approved")
+                    semantic = track.get("semantic")
+                    choreography = track.get("choreography")
+                    if choreography is not None:
+                        if track.get("approval") != "profile" or semantic in GENERIC_LIFE_SEMANTICS:
+                            errors.append(f"{label}: choreography requires a specific profile-approved semantic")
+                        if not isinstance(choreography, dict):
+                            errors.append(f"{label}: choreography must be an object")
+                        else:
+                            if choreography.get("schema") != "idle-life-cluster-v1":
+                                errors.append(f"{label}: unsupported choreography schema")
+                            keyframes = choreography.get("keyframes")
+                            if (not isinstance(keyframes, list) or not 3 <= len(keyframes) <= 4 or
+                                    any(not _integer(v) for v in keyframes)):
+                                errors.append(f"{label}: choreography keyframes must contain 3..4 integer indices")
+                            interval = choreography.get("frame_interval_ms")
+                            if not _integer(interval) or not 160 <= interval <= 400:
+                                errors.append(f"{label}: choreography frame_interval_ms must be 160..400")
+                            rest = choreography.get("rest_ms")
+                            if (not isinstance(rest, dict) or not _integer(rest.get("min")) or
+                                    not _integer(rest.get("max")) or not 4000 <= rest["min"] <= rest["max"] <= 7000):
+                                errors.append(f"{label}: choreography rest_ms must stay within 4000..7000")
+                            if choreography.get("busy_policy") != "abort_to_base_no_replay":
+                                errors.append(f"{label}: choreography must abort to base without replay")
+                            if choreography.get("returns_to_base") is not True:
+                                errors.append(f"{label}: choreography must declare returns_to_base=true")
                     roi = _rect(track.get("roi"), width, height, errors, label, MAX_BAND_ROWS)
                     track_frames = track.get("frames")
                     if not isinstance(track_frames, list) or not 2 <= len(track_frames) <= MAX_LIFE_FRAMES:
                         errors.append(f"{label}: frame count must be 2..{MAX_LIFE_FRAMES}")
                     elif roi:
+                        frame_hashes: list[str | None] = []
                         for frame_index, item in enumerate(track_frames):
                             frame_label = f"{label}[{frame_index}]"
                             if not isinstance(item, dict):
@@ -288,12 +315,27 @@ def _validate_clip(pack_root: Path, emotion: str, rel: Any, capabilities: set[st
                                 continue
                             _check_rgb565(folder, item.get("rgb565"), roi[2], roi[3], errors,
                                           frame_label, item.get("rgb565_sha256"))
+                            frame_hashes.append(item.get("rgb565_sha256"))
                             mask = _safe_file(folder, item.get("mask_a8"), errors,
                                               frame_label + ".mask")
                             if mask and mask.stat().st_size != roi[2] * roi[3]:
                                 errors.append(f"{frame_label}: A8 mask size mismatch")
                             elif mask and item.get("mask_sha256") != _sha256_bytes(mask.read_bytes()):
                                 errors.append(f"{frame_label}: A8 mask SHA-256 mismatch")
+                        if choreography is not None and isinstance(choreography, dict):
+                            keyframes = choreography.get("keyframes")
+                            if isinstance(keyframes, list) and all(_integer(v) for v in keyframes):
+                                if any(v < 0 or v >= len(track_frames) for v in keyframes):
+                                    errors.append(f"{label}: choreography keyframe outside track")
+                                elif keyframes[-1] != len(track_frames) - 1:
+                                    errors.append(f"{label}: choreography must finish on the final base frame")
+                            first, last = track_frames[0], track_frames[-1]
+                            if (frame_hashes[0] != frame_hashes[-1] or
+                                    first.get("peak_alpha") != 0 or last.get("peak_alpha") != 0 or
+                                    first.get("active_ratio") != 0.0 or last.get("active_ratio") != 0.0):
+                                errors.append(f"{label}: choreography track must close exactly on canonical base")
+                            else:
+                                summary["life_choreographies"] += 1
 
     _validate_transition(folder, render.get("enter_layer"), "enter_layer",
                          width, height, hold_hash, errors)

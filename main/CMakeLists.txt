@@ -35,6 +35,8 @@ set(SOURCES "audio/audio_codec.cc"
             "debug/stack_diag.c"
             "debug/panic_capture.c"
             "application.cc"
+            "domain/emotion_intent_policy.cc"
+            "ports/visual_port.cc"
             "ota.cc"
             "settings.cc"
             "device_state_event.cc"
@@ -327,6 +329,8 @@ elseif(CONFIG_BOARD_TYPE_EP_CHAT_P4_ML307)
     set(BUILTIN_TEXT_FONT font_puhui_basic_30_4)
     set(BUILTIN_ICON_FONT font_awesome_30_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
+    set(DEFAULT_ASSETS_EXTRA_FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/idle_flash_assets")
     list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE})
 elseif(CONFIG_BOARD_TYPE_ESP_P4_FUNCTION_EV_BOARD)
     set(BOARD_TYPE "esp-p4-function-ev-board")
@@ -702,6 +706,19 @@ idf_component_register(SRCS ${SOURCES}
                     WHOLE_ARCHIVE
                     )
 
+# These extracted adapter translation units do not throw across their C-style
+# boundaries or own unwindable resources. Their default C++ unwind tables can
+# cross the ESP32-P4 pre-IROM 64 KiB image boundary. Keep unwind data on the
+# state-machine and display owners where diagnostics matter.
+set_source_files_properties(
+    "boards/ep-chat-p4-ml307/eezui_display_adapter_conversation.cc"
+    "boards/ep-chat-p4-ml307/face_speech_core_bank.cc"
+    "boards/ep-chat-p4-ml307/face_asset_source.cc"
+    "boards/ep-chat-p4-ml307/idle_flash_band_overlay.cc"
+    PROPERTIES COMPILE_OPTIONS
+    "-fno-exceptions;-fno-unwind-tables;-fno-asynchronous-unwind-tables"
+)
+
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
 # If BOARD_NAME is empty, use BOARD_TYPE
 if(NOT BOARD_NAME)
@@ -833,6 +850,11 @@ function(build_default_assets_bin)
         ${SDKCONFIG}
         ${PROJECT_DIR}/scripts/build_default_assets.py
     )
+    if(DEFAULT_ASSETS_EXTRA_FILES)
+        file(GLOB_RECURSE DEFAULT_ASSETS_EXTRA_DEPENDS CONFIGURE_DEPENDS
+            "${DEFAULT_ASSETS_EXTRA_FILES}/*")
+        list(APPEND ASSETS_BIN_DEPENDS ${DEFAULT_ASSETS_EXTRA_DEPENDS})
+    endif()
 
     # Create custom command to build assets
     add_custom_command(

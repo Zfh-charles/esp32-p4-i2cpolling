@@ -3,7 +3,9 @@
 面向固件 **M1 layered**：静态情绪底图 + 独立嘴/眼小图 + 可选 life 轨。  
 **不重编码**输入 MJPEG；只建索引、分段、ROI、RGB565、校验。
 
-源码目录：`emotion_tool_dev/`。GitHub 镜像：`tools/emotion_builder/`。
+本地源码目录：`emotion_tool_dev/`。GitHub 权威目录：`tools/emotion_tool_dev/`。
+契约校验器随工具保留在 `tools/product_contracts/`；编译器支持上述两种目录布局，
+请勿只复制单个编译器文件。`tools/emotion_builder/` 是历史兼容入口，不再维护第二份算法。
 
 ## 推荐发布包
 
@@ -36,6 +38,31 @@ python dialogue_emotion_builder.py --input "C:\bake\mjpeg_ai" --output "C:\bake\
 ```
 
 `--profile` 可覆盖自动 ROI/分段；改完必须重校验。
+
+## P1 多 IP Character Pack v3 编译层
+
+旧 builder 继续生成固件当前可读的 v2 包；不要为了 v3 改写或重编码这条已验路径。外围编译器只读 v2 媒体，根据角色 profile 选择该角色真正拥有的嘴、眼、身体 life 和短过渡能力，生成 v3 sidecar 与覆盖/接缝/语义/资源报告：
+
+```powershell
+python character_pack_compiler.py `
+  --v2-pack "C:\bake\xiaozhi-p4-epdainaozhong0109\mjpeg_ai_dialogue_v5p3_mouth_focus" `
+  --character-profile "C:\bake\xiaozhi-p4-epdainaozhong0109\emotion_tool_dev\profiles\current_ip_v1.json" `
+  --output "C:\bake\out\character_pack_v3.json" `
+  --report "C:\bake\out\character_compile_report.json"
+```
+
+- `profiles/current_ip_v1.json`：当前人物 IP；只批准已验嘴层与 standby/happy 下半部 track1，强情绪静态降级。
+- `profiles/robot_no_mouth_v1.json`：结构测试 profile；没有嘴和眼时不读取 ROI/嘴眼资产，证明六 canonical 不等于六套固定人体坐标。
+- profile 的画布必须与素材一致；不同 IP 必须使用自己的源素材，不能把人物底图冒充机器人包。
+- `approved_layers` 与 `approved_life_tracks` 是人工发布门；自动检测结果不能自行升级为正式能力。
+- 编译器只读取并校验 `frames.mjpeg` SHA-256，不调用 JPEG 编码器；v2 `pack_manifest.json` 和媒体文件保持不变。
+
+离线测试：
+
+```powershell
+$env:PYTHONDONTWRITEBYTECODE=1
+python -m unittest discover -s emotion_tool_dev -p "test_character_pack_compiler.py" -v
+```
 
 life 的运动分数只负责找候选，正式素材应使用语义批准门。例如只保留 happy 的自动候选 track 1：
 

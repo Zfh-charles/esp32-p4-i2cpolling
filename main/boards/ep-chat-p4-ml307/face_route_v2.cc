@@ -2,6 +2,7 @@
 
 #include <atomic>
 
+#include <esp_attr.h>
 #include <esp_log.h>
 #include <esp_rom_sys.h>
 #include <freertos/FreeRTOS.h>
@@ -13,6 +14,13 @@
 #define TAG "FaceRouteV2"
 
 namespace {
+
+// Boot-only diagnostics live in DRAM so adding an R0 flag cannot split the
+// fixed P4 TCM segment at the pre-IROM 64 KiB boundary.
+DRAM_ATTR const char kFaceRouteBootFormat[] =
+    "!!FACE_S1GT a=%d b=%d c=%d d=%d e=%d f=%d g=%d i=%d j=%d k=%d l=%d "
+    "m=%d n=%d o=%d p=%d q=%d r=%d s=%d t=%d u=%d v=%d w=%d x=%d y=%d "
+    "flash_band=4x48 drop=1 abort_base=1\n";
 
 std::atomic<bool> g_a_worker{S1CN_A_WORKER != 0};
 std::atomic<bool> g_b_emotion3{S1CN_B_EMOTION3 != 0};
@@ -33,7 +41,8 @@ std::atomic<bool> g_t_idle_backlight_breathe{S1FD_T_IDLE_BACKLIGHT_BREATHE != 0}
 std::atomic<bool> g_u_visual_budget_shadow{S1FL_U_VISUAL_BUDGET_SHADOW != 0};
 std::atomic<bool> g_v_visual_budget_mouth_apply{S1FM_V_VISUAL_BUDGET_MOUTH_APPLY != 0};
 std::atomic<bool> g_w_visual_budget_life_apply{S1FN_W_VISUAL_BUDGET_LIFE_APPLY != 0};
-std::atomic<bool> g_x_idle_life_canary{S1FO_X_IDLE_LIFE_CANARY != 0};
+std::atomic<bool> g_x_idle_life_token_canary{S1FU_X_IDLE_LIFE_TOKEN_CANARY != 0};
+std::atomic<bool> g_y_idle_flash_overlay{S1GT_Y_IDLE_FLASH_OVERLAY != 0};
 
 std::atomic<bool> g_fs_busy{false};
 std::atomic<bool> g_fs_holds_afe{false};
@@ -120,10 +129,12 @@ bool FaceRouteV2_VisualBudgetMouthApplyEnabled(void) {
 bool FaceRouteV2_VisualBudgetLifeApplyEnabled(void) {
     return g_w_visual_budget_life_apply.load(std::memory_order_relaxed);
 }
-bool FaceRouteV2_IdleLifeCanaryEnabled(void) {
-    return g_x_idle_life_canary.load(std::memory_order_relaxed);
+bool FaceRouteV2_IdleLifeTokenCanaryEnabled(void) {
+    return g_x_idle_life_token_canary.load(std::memory_order_relaxed);
 }
-
+bool FaceRouteV2_IdleFlashOverlayEnabled(void) {
+    return g_y_idle_flash_overlay.load(std::memory_order_relaxed);
+}
 void FaceRouteV2_SetWorker(bool on) {
     g_a_worker.store(on, std::memory_order_relaxed);
 }
@@ -181,52 +192,37 @@ void FaceRouteV2_SetVisualBudgetMouthApply(bool on) {
 void FaceRouteV2_SetVisualBudgetLifeApply(bool on) {
     g_w_visual_budget_life_apply.store(on, std::memory_order_relaxed);
 }
-void FaceRouteV2_SetIdleLifeCanary(bool on) {
-    g_x_idle_life_canary.store(on, std::memory_order_relaxed);
+void FaceRouteV2_SetIdleLifeTokenCanary(bool on) {
+    g_x_idle_life_token_canary.store(on, std::memory_order_relaxed);
+}
+void FaceRouteV2_SetIdleFlashOverlay(bool on) {
+    g_y_idle_flash_overlay.store(on, std::memory_order_relaxed);
 }
 void FaceRouteV2_BootLog(void) {
-    ESP_LOGW(TAG,
-             "s1fo flags a=%d b=%d c=%d d=%d e_static=%d f_fullstill=%d g_enter=%d i_life=%d j_canon=%d k_idlelife=%d l_release=%d m_provisional=%d n_gain=%d o_large=%d p_life_fence=%d q_mqtt_idle_quiet=%d r_afe_dither=%d s_afe_edge=%d t_bl_breathe=%d u_budget_shadow=%d v_mouth_apply=%d w_life_apply=%d x_idle_canary=%d",
-             FaceRouteV2_WorkerEnabled() ? 1 : 0, FaceRouteV2_Emotion3Enabled() ? 1 : 0,
-             FaceRouteV2_FsGateEnabled() ? 1 : 0, FaceRouteV2_QuietLogEnabled() ? 1 : 0,
-             FaceRouteV2_StaticDialogueEnabled() ? 1 : 0, FaceRouteV2_FullStillEnabled() ? 1 : 0,
-             FaceRouteV2_EnterArcEnabled() ? 1 : 0, FaceRouteV2_LifeLayerEnabled() ? 1 : 0,
-             FaceRouteV2_CanonicalEmotionEnabled() ? 1 : 0,
-             FaceRouteV2_StandbyLifeEnabled() ? 1 : 0,
-             FaceRouteV2_ReleaseHubEnabled() ? 1 : 0,
-             FaceRouteV2_ProvisionalMouthEnabled() ? 1 : 0,
-             FaceRouteV2_MouthGainSoftEnabled() ? 1 : 0,
-             FaceRouteV2_MouthLargeGainSoftEnabled() ? 1 : 0,
-             FaceRouteV2_LifeAfeFenceEnabled() ? 1 : 0,
-             S1FA_Q_MQTT_IDLE_QUIET ? 1 : 0,
-             S1FB_R_IDLE_AFE_DITHER ? 1 : 0,
-             S1FC_S_AFE_EDGE_TOKEN ? 1 : 0,
-             FaceRouteV2_IdleBacklightBreatheEnabled() ? 1 : 0,
-             FaceRouteV2_VisualBudgetShadowEnabled() ? 1 : 0,
-             FaceRouteV2_VisualBudgetMouthApplyEnabled() ? 1 : 0,
-             FaceRouteV2_VisualBudgetLifeApplyEnabled() ? 1 : 0,
-             FaceRouteV2_IdleLifeCanaryEnabled() ? 1 : 0);
-    esp_rom_printf("!!FACE_S1FO a=%d b=%d c=%d d=%d e=%d f=%d g=%d i=%d j=%d k=%d l=%d m=%d n=%d o=%d p=%d q=%d r=%d s=%d t=%d u=%d v=%d w=%d x=%d apply=1 idle_life_ms=420 rest_ms=8000\n",
-                   FaceRouteV2_WorkerEnabled() ? 1 : 0, FaceRouteV2_Emotion3Enabled() ? 1 : 0,
-                   FaceRouteV2_FsGateEnabled() ? 1 : 0, FaceRouteV2_QuietLogEnabled() ? 1 : 0,
-                   FaceRouteV2_StaticDialogueEnabled() ? 1 : 0,
-                   FaceRouteV2_FullStillEnabled() ? 1 : 0, FaceRouteV2_EnterArcEnabled() ? 1 : 0,
-                   FaceRouteV2_LifeLayerEnabled() ? 1 : 0,
-                   FaceRouteV2_CanonicalEmotionEnabled() ? 1 : 0,
-                   FaceRouteV2_StandbyLifeEnabled() ? 1 : 0,
-                   FaceRouteV2_ReleaseHubEnabled() ? 1 : 0,
-                   FaceRouteV2_ProvisionalMouthEnabled() ? 1 : 0,
-                   FaceRouteV2_MouthGainSoftEnabled() ? 1 : 0,
-                   FaceRouteV2_MouthLargeGainSoftEnabled() ? 1 : 0,
-                   FaceRouteV2_LifeAfeFenceEnabled() ? 1 : 0,
-                   S1FA_Q_MQTT_IDLE_QUIET ? 1 : 0,
-                   S1FB_R_IDLE_AFE_DITHER ? 1 : 0,
-                   S1FC_S_AFE_EDGE_TOKEN ? 1 : 0,
-                   FaceRouteV2_IdleBacklightBreatheEnabled() ? 1 : 0,
-                   FaceRouteV2_VisualBudgetShadowEnabled() ? 1 : 0,
-                   FaceRouteV2_VisualBudgetMouthApplyEnabled() ? 1 : 0,
-                   FaceRouteV2_VisualBudgetLifeApplyEnabled() ? 1 : 0,
-                   FaceRouteV2_IdleLifeCanaryEnabled() ? 1 : 0);
+    esp_rom_printf(
+        kFaceRouteBootFormat,
+        FaceRouteV2_WorkerEnabled() ? 1 : 0,
+        FaceRouteV2_Emotion3Enabled() ? 1 : 0,
+        FaceRouteV2_FsGateEnabled() ? 1 : 0,
+        FaceRouteV2_QuietLogEnabled() ? 1 : 0,
+        FaceRouteV2_StaticDialogueEnabled() ? 1 : 0,
+        FaceRouteV2_FullStillEnabled() ? 1 : 0,
+        FaceRouteV2_EnterArcEnabled() ? 1 : 0,
+        FaceRouteV2_LifeLayerEnabled() ? 1 : 0,
+        FaceRouteV2_CanonicalEmotionEnabled() ? 1 : 0,
+        FaceRouteV2_StandbyLifeEnabled() ? 1 : 0,
+        FaceRouteV2_ReleaseHubEnabled() ? 1 : 0,
+        FaceRouteV2_ProvisionalMouthEnabled() ? 1 : 0,
+        FaceRouteV2_MouthGainSoftEnabled() ? 1 : 0,
+        FaceRouteV2_MouthLargeGainSoftEnabled() ? 1 : 0,
+        FaceRouteV2_LifeAfeFenceEnabled() ? 1 : 0,
+        0, 0, 0,
+        FaceRouteV2_IdleBacklightBreatheEnabled() ? 1 : 0,
+        FaceRouteV2_VisualBudgetShadowEnabled() ? 1 : 0,
+        FaceRouteV2_VisualBudgetMouthApplyEnabled() ? 1 : 0,
+        FaceRouteV2_VisualBudgetLifeApplyEnabled() ? 1 : 0,
+        FaceRouteV2_IdleLifeTokenCanaryEnabled() ? 1 : 0,
+        FaceRouteV2_IdleFlashOverlayEnabled() ? 1 : 0);
 }
 
 void FaceRouteV2_EnsureWorker(FaceRouteV2TickFn tick_fn, void* ctx) {

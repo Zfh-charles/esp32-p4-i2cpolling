@@ -49,7 +49,8 @@ void ReminderPoller::EnsureNvsConfigured() {
     std::string poll_url = settings.GetString("poll_url");
     if (!poll_url.empty() &&
         (poll_url.find(":8444") != std::string::npos ||
-         poll_url.find("114.245.178.62") != std::string::npos)) {
+         poll_url.find("114.245.178.62") != std::string::npos ||
+         poll_url.find("114.245.176.144") != std::string::npos)) {
 #ifdef CONFIG_REMINDER_POLL_DEFAULT_URL
         settings.SetString("poll_url", CONFIG_REMINDER_POLL_DEFAULT_URL);
         ESP_LOGW(TAG, "Migrated stale poll_url (old host/port) to menuconfig default");

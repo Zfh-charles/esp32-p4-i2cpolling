@@ -12,7 +12,8 @@
 
 #define TAG "PanicCap"
 
-#define PANIC_CAPTURE_MAGIC 0x50414E32u
+#define PANIC_CAPTURE_MAGIC_LEGACY 0x50414E32u
+#define PANIC_CAPTURE_MAGIC 0x50414E33u
 
 typedef struct {
     uint32_t magic;
@@ -30,16 +31,29 @@ typedef struct {
     uint32_t mepc2;
     uint32_t mcause2;
     uint32_t mtval2;
-    // Cache state at trap time. A LoadAccessFault on a mapped PSRAM address has
-    // only two explanations: the address is genuinely unreachable, or the cache
-    // was suspended. spi_flash_disable_cache() suspends CACHE_LL_LEVEL_EXT_MEM /
-    // CACHE_TYPE_ALL, which covers PSRAM as well as flash, so a flash write in
-    // flight makes every PSRAM load fault. These fields tell the two apart.
+    // Cache/flash-operation observations, not a root-cause verdict. A virtual
+    // address in the PSRAM range does not prove allocation, mapping or access
+    // permissions; cache_on alone cannot exclude bus or memory corruption.
     uint32_t flashop_depth;
     int32_t flashop_core;
     uint32_t flashop_seq;
     uint32_t cache_on;
+    // Append only: retain the legacy prefix. These are operands of the s1gv
+    // failing vector load and its address/loop calculations. Never dereference
+    // them in the panic path; the pointed-to memory may be inaccessible.
+    uint32_t s8;
+    uint32_t s9;
+    uint32_t t0;
+    uint32_t t3;
+    uint32_t t4;
+    uint32_t a0;
+    uint32_t a1;
+    uint32_t a2;
+    uint32_t a3;
 } panic_capture_t;
+
+_Static_assert(offsetof(panic_capture_t, s8) == 68, "preserve legacy RTC prefix");
+_Static_assert(sizeof(panic_capture_t) == 104, "bounded panic RTC record");
 
 RTC_NOINIT_ATTR panic_capture_t g_rtc_panic_capture;
 
@@ -129,6 +143,15 @@ static void IRAM_ATTR CaptureFrame(const void *frame_ptr, uint32_t via)
     g_rtc_panic_capture.flashop_core = s_flashop_core;
     g_rtc_panic_capture.flashop_seq = s_flashop_seq;
     g_rtc_panic_capture.cache_on = 0xffffffffu;
+    g_rtc_panic_capture.s8 = 0;
+    g_rtc_panic_capture.s9 = 0;
+    g_rtc_panic_capture.t0 = 0;
+    g_rtc_panic_capture.t3 = 0;
+    g_rtc_panic_capture.t4 = 0;
+    g_rtc_panic_capture.a0 = 0;
+    g_rtc_panic_capture.a1 = 0;
+    g_rtc_panic_capture.a2 = 0;
+    g_rtc_panic_capture.a3 = 0;
 
     if (frame != NULL) {
         g_rtc_panic_capture.core = (int32_t)frame->mhartid;
@@ -137,6 +160,15 @@ static void IRAM_ATTR CaptureFrame(const void *frame_ptr, uint32_t via)
         g_rtc_panic_capture.sp = (uint32_t)frame->sp;
         g_rtc_panic_capture.mcause = (uint32_t)frame->mcause;
         g_rtc_panic_capture.mtval = (uint32_t)frame->mtval;
+        g_rtc_panic_capture.s8 = (uint32_t)frame->s8;
+        g_rtc_panic_capture.s9 = (uint32_t)frame->s9;
+        g_rtc_panic_capture.t0 = (uint32_t)frame->t0;
+        g_rtc_panic_capture.t3 = (uint32_t)frame->t3;
+        g_rtc_panic_capture.t4 = (uint32_t)frame->t4;
+        g_rtc_panic_capture.a0 = (uint32_t)frame->a0;
+        g_rtc_panic_capture.a1 = (uint32_t)frame->a1;
+        g_rtc_panic_capture.a2 = (uint32_t)frame->a2;
+        g_rtc_panic_capture.a3 = (uint32_t)frame->a3;
     }
 
     // Read last: cache_hal lives in IRAM so this is safe with the cache down,
@@ -179,7 +211,8 @@ static const char *CauseName(uint32_t mcause)
 
 void PanicCaptureReport(void)
 {
-    if (g_rtc_panic_capture.magic != PANIC_CAPTURE_MAGIC) {
+    const int has_operands = g_rtc_panic_capture.magic == PANIC_CAPTURE_MAGIC;
+    if (!has_operands && g_rtc_panic_capture.magic != PANIC_CAPTURE_MAGIC_LEGACY) {
         // Printed every boot so that a missing record is never confused with a
         // missing capture hook.
         ESP_LOGI(TAG, "PANIC_LAST | none armed=1 hook=panicHandler");
@@ -200,6 +233,23 @@ void PanicCaptureReport(void)
              (unsigned long)g_rtc_panic_capture.sp,
              (unsigned long)g_rtc_panic_capture.mtval);
 
+    if (has_operands) {
+        // PR1 wire format: s8,s9,t0,t3,t4,a0,a1,a2,a3 (hex).
+        // Keep labels here, not in DROM: this build is near a mapped-segment
+        // alignment boundary. The image-layout gate still decides release.
+        ESP_LOGW(TAG,
+                 "PR1 %lx,%lx,%lx,%lx,%lx,%lx,%lx,%lx,%lx",
+                 (unsigned long)g_rtc_panic_capture.s8,
+                 (unsigned long)g_rtc_panic_capture.s9,
+                 (unsigned long)g_rtc_panic_capture.t0,
+                 (unsigned long)g_rtc_panic_capture.t3,
+                 (unsigned long)g_rtc_panic_capture.t4,
+                 (unsigned long)g_rtc_panic_capture.a0,
+                 (unsigned long)g_rtc_panic_capture.a1,
+                 (unsigned long)g_rtc_panic_capture.a2,
+                 (unsigned long)g_rtc_panic_capture.a3);
+    }
+
     if (g_rtc_panic_capture.entries > 1) {
         ESP_LOGE(TAG,
                  "PANIC_LAST | DUAL_CORE_TRAP core2=%d mcause2=%lu(%s) mepc2=0x%08lx mtval2=0x%08lx",
@@ -210,9 +260,8 @@ void PanicCaptureReport(void)
                  (unsigned long)g_rtc_panic_capture.mtval2);
     }
 
-    // flashop_depth>0 or cache_on=0 means the fault address was unreachable
-    // because the external-memory cache was suspended, not because PSRAM itself
-    // failed. Both zero points back at the PSRAM timing / 200M config.
+    // Correlate these observations with operands, the matching ELF and other
+    // diagnostics. Neither cache_on=1 nor depth=0 identifies the failing owner.
     ESP_LOGW(TAG,
              "PANIC_LAST | CACHE cache_on=%lu flashop_depth=%lu flashop_core=%d flashop_seq=%lu",
              (unsigned long)g_rtc_panic_capture.cache_on,

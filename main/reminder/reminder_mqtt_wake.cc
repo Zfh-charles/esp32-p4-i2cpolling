@@ -129,6 +129,7 @@ void ReminderMqttWake::EnsureNvsConfigured() {
     std::string nvs_broker = settings.GetString("broker");
     bool stale_broker = !nvs_broker.empty() &&
         (nvs_broker.find("114.245.178.62") != std::string::npos ||
+         nvs_broker.find("114.245.176.144") != std::string::npos ||
          nvs_broker.find("broker.emqx.io") != std::string::npos);
     if (!stale_broker && !nvs_broker.empty()) {
         return;

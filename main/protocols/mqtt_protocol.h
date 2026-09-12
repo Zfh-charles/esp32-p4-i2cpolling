@@ -9,7 +9,6 @@
 #include <mbedtls/aes.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
-#include <esp_timer.h>
 
 #include <functional>
 #include <string>

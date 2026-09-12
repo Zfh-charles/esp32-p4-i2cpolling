@@ -120,7 +120,11 @@ void ScreenPresenter::LeaveConversation() {
     }
     mode_ = Mode::kLegacyLvgl;
     legacy_passthrough_ = true;
+#if SCREEN_PRESENTER_USE_STATE_REDUCER
+    face_state_.NotifySpeechState(false);
+#else
     speech_turn_active_ = false;
+#endif
     const int64_t dur_ms = (esp_timer_get_time() - conversation_since_us_) / 1000;
     ESP_LOGW(TAG, "CTRL PRESENT mode=legacy passthrough=1 soak_ms=%d presents=%u",
              (int)dur_ms, (unsigned)present_count_);
@@ -132,6 +136,21 @@ void ScreenPresenter::LeaveConversation() {
 }
 
 uint32_t ScreenPresenter::NotifySpeechState(bool speaking) {
+#if SCREEN_PRESENTER_USE_STATE_REDUCER
+    const uint32_t old_pending_generation = face_state_.pending_generation();
+    const auto decision = face_state_.NotifySpeechState(speaking);
+    if (decision.generation == 0) {
+        return 0;
+    }
+    ESP_LOGW(TAG, "s1es speech_generation=%u", (unsigned)decision.generation);
+    esp_rom_printf("!!FACE_S1ES speech_gen=%u\n", (unsigned)decision.generation);
+    if (decision.pending_migrated && !emotion_pending_.empty()) {
+        ESP_LOGW(TAG, "s1ew pending_migrate emo=%s old_gen=%u new_gen=%u",
+                 emotion_pending_.c_str(), (unsigned)old_pending_generation,
+                 (unsigned)decision.generation);
+    }
+    return decision.generation;
+#else
     if (!speaking) {
         speech_turn_active_ = false;
         return 0;
@@ -141,9 +160,7 @@ uint32_t ScreenPresenter::NotifySpeechState(bool speaking) {
     }
     speech_turn_active_ = true;
     ++speech_generation_;
-    if (speech_generation_ == 0) {
-        ++speech_generation_;
-    }
+    if (speech_generation_ == 0) ++speech_generation_;
     ESP_LOGW(TAG, "s1es speech_generation=%u", (unsigned)speech_generation_);
     esp_rom_printf("!!FACE_S1ES speech_gen=%u\n", (unsigned)speech_generation_);
     if (!emotion_pending_.empty() && emotion_pending_generation_ != speech_generation_) {
@@ -153,32 +170,37 @@ uint32_t ScreenPresenter::NotifySpeechState(bool speaking) {
         emotion_pending_generation_ = speech_generation_;
     }
     return speech_generation_;
+#endif
 }
 
 void ScreenPresenter::NotifyEmotion(const char* emotion_name) {
-    if (!emotion_name) {
-        emotion_name = "neutral";
-    }
+    if (!emotion_name) emotion_name = "neutral";
     emotion_name_ = emotion_name;
     dirty_face_ = true;
     ESP_LOGW(TAG, "CTRL PRESENT notify emotion=%s mode=%d pass=%d", emotion_name,
              static_cast<int>(mode_), legacy_passthrough_ ? 1 : 0);
     ESP_LOGW(TAG, "SAD_DIAG PRESENT notify emo=%s mode=%d compose=%d task=%s", emotion_name,
              static_cast<int>(mode_), UseComposeBlit() ? 1 : 0, pcTaskGetName(nullptr));
-
     if (host_ == nullptr) {
         ESP_LOGW(TAG, "SAD_DIAG PRESENT notify abort=no_host emo=%s", emotion_name);
         return;
     }
 
-    // s1cn-b: pending overwrite; commit only at safe points (or immediately if idle).
     if (FaceRouteV2_Emotion3Enabled()) {
         emotion_pending_ = emotion_name;
+#if SCREEN_PRESENTER_USE_STATE_REDUCER
+        face_state_.RequestEmotion(emotion_name);
+        const uint32_t pending_generation = face_state_.pending_generation();
+        const uint32_t committed_generation = face_state_.committed_generation();
+#else
         emotion_pending_generation_ = speech_generation_;
+        const uint32_t pending_generation = emotion_pending_generation_;
+        const uint32_t committed_generation = emotion_committed_generation_;
+#endif
         ESP_LOGW(TAG, "s1es requested→pending emo=%s gen=%u committed=%s cgen=%u",
-                 emotion_name, (unsigned)emotion_pending_generation_,
+                 emotion_name, (unsigned)pending_generation,
                  emotion_committed_.empty() ? "-" : emotion_committed_.c_str(),
-                 (unsigned)emotion_committed_generation_);
+                 (unsigned)committed_generation);
         esp_rom_printf("!!FACE_S1CN b=pending emo=%s\n", emotion_name);
         if (!host_->PresenterIsFaceRoiAnimActive()) {
             FlushPendingEmotion("notify_idle");
@@ -196,12 +218,23 @@ void ScreenPresenter::NotifyEmotion(const char* emotion_name) {
 }
 
 void ScreenPresenter::FlushPendingEmotion(const char* why) {
-    if (!FaceRouteV2_Emotion3Enabled() || host_ == nullptr) {
-        return;
-    }
+    if (!FaceRouteV2_Emotion3Enabled() || host_ == nullptr) return;
     if (emotion_pending_.empty()) {
         return;
     }
+#if SCREEN_PRESENTER_USE_STATE_REDUCER
+    const uint32_t generation = face_state_.pending_generation();
+    const auto decision = face_state_.CommitPending();
+    if (decision == domain::FaceStateReducer::CommitDecision::kDeduplicated) {
+        ESP_LOGW(TAG, "s1es dedupe_same_generation emo=%s gen=%u",
+                 emotion_pending_.c_str(), (unsigned)generation);
+        emotion_pending_.clear();
+        return;
+    }
+    if (decision == domain::FaceStateReducer::CommitDecision::kNoPending) {
+        return;
+    }
+#else
     if (!emotion_committed_.empty() &&
         strcasecmp(emotion_pending_.c_str(), emotion_committed_.c_str()) == 0 &&
         emotion_pending_generation_ == emotion_committed_generation_) {
@@ -210,11 +243,14 @@ void ScreenPresenter::FlushPendingEmotion(const char* why) {
         emotion_pending_.clear();
         return;
     }
-    const std::string emo = emotion_pending_;
     const uint32_t generation = emotion_pending_generation_;
+#endif
+    const std::string emo = emotion_pending_;
     emotion_pending_.clear();
     emotion_committed_ = emo;
+#if !SCREEN_PRESENTER_USE_STATE_REDUCER
     emotion_committed_generation_ = generation;
+#endif
     emotion_name_ = emo;
     const int64_t t0 = esp_timer_get_time();
     ESP_LOGW(TAG, "s1es commit emo=%s gen=%u why=%s via=presenter", emo.c_str(),
@@ -223,81 +259,6 @@ void ScreenPresenter::FlushPendingEmotion(const char* why) {
     host_->PresenterPlayEmotion(emo.c_str());
     ESP_LOGW(TAG, "SAD_DIAG PRESENT play_done emo=%s cost_ms=%d s1cn-b", emo.c_str(),
              (int)((esp_timer_get_time() - t0) / 1000));
-}
-
-void ScreenPresenter::NotifyDialogue(const char* role, const char* content) {
-    if (!content || content[0] == '\0') {
-        return;
-    }
-    dialogue_text_ = content;
-    caption_role_ = role ? role : "";
-    dirty_text_ = true;
-
-    // L3: queue only while Emotion owns panel; LVGL ROI MID → caption_live.
-    if (StageAtLeast(1) && host_ != nullptr && host_->PresenterIsBypassAnimActive()) {
-        queued_dialogue_ = content;
-        queued_role_ = role ? role : "";
-        queued_dialogue_pending_ = true;
-        ESP_LOGW(TAG, "CTRL PRESENT dialogue queued (panel hold) len=%u s1an",
-                 (unsigned)dialogue_text_.size());
-        if (IsConversationMode() && UseComposeBlit()) {
-            SchedulePresent("dialogue_queued");
-        }
-        return;
-    }
-
-    // s1bk: during FACE_SLICE ROI, defer paint to PresentFaceFrameToLvgl coalesce.
-    if (host_ != nullptr && host_->PresenterIsFaceRoiAnimActive()) {
-        ESP_LOGW(TAG, "SAD_DIAG L3 caption_defer coalesce role=%s len=%u s1bk",
-                 role ? role : "-", (unsigned)dialogue_text_.size());
-        return;
-    }
-
-    ApplyDialogueToLvglNow(role, content);
-    dirty_text_ = false;
-    ESP_LOGW(TAG, "SAD_DIAG L3 caption_live role=%s len=%u s1an", role ? role : "-",
-             (unsigned)dialogue_text_.size());
-    if (IsConversationMode() && UseComposeBlit()) {
-        SchedulePresent("dialogue");
-        return;
-    }
-    ESP_LOGW(TAG, "CTRL PRESENT dialogue apply len=%u stage=%d compose=%d",
-             (unsigned)dialogue_text_.size(), Stage(), UseComposeBlit() ? 1 : 0);
-}
-
-void ScreenPresenter::NotifyStatusPhase(const char* phase_label) {
-    if (!phase_label) {
-        return;
-    }
-    status_phase_ = phase_label;
-    dialogue_text_ = phase_label;
-    caption_role_ = "status";
-    dirty_text_ = true;
-
-    if (StageAtLeast(1) && host_ != nullptr && host_->PresenterIsBypassAnimActive()) {
-        queued_dialogue_ = phase_label;
-        queued_role_ = "status";
-        queued_dialogue_pending_ = true;
-        ESP_LOGW(TAG, "CTRL PRESENT status queued (panel hold) s1an");
-        if (IsConversationMode() && UseComposeBlit()) {
-            SchedulePresent("status_queued");
-        }
-        return;
-    }
-
-    if (host_ != nullptr && host_->PresenterIsFaceRoiAnimActive()) {
-        ESP_LOGW(TAG, "SAD_DIAG L3 status_defer coalesce len=%u s1bk",
-                 (unsigned)strlen(phase_label));
-        return;
-    }
-
-    ApplyDialogueToLvglNow("status", phase_label);
-    dirty_text_ = false;
-    ESP_LOGW(TAG, "SAD_DIAG L3 caption_live role=status len=%u s1an",
-             (unsigned)strlen(phase_label));
-    if (IsConversationMode() && UseComposeBlit()) {
-        SchedulePresent("status");
-    }
 }
 
 void ScreenPresenter::OnFaceFrameCached(const uint8_t* rgb, uint32_t size, uint32_t w,
@@ -310,46 +271,6 @@ void ScreenPresenter::OnFaceFrameCached(const uint8_t* rgb, uint32_t size, uint3
     if (IsConversationMode() && UseComposeBlit()) {
         SchedulePresent("face");
     }
-}
-
-void ScreenPresenter::OnBypassAnimEnded() {
-    if (!StageAtLeast(1)) {
-        return;
-    }
-    if (queued_dialogue_pending_) {
-        ApplyDialogueToLvglNow(queued_role_.c_str(), queued_dialogue_.c_str());
-        ClearQueuedDialogue();
-        dirty_text_ = false;
-    } else if (dirty_text_ && !dialogue_text_.empty()) {
-        // s1cr: flush deferred assistant text after enter_hold / slice end.
-        const char* role = caption_role_.empty() ? "assistant" : caption_role_.c_str();
-        ApplyDialogueToLvglNow(role, dialogue_text_.c_str());
-        dirty_text_ = false;
-        ESP_LOGW(TAG, "SAD_DIAG L3 caption_flush_end role=%s len=%u s1cr", role,
-                 (unsigned)dialogue_text_.size());
-        esp_rom_printf("!!FACE_CAPTION flush_end s1cr\n");
-    }
-    if (IsConversationMode() && UseComposeBlit()) {
-        CommitPresent("anim_end");
-    }
-}
-
-bool ScreenPresenter::FlushCaptionIfDirty() {
-    if (!dirty_text_ || dialogue_text_.empty() || host_ == nullptr) {
-        return false;
-    }
-    const char* role = caption_role_.empty() ? "assistant" : caption_role_.c_str();
-    host_->PresenterApplyDialogueAssumingLock(role, dialogue_text_.c_str());
-    dirty_text_ = false;
-    ESP_LOGW(TAG, "SAD_DIAG L3 caption_coalesce role=%s len=%u s1bk", role,
-             (unsigned)dialogue_text_.size());
-    return true;
-}
-
-void ScreenPresenter::ClearQueuedDialogue() {
-    queued_dialogue_pending_ = false;
-    queued_dialogue_.clear();
-    queued_role_.clear();
 }
 
 void ScreenPresenter::SchedulePresent(const char* reason) {
@@ -434,229 +355,6 @@ void ScreenPresenter::PresentTimerCallback(void* arg) {
         return;
     }
     self->CommitPresent("timer");
-}
-
-bool ScreenPresenter::EnsurePresentBuf() {
-    if (host_ == nullptr) {
-        return false;
-    }
-    const uint32_t px = (uint32_t)host_->PresenterWidth() * (uint32_t)host_->PresenterHeight();
-    if (px == 0) {
-        return false;
-    }
-    if (present_buf_ != nullptr && present_px_ == px) {
-        return true;
-    }
-    FreePresentBuf();
-    present_buf_ = static_cast<uint16_t*>(
-        heap_caps_malloc(px * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!present_buf_) {
-        present_buf_ = static_cast<uint16_t*>(malloc(px * sizeof(uint16_t)));
-    }
-    if (!present_buf_) {
-        return false;
-    }
-    present_px_ = px;
-    memset(present_buf_, 0, px * sizeof(uint16_t));
-    return true;
-}
-
-void ScreenPresenter::FreePresentBuf() {
-    if (present_buf_ != nullptr) {
-        heap_caps_free(present_buf_);
-        present_buf_ = nullptr;
-        present_px_ = 0;
-    }
-}
-
-void ScreenPresenter::FreeOverlayCache() {
-    if (overlay_rgb_ != nullptr) {
-        heap_caps_free(overlay_rgb_);
-        overlay_rgb_ = nullptr;
-    }
-    overlay_cap_px_ = 0;
-    overlay_w_ = 0;
-    overlay_h_ = 0;
-    overlay_valid_ = false;
-}
-
-void ScreenPresenter::ApplyOverlayCache(int W, int H) {
-    if (!overlay_valid_ || !overlay_rgb_ || overlay_w_ <= 0 || overlay_h_ <= 0 || !present_buf_) {
-        return;
-    }
-    for (int y = 0; y < overlay_h_; y++) {
-        const int dy = overlay_y_ + y;
-        if (dy < 0 || dy >= H) {
-            continue;
-        }
-        for (int x = 0; x < overlay_w_; x++) {
-            const int dx = overlay_x_ + x;
-            if (dx < 0 || dx >= W) {
-                continue;
-            }
-            present_buf_[dy * W + dx] = overlay_rgb_[y * overlay_w_ + x];
-        }
-    }
-}
-
-bool ScreenPresenter::StoreOverlayCache(const uint16_t* src, int stride_px, int x0, int y0,
-                                        int sw, int sh) {
-    if (!src || sw <= 0 || sh <= 0 || stride_px <= 0) {
-        overlay_valid_ = false;
-        return false;
-    }
-    const uint32_t need = (uint32_t)sw * (uint32_t)sh;
-    if (overlay_rgb_ == nullptr || overlay_cap_px_ < need) {
-        FreeOverlayCache();
-        overlay_rgb_ = static_cast<uint16_t*>(
-            heap_caps_malloc(need * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!overlay_rgb_) {
-            overlay_rgb_ = static_cast<uint16_t*>(malloc(need * sizeof(uint16_t)));
-        }
-        if (!overlay_rgb_) {
-            return false;
-        }
-        overlay_cap_px_ = need;
-    }
-    for (int y = 0; y < sh; y++) {
-        memcpy(overlay_rgb_ + y * sw, src + y * stride_px, (size_t)sw * sizeof(uint16_t));
-    }
-    overlay_x_ = x0;
-    overlay_y_ = y0;
-    overlay_w_ = sw;
-    overlay_h_ = sh;
-    overlay_valid_ = true;
-    return true;
-}
-
-bool ScreenPresenter::CacheFace(const uint8_t* rgb, uint32_t size, uint32_t w, uint32_t h) {
-    if (!rgb || size == 0 || w == 0 || h == 0) {
-        return false;
-    }
-    if (face_rgb_ == nullptr || face_cap_ < size) {
-        if (face_rgb_ != nullptr) {
-            heap_caps_free(face_rgb_);
-            face_rgb_ = nullptr;
-            face_cap_ = 0;
-        }
-        face_rgb_ = static_cast<uint8_t*>(
-            heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!face_rgb_) {
-            face_rgb_ = static_cast<uint8_t*>(malloc(size));
-        }
-        if (!face_rgb_) {
-            return false;
-        }
-        face_cap_ = size;
-    }
-    memcpy(face_rgb_, rgb, size);
-    face_size_ = size;
-    face_w_ = w;
-    face_h_ = h;
-    return true;
-}
-
-esp_err_t ScreenPresenter::RenderCompose() {
-    if (!present_buf_ || host_ == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    const int W = host_->PresenterWidth();
-    const int H = host_->PresenterHeight();
-    if (W <= 0 || H <= 0) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    const int64_t t0 = esp_timer_get_time();
-    // Base: face (or black).
-    if (face_rgb_ && face_size_ > 0 && face_w_ > 0 && face_h_ > 0) {
-        const uint32_t copy_w = (face_w_ < (uint32_t)W) ? face_w_ : (uint32_t)W;
-        const uint32_t copy_h = (face_h_ < (uint32_t)H) ? face_h_ : (uint32_t)H;
-        const auto* src = reinterpret_cast<const uint16_t*>(face_rgb_);
-        if (copy_w == (uint32_t)W && copy_h == (uint32_t)H) {
-            memcpy(present_buf_, src, (size_t)W * (size_t)H * sizeof(uint16_t));
-        } else {
-            memset(present_buf_, 0, (size_t)W * (size_t)H * sizeof(uint16_t));
-            for (uint32_t y = 0; y < copy_h; y++) {
-                memcpy(present_buf_ + y * W, src + y * face_w_, copy_w * sizeof(uint16_t));
-            }
-        }
-    } else {
-        memset(present_buf_, 0, (size_t)W * (size_t)H * sizeof(uint16_t));
-    }
-    const int64_t face_ms = (esp_timer_get_time() - t0) / 1000;
-
-#if LV_USE_SNAPSHOT
-    // Face-only update: reuse last dialogue overlay (no lv_snapshot → less HP_WDT risk).
-    if (!dirty_text_ && overlay_valid_) {
-        ApplyOverlayCache(W, H);
-        ESP_LOGW(TAG, "CTRL PRESENT DIAG render face_ms=%d snap=reuse box=%dx%d@%d,%d",
-                 (int)face_ms, overlay_w_, overlay_h_, overlay_x_, overlay_y_);
-        return ESP_OK;
-    }
-
-    lv_obj_t* box = host_->PresenterDialogueBox();
-    if (box == nullptr) {
-        ESP_LOGW(TAG, "CTRL PRESENT DIAG render face_ms=%d snap=skip_no_box", (int)face_ms);
-        return ESP_OK;
-    }
-    BootTraceMark("PRESENT_SNAP", "lock");
-    esp_rom_printf("!!PRESENT_SNAP lock\n");
-    const int64_t tl = esp_timer_get_time();
-    if (!host_->PresenterSafeLVGLLock(80)) {
-        esp_rom_printf("!!PRESENT_SNAP lock_fail\n");
-        if (overlay_valid_) {
-            ApplyOverlayCache(W, H);
-        }
-        ESP_LOGW(TAG, "CTRL PRESENT DIAG snapshot skip=lock_fail face_ms=%d reuse=%d",
-                 (int)face_ms, overlay_valid_ ? 1 : 0);
-        return ESP_OK;
-    }
-    const int64_t lock_ms = (esp_timer_get_time() - tl) / 1000;
-    BootTraceMark("PRESENT_SNAP", "take");
-    esp_rom_printf("!!PRESENT_SNAP take\n");
-    const int64_t ts = esp_timer_get_time();
-    lv_draw_buf_t* snap = lv_snapshot_take(box, LV_COLOR_FORMAT_RGB565);
-    const int64_t snap_ms = (esp_timer_get_time() - ts) / 1000;
-    esp_rom_printf("!!PRESENT_SNAP done ms=%d\n", (int)snap_ms);
-    if (snap == nullptr || snap->data == nullptr) {
-        host_->PresenterSafeLVGLUnlock();
-        if (overlay_valid_) {
-            ApplyOverlayCache(W, H);
-        }
-        ESP_LOGW(TAG, "CTRL PRESENT DIAG snapshot miss face_ms=%d lock_ms=%d snap_ms=%d",
-                 (int)face_ms, (int)lock_ms, (int)snap_ms);
-        return ESP_OK;
-    }
-    BootTraceMark("PRESENT_SNAP", "overlay");
-    const int64_t to = esp_timer_get_time();
-    lv_area_t coords;
-    lv_obj_get_coords(box, &coords);
-    const int x0 = coords.x1;
-    const int y0 = coords.y1;
-    const int sw = (int)snap->header.w;
-    const int sh = (int)snap->header.h;
-    const int stride_px = (int)(snap->header.stride / 2);
-    const auto* s = reinterpret_cast<const uint16_t*>(snap->data);
-    StoreOverlayCache(s, stride_px, x0, y0, sw, sh);
-    ApplyOverlayCache(W, H);
-    lv_draw_buf_destroy(snap);
-    host_->PresenterSafeLVGLUnlock();
-    const int64_t overlay_ms = (esp_timer_get_time() - to) / 1000;
-    ESP_LOGW(TAG,
-             "CTRL PRESENT DIAG render face_ms=%d lock_ms=%d snap_ms=%d "
-             "overlay_ms=%d box=%dx%d@%d,%d",
-             (int)face_ms, (int)lock_ms, (int)snap_ms, (int)overlay_ms, sw, sh, x0, y0);
-#else
-    ESP_LOGW(TAG, "CTRL PRESENT snapshot disabled face_ms=%d", (int)face_ms);
-#endif
-    return ESP_OK;
-}
-
-void ScreenPresenter::ApplyDialogueToLvglNow(const char* role, const char* content) {
-    if (host_ == nullptr || !content) {
-        return;
-    }
-    host_->PresenterApplyDialogue(role, content);
 }
 
 void ScreenPresenter::SoakTick() {
